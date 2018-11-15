@@ -470,10 +470,17 @@ public:
   int Decode(const uint8_t* buffer, const uint8_t* buffer_end, TimestampValue* v) const;
 
   TimestampValue Int64ToTimestampValue(int64_t unix_time) const {
-    DCHECK(precision_ == MILLI || precision_ == MICRO);
-    return precision_ == MILLI
-        ? TimestampValue::UtcFromUnixTimeMillis(unix_time)
-        : TimestampValue::UtcFromUnixTimeMicros(unix_time);
+    switch (precision_) {
+    case MILLI:
+      return TimestampValue::UtcFromUnixTimeMillis(unix_time);
+    case MICRO:
+      return TimestampValue::UtcFromUnixTimeMicros(unix_time);
+    case NANO:
+      return TimestampValue::UtcFromUnixTimeLimitedRangeNanos(unix_time);
+    default:
+      DCHECK(false);
+      return TimestampValue();
+    }
   }
 
   void ConvertToLocalTime(TimestampValue* v) const {
@@ -494,9 +501,11 @@ public:
   /// way that the same will be true after t is converted.
   void ConvertMaxStatToLocalTime(TimestampValue* v) const;
 
-private:
   enum Precision { MILLI, MICRO, NANO };
+  static bool ProcessSchema(const parquet::SchemaElement& e, Precision& precision,
+      bool& needs_conversion);
 
+private:
   /// Timezone used for UTC->Local conversions. If nullptr, no conversion is needed.
   const Timezone* timezone_ = nullptr;
 
@@ -509,7 +518,6 @@ private:
 template <>
 inline int ParquetTimestampDecoder::Decode<parquet::Type::INT64>(
     const uint8_t* buffer, const uint8_t* buffer_end, TimestampValue* v) const {
-  DCHECK(precision_ == MILLI || precision_ == MICRO);
   int64_t unix_time;
   int bytes_read = ParquetPlainEncoder::Decode<int64_t, parquet::Type::INT64>(
       buffer, buffer_end, 0, &unix_time);

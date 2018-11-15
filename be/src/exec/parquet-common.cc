@@ -89,28 +89,63 @@ parquet::CompressionCodec::type ConvertImpalaToParquetCodec(
   return IMPALA_TO_PARQUET_CODEC[codec];
 }
 
+bool ParquetTimestampDecoder::ProcessSchema(const parquet::SchemaElement& e,
+    Precision& precision, bool& needs_conversion) {
+  if (e.type == parquet::Type::INT96) {
+    // Metadata does not contain information about being UTC normalized or not. The
+    // caller may override depending on flags and writer.
+    needs_conversion = false;
+    precision = NANO;
+    return true;
+  }
+
+  // Timestamps can be only encoded as INT64 or INT96.
+  if (e.type != parquet::Type::INT64) return false;
+
+  if (e.__isset.logicalType) {
+    // Newer solution, contains information about being UTC normalized or not.
+    if (!e.logicalType.__isset.TIMESTAMP) return false;
+
+    needs_conversion = e.logicalType.TIMESTAMP.isAdjustedToUTC;
+    if (e.logicalType.TIMESTAMP.unit.__isset.MILLIS) {
+      precision = ParquetTimestampDecoder::MILLI;
+    }
+    else if (e.logicalType.TIMESTAMP.unit.__isset.MICROS) {
+      precision = ParquetTimestampDecoder::MICRO;
+    }
+    else if (e.logicalType.TIMESTAMP.unit.__isset.NANOS) {
+      precision = ParquetTimestampDecoder::NANO;
+    } else {
+      return false;
+    }
+  } else if (e.__isset.converted_type) {
+    // Older solution, does not contain information about being UTC normalized or not.
+    // Timestamp with converted type but without logical type are/were never written
+    // by Impala, so it is assumed that the writer is Parquet-mr and that timezone
+    // conversion is needed.
+    needs_conversion = true;
+    if (e.converted_type == parquet::ConvertedType::TIMESTAMP_MILLIS) {
+      precision = ParquetTimestampDecoder::MILLI;
+    }
+    else if (e.converted_type == parquet::ConvertedType::TIMESTAMP_MICROS) {
+      precision = ParquetTimestampDecoder::MICRO;
+    } else {
+      // There is no TIMESTAMP_NANO converted type.
+      return false;
+    }
+  } else {
+    // Either logical or converted type must be set for int64 timestamps.
+    return false;
+  }
+  return true;
+}
+
 ParquetTimestampDecoder::ParquetTimestampDecoder(const parquet::SchemaElement& e,
     const Timezone* timezone, bool convert_int96_timestamps) {
   bool needs_conversion = false;
-  if (e.__isset.logicalType) {
-    DCHECK(e.logicalType.__isset.TIMESTAMP);
-    needs_conversion = e.logicalType.TIMESTAMP.isAdjustedToUTC;
-    precision_ = e.logicalType.TIMESTAMP.unit.__isset.MILLIS
-        ? ParquetTimestampDecoder::MILLI : ParquetTimestampDecoder::MICRO;
-  } else {
-    if (e.__isset.converted_type) {
-      // Timestamp with converted type but without logical type are/were never written
-      // by Impala, so it is assumed that the writer is Parquet-mr and that timezone
-      // conversion is needed.
-      needs_conversion = true;
-      precision_ = e.converted_type == parquet::ConvertedType::TIMESTAMP_MILLIS
-          ? ParquetTimestampDecoder::MILLI : ParquetTimestampDecoder::MICRO;
-    } else {
-      // INT96 timestamps needs conversion depending on the writer.
-      needs_conversion = convert_int96_timestamps;
-      precision_ = ParquetTimestampDecoder::NANO;
-    }
-  }
+  bool valid_schema = ProcessSchema(e, precision_, needs_conversion);
+  DCHECK(valid_schema); // Invalid schemas should rejected in an earlier step.
+  if (e.type == parquet::Type::INT96 && convert_int96_timestamps) needs_conversion = true;
   if (needs_conversion) timezone_ = timezone;
 }
 
