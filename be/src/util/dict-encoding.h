@@ -332,13 +332,8 @@ class DictDecoder : public DictDecoderBase {
   /// dictionary values (values stored using FIXED_LEN_BYTE_ARRAY).
   /// Returns true if the dictionary values were all successfully decoded, or false
   /// if the dictionary was corrupt.
-  template<parquet::Type::type PARQUET_TYPE>
-  bool Reset(uint8_t* dict_buffer, int dict_len, int fixed_len_size) WARN_UNUSED_RESULT;
-
-  /// Should be only called for Timestamp columns.
-  void SetTimestampHelper(ParquetTimestampDecoder timestamp_decoder) {
-    timestamp_decoder_ = timestamp_decoder;
-  }
+  /// TODO: bytes should be released first
+  void Reset(std::vector<T>& data);
 
   virtual int num_entries() const { return dict_.size(); }
 
@@ -390,15 +385,6 @@ class DictDecoder : public DictDecoderBase {
   /// Slow path for GetNextValue() where we need to decode new values. Should not be
   /// inlined everywhere.
   bool DecodeNextValue(T* value);
-
-  /// Specialized for Timestamp columns, simple proxy to ParquetPlainEncoder::Decode
-  /// for other types.
-  template<parquet::Type::type PARQUET_TYPE>
-  int Decode(const uint8_t* buffer, const uint8_t* buffer_end,
-      int fixed_len_size, T* v) {
-    return  ParquetPlainEncoder::Decode<T, PARQUET_TYPE>(buffer, buffer_end,
-        fixed_len_size,  v);
-  }
 };
 
 template<typename T>
@@ -618,30 +604,12 @@ inline int DictEncoderBase::WriteData(uint8_t* buffer, int buffer_len) {
   return 1 + encoder.len();
 }
 
-template <>
-template<parquet::Type::type PARQUET_TYPE>
-inline int DictDecoder<TimestampValue>::Decode(const uint8_t* buffer,
-    const uint8_t* buffer_end, int fixed_len_size, TimestampValue* v) {
-  return timestamp_decoder_.Decode<PARQUET_TYPE>(buffer, buffer_end, v);
-}
-
 template<typename T>
-template<parquet::Type::type PARQUET_TYPE>
-inline bool DictDecoder<T>::Reset(uint8_t* dict_buffer, int dict_len,
-    int fixed_len_size) {
+inline void DictDecoder<T>::Reset(std::vector<T>& data) {
   dict_.clear();
   ReleaseBytes();
-  uint8_t* end = dict_buffer + dict_len;
-  while (dict_buffer < end) {
-    T value;
-    int decoded_len = Decode<PARQUET_TYPE>(dict_buffer, end,
-        fixed_len_size, &value);
-    if (UNLIKELY(decoded_len < 0)) return false;
-    dict_buffer += decoded_len;
-    dict_.push_back(value);
-  }
+  dict_.swap(data);
   ConsumeBytes(sizeof(T) * dict_.size());
-  return true;
 }
 
 }

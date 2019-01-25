@@ -27,6 +27,8 @@
 #include "testutil/gtest-util.h"
 #include "util/bit-packing.inline.h"
 #include "util/dict-encoding.h"
+#include "exec/parquet/hdfs-parquet-scanner.h"
+#include "exec/parquet/parquet-type-decoders.h"
 
 #include "common/names.h"
 
@@ -51,9 +53,9 @@ const vector<InternalType>& values, int skip_at, int skip_count, bool skip_succe
   }
 }
 
-template<typename InternalType, parquet::Type::type PARQUET_TYPE>
+template<typename InternalType, class TypeDecoder>
 void ValidateDict(const vector<InternalType>& values,
-    const vector<InternalType>& dict_values, int fixed_buffer_byte_size,
+    const vector<InternalType>& dict_values, TypeDecoder& type_decoder,
     int skip_at = 0, int skip_count = 0, bool skip_success = true) {
   set<InternalType> values_set(values.begin(), values.end());
 
@@ -61,7 +63,8 @@ void ValidateDict(const vector<InternalType>& values,
   MemTracker track_encoder;
   MemTracker tracker;
   MemPool pool(&tracker);
-  DictEncoder<InternalType> encoder(&pool, fixed_buffer_byte_size, &track_encoder);
+
+  DictEncoder<InternalType> encoder(&pool, type_decoder.Size(), &track_encoder);
   encoder.UsedbyTest();
   for (InternalType i: values) encoder.Put(i);
   bytes_alloc = encoder.DictByteSize();
@@ -79,8 +82,10 @@ void ValidateDict(const vector<InternalType>& values,
 
   MemTracker decode_tracker;
   DictDecoder<InternalType> decoder(&decode_tracker);
-  ASSERT_TRUE(decoder.template Reset<PARQUET_TYPE>(dict_buffer,
-      encoder.dict_encoded_size(),fixed_buffer_byte_size));
+  vector<InternalType> tmp_dict_values;
+  ASSERT_TRUE(DecodePlainParquetPageToVector(
+      dict_buffer, encoder.dict_encoded_size(), type_decoder, tmp_dict_values));
+  decoder.Reset(tmp_dict_values);
   bytes_alloc = decoder.DictByteSize();
   EXPECT_EQ(decode_tracker.consumption(), bytes_alloc);
 
@@ -123,7 +128,11 @@ TEST(DictTest, TestStrings) {
   values.push_back(sv3);
   values.push_back(sv4);
 
-  ValidateDict<StringValue, parquet::Type::BYTE_ARRAY>(values, dict_values, -1);
+  ParquetStringDecoder type_decoder;
+  type_decoder.fixed_size_len_ = -1;
+  type_decoder.needs_conversion_ = false;
+  type_decoder.char_len_ = -1;
+  ValidateDict<StringValue, ParquetStringDecoder>(values, dict_values, type_decoder);
 }
 
 TEST(DictTest, TestTimestamps) {
@@ -144,8 +153,9 @@ TEST(DictTest, TestTimestamps) {
   values.push_back(tv1);
   values.push_back(tv1);
 
-  ValidateDict<TimestampValue, parquet::Type::INT96>(values, dict_values,
-      ParquetPlainEncoder::EncodedByteSize(ColumnType(TYPE_TIMESTAMP)));
+  ParquetInt96TimestampDecoder type_decoder;
+  ValidateDict<TimestampValue, ParquetInt96TimestampDecoder>(values, dict_values,
+      type_decoder);
 }
 
 template<typename InternalType>
@@ -155,8 +165,8 @@ template <> void IncrementValue(Decimal4Value* t) { ++(t->value()); }
 template <> void IncrementValue(Decimal8Value* t) { ++(t->value()); }
 template <> void IncrementValue(Decimal16Value* t) { ++(t->value()); }
 
-template<typename InternalType, parquet::Type::type PARQUET_TYPE>
-void TestNumbers(int max_value, int repeat, int value_byte_size) {
+template<typename InternalType, class TypeDecoder>
+void TestNumbers(int max_value, int repeat, TypeDecoder& type_decoder) {
   vector<InternalType> values;
   vector<InternalType> dict_values;
   for (InternalType val = 0; val < max_value; IncrementValue(&val)) {
@@ -166,35 +176,58 @@ void TestNumbers(int max_value, int repeat, int value_byte_size) {
     dict_values.push_back(val);
   }
 
-  ValidateDict<InternalType, PARQUET_TYPE>(values, dict_values, value_byte_size);
+  ValidateDict<InternalType, TypeDecoder>(values, dict_values, type_decoder);
 }
 
-template<typename InternalType, parquet::Type::type PARQUET_TYPE>
-void TestNumbers(int value_byte_size) {
-  TestNumbers<InternalType, PARQUET_TYPE>(100, 1, value_byte_size);
-  TestNumbers<InternalType, PARQUET_TYPE>(1, 100, value_byte_size);
-  TestNumbers<InternalType, PARQUET_TYPE>(1, 1, value_byte_size);
-  TestNumbers<InternalType, PARQUET_TYPE>(1, 2, value_byte_size);
+template<typename InternalType, class TypeDecoder>
+void TestNumbers(TypeDecoder& type_decoder) {
+  TestNumbers<InternalType, TypeDecoder>(100, 1, type_decoder);
+  TestNumbers<InternalType, TypeDecoder>(1, 100, type_decoder);
+  TestNumbers<InternalType, TypeDecoder>(1, 1, type_decoder);
+  TestNumbers<InternalType, TypeDecoder>(1, 2, type_decoder);
 }
 
 TEST(DictTest, TestNumbers) {
-  TestNumbers<int8_t, parquet::Type::INT32>(
-      ParquetPlainEncoder::EncodedByteSize(ColumnType(TYPE_TINYINT)));
-  TestNumbers<int16_t, parquet::Type::INT32>(
-      ParquetPlainEncoder::EncodedByteSize(ColumnType(TYPE_SMALLINT)));
-  TestNumbers<int32_t, parquet::Type::INT32>(
-      ParquetPlainEncoder::EncodedByteSize(ColumnType(TYPE_INT)));
-  TestNumbers<int64_t, parquet::Type::INT64>(
-      ParquetPlainEncoder::EncodedByteSize(ColumnType(TYPE_BIGINT)));
-  TestNumbers<float, parquet::Type::FLOAT>(
-      ParquetPlainEncoder::EncodedByteSize(ColumnType(TYPE_FLOAT)));
-  TestNumbers<double, parquet::Type::DOUBLE>(
-      ParquetPlainEncoder::EncodedByteSize(ColumnType(TYPE_DOUBLE)));
+  typedef ParquetTypeDecoder<int8_t, parquet::Type::INT32> I8i32Decoder;
+  I8i32Decoder i8i32decoder;
+  TestNumbers<int8_t, I8i32Decoder>(i8i32decoder);
+
+  typedef ParquetTypeDecoder<int16_t, parquet::Type::INT32> I16i32Decoder;
+  I16i32Decoder i16i32decoder;
+  TestNumbers<int16_t, I16i32Decoder>(i16i32decoder);
+
+  typedef ParquetTypeDecoder<int32_t, parquet::Type::INT32> I32i32Decoder;
+  I32i32Decoder i32i32decoder;
+  TestNumbers<int32_t, I32i32Decoder>(i32i32decoder);
+
+  typedef ParquetTypeDecoder<int64_t, parquet::Type::INT64> I64i64Decoder;
+  I64i64Decoder i64i64decoder;
+  TestNumbers<int64_t, I64i64Decoder>(i64i64decoder);
+
+  typedef ParquetTypeDecoder<float, parquet::Type::FLOAT> FloatDecoder;
+  FloatDecoder floatDecoder;
+  TestNumbers<float, FloatDecoder>(floatDecoder);
+
+  typedef ParquetTypeDecoder<double, parquet::Type::DOUBLE> DoubleDecoder;
+  DoubleDecoder doubleDecoder;
+  TestNumbers<double, DoubleDecoder>(doubleDecoder);
 
   for (int i = 1; i <= 16; ++i) {
-    if (i <= 4) TestNumbers<Decimal4Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(i);
-    if (i <= 8) TestNumbers<Decimal8Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(i);
-    TestNumbers<Decimal16Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(i);
+    typedef ParquetFixedLenByteArrayDecimalDecoder<Decimal4Value> Decimal4Decoder;
+    Decimal4Decoder decimal4Decoder;
+    decimal4Decoder.fixed_len_size_ = i;
+    DCHECK_EQ(decimal4Decoder.Size(), i);
+    if (i <= 4) TestNumbers<Decimal4Value, Decimal4Decoder>(decimal4Decoder);
+
+    typedef ParquetFixedLenByteArrayDecimalDecoder<Decimal8Value> Decimal8Decoder;
+    Decimal8Decoder decimal8Decoder;
+    decimal8Decoder.fixed_len_size_ = i;
+    if (i <= 8) TestNumbers<Decimal8Value, Decimal8Decoder>(decimal8Decoder);
+
+    typedef ParquetFixedLenByteArrayDecimalDecoder<Decimal16Value> Decimal16Decoder;
+    Decimal16Decoder decimal16Decoder;
+    decimal16Decoder.fixed_len_size_ = i;
+    TestNumbers<Decimal16Value, Decimal16Decoder>(decimal16Decoder);
   }
 }
 
@@ -207,8 +240,14 @@ TEST(DictTest, TestInvalidStrings) {
   // the decoder should fail.
   MemTracker tracker;
   DictDecoder<StringValue> decoder(&tracker);
-  ASSERT_FALSE(decoder.template Reset<parquet::Type::BYTE_ARRAY>(buffer, sizeof(buffer),
-      0));
+
+  ParquetStringDecoder type_decoder;
+  type_decoder.fixed_size_len_ = -1;
+  type_decoder.needs_conversion_ = false;
+  type_decoder.char_len_ = -1;
+  vector<StringValue> tmp_dict_values;
+  ASSERT_FALSE(DecodePlainParquetPageToVector(
+      buffer, sizeof(buffer), type_decoder, tmp_dict_values));
 }
 
 TEST(DictTest, TestStringBufferOverrun) {
@@ -221,8 +260,14 @@ TEST(DictTest, TestStringBufferOverrun) {
   // invalid memory.
   MemTracker tracker;
   DictDecoder<StringValue> decoder(&tracker);
-  ASSERT_FALSE(decoder.template Reset<parquet::Type::BYTE_ARRAY>(buffer, sizeof(buffer),
-      0));
+
+  ParquetStringDecoder type_decoder;
+  type_decoder.fixed_size_len_ = -1;
+  type_decoder.needs_conversion_ = false;
+  type_decoder.char_len_ = -1;
+  vector<StringValue> tmp_dict_values;
+  ASSERT_FALSE(DecodePlainParquetPageToVector(
+      buffer, sizeof(buffer), type_decoder, tmp_dict_values));
 }
 
 // Make sure that SetData() resets the dictionary decoder, including the embedded RLE
@@ -251,8 +296,11 @@ TEST(DictTest, SetDataAfterPartialRead) {
   encoder.ClearIndices();
 
   DictDecoder<int> decoder(&track_decoder);
-  ASSERT_TRUE(decoder.template Reset<parquet::Type::INT32>(
-      dict_buffer.data(), dict_buffer.size(), sizeof(int)));
+  ParquetTypeDecoder<int32_t, parquet::Type::INT32> type_decoder;
+  vector<int32_t> tmp_dict_values;
+  ASSERT_TRUE(DecodePlainParquetPageToVector(
+      dict_buffer.data(), dict_buffer.size(), type_decoder, tmp_dict_values));
+  decoder.Reset(tmp_dict_values);
 
   // Test decoding some of the values, then resetting. If the decoder incorrectly
   // caches some values, this could produce incorrect results.
@@ -289,8 +337,11 @@ TEST(DictTest, DecodeErrors) {
   small_dict_encoder.ClearIndices();
 
   DictDecoder<int> small_dict_decoder(&track_decoder);
-  ASSERT_TRUE(small_dict_decoder.template Reset<parquet::Type::INT32>(
-        small_dict_buffer.data(), small_dict_buffer.size(), sizeof(int)));
+  ParquetTypeDecoder<int32_t, parquet::Type::INT32> type_decoder;
+  vector<int32_t> tmp_dict_values;
+  ASSERT_TRUE(DecodePlainParquetPageToVector(
+      small_dict_buffer.data(), small_dict_buffer.size(), type_decoder, tmp_dict_values));
+  small_dict_decoder.Reset(tmp_dict_values);
 
   // Generate dictionary-encoded data with between 9 and 15 distinct values to test that
   // error is detected when the decoder reads a 4-bit value that is out of range.
@@ -340,9 +391,9 @@ TEST(DictTest, TestSkippingValues) {
   auto ValidateSkipping = [](const vector<int32_t>& values,
       const vector<int32_t>& dict_values, int skip_at, int skip_count,
       bool skip_success = true) {
-    const int value_byte_size = ParquetPlainEncoder::EncodedByteSize(
-        ColumnType(TYPE_INT));
-    ValidateDict<int32_t, parquet::Type::INT32>(values, dict_values, value_byte_size,
+    typedef ParquetTypeDecoder<int32_t, parquet::Type::INT32> I32i32Decoder;
+    I32i32Decoder i32i32decoder;
+    ValidateDict<int32_t, I32i32Decoder>(values, dict_values, i32i32decoder,
         skip_at, skip_count, skip_success);
   };
 

@@ -42,7 +42,7 @@ class ParquetLevelDecoder;
 class ParquetColumnReader;
 class CollectionColumnReader;
 class BaseScalarColumnReader;
-template<typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
+template<class TypeDecoder>
 class ScalarColumnReader;
 class BoolColumnReader;
 
@@ -354,7 +354,7 @@ class HdfsParquetScanner : public HdfsScanner {
   friend class ParquetColumnReader;
   friend class CollectionColumnReader;
   friend class BaseScalarColumnReader;
-  template<typename InternalType, parquet::Type::type PARQUET_TYPE, bool MATERIALIZED>
+  template<class TypeDecoder>
   friend class ScalarColumnReader;
   friend class BoolColumnReader;
   friend class HdfsParquetScannerTest;

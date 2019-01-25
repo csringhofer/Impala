@@ -393,6 +393,7 @@ template <typename T>
 inline int DecodeDecimalFixedLen(
     const uint8_t* buffer, const uint8_t* buffer_end, int fixed_len_size, T* v) {
   if (UNLIKELY(buffer_end - buffer < fixed_len_size)) return -1;
+  DCHECK_GT(fixed_len_size, 0);
   DecimalUtil::DecodeFromFixedLenByteArray(buffer, fixed_len_size, v);
   return fixed_len_size;
 }
