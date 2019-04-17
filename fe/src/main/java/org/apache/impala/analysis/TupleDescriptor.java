@@ -267,13 +267,13 @@ public class TupleDescriptor {
       if (!d.isMaterialized()) continue;
       ColumnStats stats = d.getStats();
       int slotSize = d.getType().getSlotSize();
-
-      if (stats.hasAvgSerializedSize()) {
+      // TODO: for computed slots, try to come up with stats estimates
+      if (stats.hasAvgSize()) {
         avgSerializedSize_ += d.getStats().getAvgSerializedSize();
       } else {
-        // TODO: for computed slots, try to come up with stats estimates
         avgSerializedSize_ += slotSize;
       }
+
       // Add padding for a KUDU string slot.
       if (d.isKuduStringSlot()) {
         slotSize += KUDU_STRING_PADDING;
