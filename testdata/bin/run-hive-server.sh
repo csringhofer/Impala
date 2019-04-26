@@ -80,6 +80,22 @@ if [[ $USE_CDP_HIVE && -n "$SENTRY_HOME" ]]; then
   done
 fi
 
+# For Hive 3, we use Tez for execution. We have to add it to the HS2 classpath.
+# HMS also needs Tez for query based compaction.
+if ${USE_CDP_HIVE} ; then
+  export HADOOP_CLASSPATH=${HADOOP_CLASSPATH}:${TEZ_HOME}/*
+  # This is a little hacky, but Tez bundles a bunch of junk into lib/, such
+  # as extra copies of the hadoop libraries, etc, and we want to avoid conflicts.
+  # So, we'll be a bit choosy about what we add to the classpath here.
+  for jar in $TEZ_HOME/lib/* ; do
+    case $(basename $jar) in
+      commons-*|RoaringBitmap*)
+        export HADOOP_CLASSPATH=$HADOOP_CLASSPATH:$jar
+        ;;
+    esac
+  done
+fi
+
 # Starts a Hive Metastore Server on the specified port.
 # To debug log4j2 loading issues, add to HADOOP_CLIENT_OPTS:
 #   -Dorg.apache.logging.log4j.simplelog.StatusLogger.level=TRACE
@@ -90,21 +106,6 @@ HADOOP_CLIENT_OPTS="-Xmx2024m -Dhive.log.file=hive-metastore.log" hive \
 ${CLUSTER_BIN}/wait-for-metastore.py --transport=${METASTORE_TRANSPORT}
 
 if [ ${ONLY_METASTORE} -eq 0 ]; then
-  # For Hive 3, we use Tez for execution. We have to add it to the HS2 classpath.
-  if ${USE_CDP_HIVE} ; then
-    export HADOOP_CLASSPATH=${HADOOP_CLASSPATH}:${TEZ_HOME}/*
-    # This is a little hacky, but Tez bundles a bunch of junk into lib/, such
-    # as extra copies of the hadoop libraries, etc, and we want to avoid conflicts.
-    # So, we'll be a bit choosy about what we add to the classpath here.
-    for jar in $TEZ_HOME/lib/* ; do
-      case $(basename $jar) in
-        commons-*|RoaringBitmap*)
-          export HADOOP_CLASSPATH=$HADOOP_CLASSPATH:$jar
-          ;;
-      esac
-    done
-  fi
-
   # Starts a HiveServer2 instance on the port specified by the HIVE_SERVER2_THRIFT_PORT
   # environment variable. HADOOP_HEAPSIZE should be set to at least 2048 to avoid OOM
   # when loading ORC tables like widerow.
