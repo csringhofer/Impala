@@ -109,6 +109,7 @@ import tempfile
 from itertools import product
 from optparse import OptionParser
 from tests.util.test_file_parser import *
+from tests.common.environ import HIVE_MAJOR_VERSION
 from tests.common.test_dimensions import *
 
 parser = OptionParser()
@@ -156,8 +157,12 @@ COMPRESSION_CODEC = "SET mapred.output.compression.codec=%s;"
 AVRO_COMPRESSION_CODEC = "SET avro.output.codec=%s;"
 SET_DYNAMIC_PARTITION_STATEMENT = "SET hive.exec.dynamic.partition=true;"
 SET_PARTITION_MODE_NONSTRICT_STATEMENT = "SET hive.exec.dynamic.partition.mode=nonstrict;"
+
 SET_HIVE_INPUT_FORMAT = "SET mapred.max.split.size=256000000;\n"\
                         "SET hive.input.format=org.apache.hadoop.hive.ql.io.%s;\n"
+if HIVE_MAJOR_VERSION >= 3:
+  SET_HIVE_INPUT_FORMAT += "SET mapred.min.split.size=32000000;\n"
+
 SET_HIVE_HBASE_BULK_LOAD = "SET hive.hbase.bulk = true"
 FILE_FORMAT_IDX = 0
 DATASET_IDX = 1
