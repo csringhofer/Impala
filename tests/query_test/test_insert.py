@@ -147,12 +147,13 @@ class TestInsertQueries(ImpalaTestSuite):
     # need to drop and create such tables, and table properties are preserved during
     # those operations and this is enough for the tests (A table is ACID if it has the
     # relevant table properties).
-    capability_check = self.hive_client.getMetaConf("metastore.client.capability.check")
+    CAPABILITY_CHECK_CONF = "hive.metastore.client.capability.check"
+    capability_check = self.hive_client.getMetaConf(CAPABILITY_CHECK_CONF)
     self.hive_client.setMetaConf("metastore.client.capability.check", "false")
     self.run_test_case('QueryTest/acid-insert', vector,
         multiple_impalad=vector.get_value('exec_option')['sync_ddl'] == 1)
     # Reset original state.
-    self.hive_client.setMetaConf("metastore.client.capability.check", capability_check)
+    self.hive_client.setMetaConf(CAPABILITY_CHECK_CONF, capability_check)
 
   @SkipIfHive2.acid
   def test_acid_nonacid_insert(self, vector, unique_database):
