@@ -127,6 +127,101 @@ class TestOwnerPrivileges(SentryCacheTestSuite):
                     "org.apache.impala.testutil.TestSentryResourceAuthorizationProvider"
                     .format(SENTRY_CONFIG_FILE_OO, SENTRY_LONG_POLLING_FREQUENCY_S),
       sentry_config=SENTRY_CONFIG_FILE_OO,
+      sentry_log_dir="{0}/test_drop_table_if_exists".format(SENTRY_BASE_LOG_DIR))
+  def test_drop_if_exists(self, vector, unique_database):
+    try:
+      # we need to use a separate db for testing the drop database if exists case
+      # For others we can rely on using unique_database which gets cleaned up
+      # automatically
+      test_db = "test_drop_if_exists_db"
+      self._setup_drop_if_exist_test(unique_database)
+      self._execute_drop_if_exists(TestObject(TestObject.DATABASE,
+        test_db))
+      self._execute_drop_if_exists(TestObject(TestObject.TABLE, unique_database +
+          ".test_table"))
+      self._execute_drop_if_exists(TestObject(TestObject.VIEW, unique_database +
+          ".test_view"))
+      self._execute_drop_if_exists(TestObject(TestObject.FUNCTION, unique_database +
+          ".test_func()"))
+    finally:
+      self._cleanup_drop_if_exist_test(test_db)
+
+  def _setup_drop_if_exist_test(self, unique_database):
+    # create a role which can create objects on this server
+    # for the purposes of this test oo_user1 will have privileges
+    # to create (and drop) objects while oo_user_2 will not have drop privileges
+    for role_name in self.execute_query("show roles").data:
+      if role_name in ['oo_user1_role', 'oo_user2_role']:
+        self.execute_query("drop role {0}".format(role_name))
+
+    self.execute_query("create role oo_user1_role")
+    self.execute_query("create role oo_user2_role")
+    # grant create permissions to oo_user_1 so that they can create database/table
+    # or functions
+    self.execute_query("grant create on server to oo_user1_role")
+    # oo_user1 needs permissions to create a view based of functional.alltypes
+    self.execute_query("grant select on database functional to oo_user1_role")
+    # oo_user1 needs permissions to create a function based of libTestUdfs.so
+    self.execute_query("grant all on uri 'hdfs:///test-warehouse/libTestUdfs.so' to"
+        " oo_user1_role")
+    # We need to provide explicit privileges to drop functions
+    self.execute_query("grant drop on database {0} to "
+        "oo_user1_role".format(unique_database))
+    self.execute_query("grant role oo_user1_role to group oo_group1")
+    self.execute_query("grant role oo_user2_role to group oo_group2")
+    self.execute_query("refresh authorization")
+
+  def _cleanup_drop_if_exist_test(self, test_db):
+    self.execute_query("revoke role oo_user1_role from group oo_group1")
+    self.execute_query("revoke role oo_user2_role from group oo_group2")
+    self.execute_query("drop role oo_user1_role")
+    self.execute_query("drop role oo_user2_role")
+    self.execute_query("refresh authorization")
+    self.execute_query("drop database if exists {0}".format(test_db))
+
+  def _execute_drop_if_exists(self, test_obj):
+    """
+    Executes a drop table if exists on a given object type and makes sure that
+    there is no authorization exception when the user has enough privileges. If the user
+    does not have correct privileges the test confirms that error is thrown
+    """
+    self.oo_user1_impalad_client = self.create_impala_client()
+    self.oo_user2_impalad_client = self.create_impala_client()
+    self.user_query(self.oo_user1_impalad_client, "create %s %s %s %s %s" %
+                    (test_obj.obj_type, test_obj.obj_name, test_obj.table_def,
+                     test_obj.view_select, test_obj.func_def), user="oo_user1")
+    error_msg = \
+        "does not have privileges to DROP" if test_obj.obj_type == TestObject.FUNCTION \
+        else "does not have privileges to execute 'DROP'"
+    self.user_query(self.oo_user2_impalad_client, "drop %s %s" %
+                    (test_obj.obj_type, test_obj.obj_name), user="oo_user2",
+                    error_msg=error_msg)
+    self.user_query(self.oo_user1_impalad_client, "drop %s %s" %
+                    (test_obj.obj_type, test_obj.obj_name,), user="oo_user1")
+    # a drop if exists on a non-existing object should not error out if the user has
+    # minimum set of privileges required to list those object types
+    self.user_query(self.oo_user1_impalad_client, "drop %s if exists %s" %
+                    (test_obj.obj_type, test_obj.obj_name), user="oo_user1")
+    # oo_user2 does not have privileges on this object and hence should receive a
+    # authorization error
+    error_msg = \
+        "does not have privileges to ANY" if test_obj.obj_type == TestObject.FUNCTION \
+        else "does not have privileges to access"
+    self.user_query(self.oo_user2_impalad_client, "drop %s if exists %s" %
+                    (test_obj.obj_type, test_obj.obj_name), user="oo_user2",
+                    error_msg=error_msg)
+
+  @pytest.mark.execute_serially
+  @SentryCacheTestSuite.with_args(
+      impalad_args="--server_name=server1 --sentry_config={0} "
+                   "--authorization_policy_provider_class="
+                   "org.apache.impala.testutil.TestSentryResourceAuthorizationProvider"
+                   .format(SENTRY_CONFIG_FILE_OO),
+      catalogd_args="--sentry_config={0} --sentry_catalog_polling_frequency_s={1} "
+                    "--authorization_policy_provider_class="
+                    "org.apache.impala.testutil.TestSentryResourceAuthorizationProvider"
+                    .format(SENTRY_CONFIG_FILE_OO, SENTRY_LONG_POLLING_FREQUENCY_S),
+      sentry_config=SENTRY_CONFIG_FILE_OO,
       sentry_log_dir="{0}/test_owner_privileges_with_grant".format(SENTRY_BASE_LOG_DIR))
   def test_owner_privileges_with_grant(self, vector, unique_database):
     """Tests owner privileges with grant on database, table, and view.
