@@ -85,7 +85,7 @@ void FilterContext::Insert(TupleRow* row) const noexcept {
     void* val = expr_eval->GetValue(row);
     uint32_t filter_hash = RawValue::GetHashValueFastHash32(
         val, expr_eval->root().type(), RuntimeFilterBank::DefaultHashSeed());
-    local_bloom_filter->Insert(filter_hash);
+    local_bloom_filter->InsertBuffered(filter_hash);
   } else if (filter->is_min_max_filter()) {
     if (local_min_max_filter == nullptr || local_min_max_filter->AlwaysTrue()) return;
     void* val = expr_eval->GetValue(row);
@@ -129,6 +129,9 @@ void FilterContext::MaterializeValues() const {
     local_min_max_filter->MaterializeValues();
   } else if (filter->is_in_list_filter() && local_in_list_filter != nullptr) {
     local_in_list_filter->MaterializeValues();
+  } else {
+    DCHECK(filter->is_bloom_filter());
+    //local_bloom_filter->Flush();
   }
 }
 

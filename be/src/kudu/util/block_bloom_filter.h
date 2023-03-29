@@ -89,7 +89,7 @@ class BlockBloomFilter {
   // "hash_algorithm": Hash algorithm used to hash the keys to 32-bit integers prior to doing
   //                   Insert() or Find().
   // "hash_seed": Seed used to hash the keys.
-  Status Init(int log_space_bytes, HashAlgorithm hash_algorithm, uint32_t hash_seed);
+  Status Init(int log_space_bytes, HashAlgorithm hash_algorithm, uint32_t hash_seed, std::vector<std::vector<uint32_t>>& buffers);
   // Initialize the BlockBloomFilter by de-serializing the protobuf message.
   Status InitFromPB(const BlockBloomFilterPB& bf_src);
   // Initialize the BlockBloomFilter from a populated "directory" structure.
@@ -116,6 +116,9 @@ class BlockBloomFilter {
   void Insert(const Slice& key) noexcept {
     Insert(HashUtil::ComputeHash32(key, hash_algorithm_, hash_seed_));
   }
+
+  void InsertBuffered(uint32_t hash, std::vector<std::vector<uint32_t>>& buffers) noexcept;
+  void FlushBuffered(std::vector<std::vector<uint32_t>>& buffers) noexcept;
 
   // Finds an element in the BloomFilter, returning true if it is found and false (with
   // high probability) if it is not.
@@ -226,7 +229,7 @@ class BlockBloomFilter {
   uint32_t hash_seed_;
 
   // Helper function for public Init() variants.
-  Status InitInternal(int log_space_bytes, HashAlgorithm hash_algorithm, uint32_t hash_seed);
+  Status InitInternal(int log_space_bytes, HashAlgorithm hash_algorithm, uint32_t hash_seed, std::vector<std::vector<uint32_t>>* buffers);
 
   // Same as Insert(), but skips the CPU check and assumes that AVX2 is not available.
   void InsertNoAvx2(uint32_t hash) noexcept;

@@ -107,6 +107,8 @@ class BloomFilter {
   /// this Bloom filter, since the collision probability (the probability that two
   /// non-equal values will have the same hash value) is 0.
   void Insert(const uint32_t hash) noexcept;
+  void InsertBuffered(const uint32_t hash) noexcept;
+  void Flush() noexcept;
   // Same as above for codegen
   void IR_ALWAYS_INLINE IrInsert(const uint32_t hash) noexcept;
 
@@ -179,6 +181,8 @@ class BloomFilter {
   /// Embedded Kudu BlockBloomFilter object
   kudu::BlockBloomFilter block_bloom_filter_;
 
+  std::vector<std::vector<uint32_t>> buffers_;
+
   /// Serializes this filter as Protobuf.
   void ToProtobuf(BloomFilterPB* protobuf, kudu::rpc::RpcController* controller) const;
 
@@ -204,6 +208,15 @@ class BloomFilter {
 
 inline void ALWAYS_INLINE BloomFilter::Insert(const uint32_t hash) noexcept {
   block_bloom_filter_.Insert(hash);
+}
+
+inline void ALWAYS_INLINE BloomFilter::InsertBuffered(const uint32_t hash) noexcept {
+  block_bloom_filter_.InsertBuffered(hash, buffers_);
+}
+
+
+inline void BloomFilter::Flush() noexcept {
+  block_bloom_filter_.FlushBuffered(buffers_);
 }
 
 inline bool ALWAYS_INLINE BloomFilter::Find(const uint32_t hash) const noexcept {

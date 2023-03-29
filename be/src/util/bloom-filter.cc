@@ -51,7 +51,7 @@ BloomFilter::~BloomFilter() {}
 
 Status BloomFilter::Init(const int log_bufferpool_space, uint32_t hash_seed) {
   KUDU_RETURN_IF_ERROR(
-      block_bloom_filter_.Init(log_bufferpool_space, kudu::FAST_HASH, hash_seed),
+      block_bloom_filter_.Init(log_bufferpool_space, kudu::FAST_HASH, hash_seed, buffers_),
       "Failed to init Block Bloom Filter");
   return Status::OK();
 }
@@ -61,7 +61,7 @@ Status BloomFilter::Init(const BloomFilterPB& protobuf, const uint8_t* directory
   if (protobuf.always_false() || directory_in_size == 0) {
     // Directory size equal 0 only when it's always false.
     KUDU_RETURN_IF_ERROR(block_bloom_filter_.Init(
-                             protobuf.log_bufferpool_space(), kudu::FAST_HASH, hash_seed),
+                             protobuf.log_bufferpool_space(), kudu::FAST_HASH, hash_seed, buffers_),
         "Failed to init Block Bloom Filter");
   } else {
     kudu::Slice slice(directory_in, directory_in_size);

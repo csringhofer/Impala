@@ -136,6 +136,7 @@ void JoinBuilder::PublishRuntimeFilters(const std::vector<FilterContext>& filter
     BloomFilter* bloom_filter = nullptr;
     if (ctx.local_bloom_filter != nullptr) {
       bloom_filter = ctx.local_bloom_filter;
+      bloom_filter->Flush();
       ++num_enabled_filters;
     } else if (ctx.local_min_max_filter != nullptr) {
       /// Apply the column min/max stats (if applicable) to shut down the min/max

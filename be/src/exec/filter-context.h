@@ -123,6 +123,7 @@ struct FilterContext {
   /// or 'local_min_max_filter' as appropriate.
   void Insert(TupleRow* row) const noexcept;
 
+
   /// Implements different flavors of insertion based on filter type and comparison
   /// op in filter desc.
   ///  1). When the op is EQ, regardless of filter type, call this->Insert(TupleRow* row);

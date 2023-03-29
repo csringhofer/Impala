@@ -20,5 +20,6 @@
 using namespace impala;
 
 void IR_ALWAYS_INLINE BloomFilter::IrInsert(const uint32_t hash) noexcept {
-  block_bloom_filter_.Insert(hash);
+  block_bloom_filter_.InsertBuffered(hash, buffers_);
+  //block_bloom_filter_.Insert(hash);
 }

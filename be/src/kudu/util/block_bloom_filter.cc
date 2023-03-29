@@ -91,7 +91,8 @@ BlockBloomFilter::~BlockBloomFilter() {
 
 Status BlockBloomFilter::InitInternal(const int log_space_bytes,
                                       HashAlgorithm hash_algorithm,
-                                      uint32_t hash_seed) {
+                                      uint32_t hash_seed,
+                                      std::vector<std::vector<uint32_t>>* buffers) {
   if (!HashUtil::IsComputeHash32Available(hash_algorithm)) {
     return Status::InvalidArgument(
         Substitute("Invalid/Unsupported hash algorithm $0", HashAlgorithm_Name(hash_algorithm)));
@@ -115,12 +116,20 @@ Status BlockBloomFilter::InitInternal(const int log_space_bytes,
                                                   reinterpret_cast<void**>(&directory_)));
   hash_algorithm_ = hash_algorithm;
   hash_seed_ = hash_seed;
+
+  int log_buffer_size = 18; // 256KB - with 32 byte  buckets this means 8K buckets per buffer
+  int log_num_buffers = log_space_bytes - log_buffer_size;
+  if (log_num_buffers >= 1 && buffers != nullptr) {
+    *buffers = std::vector<vector<uint32_t>>(1 << log_num_buffers);
+  }
+
   return Status::OK();
 }
 
 Status BlockBloomFilter::Init(const int log_space_bytes, HashAlgorithm hash_algorithm,
-                              uint32_t hash_seed) {
-  RETURN_NOT_OK(InitInternal(log_space_bytes, hash_algorithm, hash_seed));
+                              uint32_t hash_seed,
+                              std::vector<std::vector<uint32_t>>& buffers) {
+  RETURN_NOT_OK(InitInternal(log_space_bytes, hash_algorithm, hash_seed, &buffers));
   DCHECK(directory_);
   memset(directory_, 0, directory_size());
   always_false_ = true;
@@ -131,8 +140,8 @@ Status BlockBloomFilter::InitFromDirectory(int log_space_bytes,
                                            const Slice& directory,
                                            bool always_false,
                                            HashAlgorithm hash_algorithm,
-                                           uint32_t hash_seed) {
-  RETURN_NOT_OK(InitInternal(log_space_bytes, hash_algorithm, hash_seed));
+                                           uint32_t hash_seed) {                                         
+  RETURN_NOT_OK(InitInternal(log_space_bytes, hash_algorithm, hash_seed, nullptr));
   DCHECK(directory_);
 
   if (directory_size() != directory.size()) {
@@ -159,7 +168,7 @@ Status BlockBloomFilter::Clone(BlockBloomFilterBufferAllocatorIf* allocator,
                                unique_ptr<BlockBloomFilter>* bf_out) const {
   unique_ptr<BlockBloomFilter> bf_clone(new BlockBloomFilter(allocator));
 
-  RETURN_NOT_OK(bf_clone->InitInternal(log_space_bytes(), hash_algorithm_, hash_seed_));
+  RETURN_NOT_OK(bf_clone->InitInternal(log_space_bytes(), hash_algorithm_, hash_seed_, nullptr));
   DCHECK(bf_clone->directory_);
   CHECK_EQ(bf_clone->directory_size(), directory_size());
   memcpy(bf_clone->directory_, directory_, bf_clone->directory_size());
@@ -319,6 +328,47 @@ void BlockBloomFilter::Insert(const uint32_t hash) noexcept {
   DCHECK(bucket_insert_func_ptr_);
   (this->*bucket_insert_func_ptr_)(bucket_idx, hash);
 }
+
+
+void BlockBloomFilter::InsertBuffered(uint32_t hash, std::vector<std::vector<uint32_t>>& buffers) noexcept {
+  if (buffers.empty()) {
+    Insert(hash);
+    return;
+  }
+  always_false_ = false;
+  const uint32_t bucket_idx = Rehash32to32(hash) & directory_mask_;
+  uint32_t buffer_idx =  bucket_idx >> (18 - kLogBucketByteSize);
+  std::vector<uint32_t>& buffer = buffers[buffer_idx];
+  buffer.push_back(hash);
+  buffer.push_back(bucket_idx);
+  const uint32_t FLUSH_SIZE = 1024 * 2;
+  if (buffer.size() == FLUSH_SIZE * 2) {
+    /*for (int i =0; i < FLUSH_SIZE; i++) {
+      void* bucket_ptr = directory_ + buffer[i*2 + 1] * 32;
+      __builtin_prefetch(bucket_ptr, 1, 1);
+    }*/
+    for (int i =0; i < FLUSH_SIZE; i++) {
+      //__builtin_prefetch(&buckets_[bucket_idx], READ ? 0 : 1, 1);
+      //Insert(hash);
+      //(this->*bucket_insert_func_ptr_)(buffer[i*2 + 1], buffer[i*2]);
+      // TODO: handle non AVX2 case
+      BucketInsertAVX2(buffer[i*2 + 1], buffer[i*2]);
+    }
+    buffer.clear();
+  }
+}
+
+void BlockBloomFilter::FlushBuffered(std::vector<std::vector<uint32_t>>& buffers) noexcept {
+  for (int buffer_idx = 0; buffer_idx  <  buffers.size(); buffer_idx++) {
+    std::vector<uint32_t>& buffer = buffers[buffer_idx];
+    for (int i =0; i < buffer.size() / 2; i++) {
+      //Insert(hash);
+      (this->*bucket_insert_func_ptr_)(buffer[i*2 + 1], buffer[i*2]);
+    }
+    buffer.clear();
+  }
+}
+
 
 bool BlockBloomFilter::Find(const uint32_t hash) const noexcept {
   if (always_false_) {
