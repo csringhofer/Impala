@@ -181,6 +181,7 @@ public class IcebergDeleteNode extends JoinNode {
                                           .getFileDescriptorsWithLimit(null, false, -1)
                                           .size();
       } else {
+        Preconditions.checkState(distrMode_ == DistributionMode.BROADCAST);
         numberOfDataFilesWithDelete = ((IcebergScanNode) getChild(0))
                                           .getFileDescriptorsWithLimit(null, false, -1)
                                           .size();

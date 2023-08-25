@@ -31,6 +31,7 @@ class TestJoinQueries(ImpalaTestSuite):
   # Additional values for exhaustive tests.
   MT_DOP_VALUES_EXHAUSTIVE = [1]
   ENABLE_OUTER_JOIN_TO_INNER_TRANSFORMATION = ['false', 'true']
+  LOCAL_SHUFFLE_BYTES_LIMIT= [0, 34359738368]
 
   @classmethod
   def get_workload(cls):
@@ -55,9 +56,13 @@ class TestJoinQueries(ImpalaTestSuite):
       # Cut down on execution time when not running in exhaustive mode.
       cls.ImpalaTestMatrix.add_constraint(lambda v: v.get_value('batch_size') != 1)
 
+    #cls.ImpalaTestMatrix.add_dimension(
+    #    ImpalaTestDimension('enable_outer_join_to_inner_transformation',
+    #    *TestJoinQueries.ENABLE_OUTER_JOIN_TO_INNER_TRANSFORMATION))
+   
     cls.ImpalaTestMatrix.add_dimension(
-        ImpalaTestDimension('enable_outer_join_to_inner_transformation',
-        *TestJoinQueries.ENABLE_OUTER_JOIN_TO_INNER_TRANSFORMATION))
+        ImpalaTestDimension('local_shuffle_bytes_limit',
+        *TestJoinQueries.LOCAL_SHUFFLE_BYTES_LIMIT))
 
   def test_basic_joins(self, vector):
     new_vector = deepcopy(vector)
@@ -132,6 +137,10 @@ class TestTPCHJoinQueries(ImpalaTestSuite):
     if cls.exploration_strategy() != 'exhaustive':
       # Cut down on execution time when not running in exhaustive mode.
       cls.ImpalaTestMatrix.add_constraint(lambda v: v.get_value('batch_size') != 1)
+
+    cls.ImpalaTestMatrix.add_dimension(
+        ImpalaTestDimension('local_shuffle_bytes_limit',
+        *TestJoinQueries.LOCAL_SHUFFLE_BYTES_LIMIT))
 
   @classmethod
   def teardown_class(cls):

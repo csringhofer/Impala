@@ -344,7 +344,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
    */
   private void castPartitionedJoinExchanges(PlanNode node, Analyzer analyzer) {
     if (node instanceof HashJoinNode
-        && ((JoinNode) node).getDistributionMode() == DistributionMode.PARTITIONED) {
+        && ((JoinNode) node).getDistributionMode().usesPartitioning()) {
       // Contains all exchange nodes in this fragment below the current join node.
       List<ExchangeNode> exchNodes = new ArrayList<>();
       node.collect(ExchangeNode.class, exchNodes);
