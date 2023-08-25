@@ -35,6 +35,7 @@ import org.apache.impala.catalog.FeKuduTable;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.planner.JoinNode.DistributionMode;
+import org.apache.impala.thrift.TLocalPartitioningRole;
 import org.apache.impala.thrift.TPartitionType;
 import org.apache.impala.thrift.TVirtualColumnType;
 import org.apache.impala.util.KuduUtil;
@@ -446,7 +447,14 @@ public class DistributedPlanner {
       PlanFragment leftChildFragment, PlanFragment rightChildFragment,
       List<Expr> lhsJoinExprs, List<Expr> rhsJoinExprs,
       List<PlanFragment> fragments) throws ImpalaException {
-    Preconditions.checkState(node.getDistributionMode() == DistributionMode.PARTITIONED);
+    Preconditions.checkState(node.getDistributionMode().usesPartitioning());
+
+    boolean isLocalPartitioned =
+        node.getDistributionMode() == DistributionMode.LOCAL_PARTITIONED;
+    // TODO: Think through what to do with compatible lhs/rhs partitioning in case
+    //       of local partitioning. The optimized returns paths are probably incorrect
+    //       subuptimal for local partitioning.
+
     // The lhs and rhs input fragments are already partitioned on the join exprs.
     // Combine the lhs/rhs input fragments into leftChildFragment by placing the join
     // node into leftChildFragment and setting its lhs/rhs children to the plan root of
@@ -547,6 +555,17 @@ public class DistributedPlanner {
       // Otherwise we're good to use the lhs partition.
       default:
         outputPartition = lhsJoinPartition;
+    }
+    if (isLocalPartitioned) {
+      // The output won't be partioned among hosts, so we cannot assume it to be
+      // partitioned.
+      // TODO: it would be possible to propagate the local partitioned state.
+      outputPartition = DataPartition.RANDOM;
+
+      lhsJoinPartition.setLocalPartitioningRole(
+          TLocalPartitioningRole.SEND_TO_ONE_INSTANCE_WITHIN_HOST);
+      rhsJoinPartition.setLocalPartitioningRole(
+          TLocalPartitioningRole.SEND_TO_ONE_INSTANCE_IN_EACH_HOST);
     }
     PlanFragment joinFragment =
         new PlanFragment(ctx_.getNextFragmentId(), node, outputPartition);
@@ -842,10 +861,13 @@ public class DistributedPlanner {
    long htSize = Math.round(rhsDataSize * PlannerContext.HASH_TBL_SPACE_OVERHEAD);
    long memLimit = ctx_.getQueryOptions().mem_limit;
    long broadcast_bytes_limit = ctx_.getQueryOptions().getBroadcast_bytes_limit();
+   long local_partitioning_bytes_limit =
+       ctx_.getQueryOptions().getLocal_shuffle_bytes_limit();
 
    if (broadcastCost <= partitionCost && (memLimit == 0 || htSize <= memLimit) &&
            (broadcast_bytes_limit == 0 || htSize <= broadcast_bytes_limit)) {
-     return DistributionMode.BROADCAST;
+     if (local_partitioning_bytes_limit >= htSize) return DistributionMode.BROADCAST;
+     else return DistributionMode.LOCAL_PARTITIONED;
    }
    // Partitioned was cheaper or the broadcast HT would not fit within the mem limit.
    return DistributionMode.PARTITIONED;

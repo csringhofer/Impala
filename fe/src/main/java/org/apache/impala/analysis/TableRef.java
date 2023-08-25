@@ -404,9 +404,9 @@ public class TableRef extends StmtNode {
     sampleParams_ = sampleParams;
   }
 
-  public boolean isBroadcastJoin() { return distrMode_ == DistributionMode.BROADCAST; }
+  private boolean isBroadcastJoin() { return distrMode_ == DistributionMode.BROADCAST; }
 
-  public boolean isPartitionedJoin() {
+  private boolean isPartitionedJoin() {
     return distrMode_ == DistributionMode.PARTITIONED;
   }
 
@@ -605,7 +605,13 @@ public class TableRef extends StmtNode {
         }
         distrMode_ = DistributionMode.PARTITIONED;
         analyzer.setHasPlanHints();
-      } else {
+      } else if (hint.is("LOCAL_SHUFFLE")) {
+        // TODO: handle conflicts as above
+        // TODO: what to do if mt_dop <=1?
+        distrMode_ = DistributionMode.LOCAL_PARTITIONED;
+        analyzer.setHasPlanHints();
+      }
+      else {
         analyzer.addWarning("JOIN hint not recognized: " + hint);
       }
     }
