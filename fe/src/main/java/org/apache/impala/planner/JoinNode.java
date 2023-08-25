@@ -108,7 +108,8 @@ public abstract class JoinNode extends PlanNode {
     NONE("NONE"),
     BROADCAST("BROADCAST"),
     PARTITIONED("PARTITIONED"),
-    DIRECTED("DIRECTED");
+    DIRECTED("DIRECTED"),
+    LOCAL_PARTITIONED("LOCAL_PARTITIONED");
 
     private final String description_;
 
@@ -121,6 +122,7 @@ public abstract class JoinNode extends PlanNode {
 
     public static DistributionMode fromThrift(TJoinDistributionMode distrMode) {
       switch (distrMode) {
+        // TODO: should this handle LOCAL_PARTITIONED?
         case BROADCAST:
           return BROADCAST;
         case SHUFFLE:
@@ -130,6 +132,10 @@ public abstract class JoinNode extends PlanNode {
         default:
           throw new RuntimeException("Invalid distribution mode: " + distrMode);
       }
+    }
+
+    public boolean usesPartitioning() {
+      return this == PARTITIONED || this == LOCAL_PARTITIONED;
     }
   }
 

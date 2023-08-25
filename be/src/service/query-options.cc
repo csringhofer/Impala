@@ -1166,6 +1166,12 @@ Status impala::SetQueryOption(const string& key, const string& value,
         query_options->__set_codegen_opt_level(enum_type);
         break;
       }
+      case TImpalaQueryOptions::LOCAL_SHUFFLE_BYTES_LIMIT: {
+        MemSpec mem_spec_val{};
+        RETURN_IF_ERROR(QueryOptionParser::Parse<MemSpec>(option, value, &mem_spec_val));
+        query_options->__set_local_shuffle_bytes_limit(mem_spec_val.value);
+        break;
+      }
       default:
         if (IsRemovedQueryOption(key)) {
           LOG(WARNING) << "Ignoring attempt to set removed query option '" << key << "'";

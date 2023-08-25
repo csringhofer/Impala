@@ -24,6 +24,7 @@ import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.ExprSubstitutionMap;
 import org.apache.impala.thrift.TDataPartition;
+import org.apache.impala.thrift.TLocalPartitioningRole;
 import org.apache.impala.thrift.TPartitionType;
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
@@ -44,7 +45,10 @@ public class DataPartition {
   // Always non-null.
   private List<Expr> partitionExprs_;
 
-  private DataPartition(TPartitionType type, List<Expr> exprs) {
+  private TLocalPartitioningRole localPartitioningRole_ = TLocalPartitioningRole.NONE;
+
+  private DataPartition(TPartitionType type, List<Expr> exprs,
+      TLocalPartitioningRole localPartitioningRole) {
     Preconditions.checkNotNull(exprs);
     Preconditions.checkState(!exprs.isEmpty());
     Preconditions.checkState(type == TPartitionType.HASH_PARTITIONED
@@ -52,6 +56,7 @@ public class DataPartition {
         || type == TPartitionType.KUDU);
     type_ = type;
     partitionExprs_ = exprs;
+    localPartitioningRole_ = localPartitioningRole;
   }
 
   private DataPartition(TPartitionType type) {
@@ -68,20 +73,27 @@ public class DataPartition {
   public final static DataPartition RANDOM =
       new DataPartition(TPartitionType.RANDOM);
 
+
   public final static DataPartition DIRECTED = new DataPartition(TPartitionType.DIRECTED);
 
   public static DataPartition hashPartitioned(List<Expr> exprs) {
-    return new DataPartition(TPartitionType.HASH_PARTITIONED, exprs);
+    return new DataPartition(TPartitionType.HASH_PARTITIONED, exprs,
+        TLocalPartitioningRole.NONE);
   }
 
   public static DataPartition kuduPartitioned(Expr expr) {
-    return new DataPartition(TPartitionType.KUDU, Lists.newArrayList(expr));
+    return new DataPartition(TPartitionType.KUDU, Lists.newArrayList(expr), 
+        TLocalPartitioningRole.NONE);
   }
 
   public boolean isPartitioned() { return type_ != TPartitionType.UNPARTITIONED; }
   public boolean isHashPartitioned() { return type_ == TPartitionType.HASH_PARTITIONED; }
   public TPartitionType getType() { return type_; }
   public List<Expr> getPartitionExprs() { return partitionExprs_; }
+
+  public void setLocalPartitioningRole(TLocalPartitioningRole role) {
+    localPartitioningRole_ = role;
+  }
 
   public void substitute(ExprSubstitutionMap smap, Analyzer analyzer) {
     partitionExprs_ = Expr.substituteList(partitionExprs_, smap, analyzer, false);
@@ -92,6 +104,7 @@ public class DataPartition {
     if (partitionExprs_ != null) {
       result.setPartition_exprs(Expr.treesToThrift(partitionExprs_));
     }
+    result.setLocal_partitioning_role(localPartitioningRole_);
     return result;
   }
 
@@ -101,6 +114,7 @@ public class DataPartition {
     if (obj.getClass() != this.getClass()) return false;
     DataPartition other = (DataPartition) obj;
     if (type_ != other.type_) return false;
+    if (localPartitioningRole_ != other.localPartitioningRole_) return false;
     return Expr.equalLists(partitionExprs_, other.partitionExprs_);
   }
 
@@ -108,11 +122,13 @@ public class DataPartition {
     return MoreObjects.toStringHelper(this)
         .add("type_", type_)
         .addValue(Expr.debugString(partitionExprs_))
+        .add("localPartitioningRole_", localPartitioningRole_)
         .toString();
   }
 
   public String getExplainString() {
     StringBuilder str = new StringBuilder();
+    if (localPartitioningRole_ != TLocalPartitioningRole.NONE) str.append("LOCAL ");
     str.append(getPartitionShortName(type_));
     if (!partitionExprs_.isEmpty()) {
       List<String> strings = new ArrayList<>();

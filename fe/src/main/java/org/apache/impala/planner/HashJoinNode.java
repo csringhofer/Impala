@@ -258,6 +258,8 @@ public class HashJoinNode extends JoinNode {
       // Assume the rows are evenly divided among instances.
       if (distrMode_ == DistributionMode.PARTITIONED) {
         perBuildInstanceDataBytes /= numInstances;
+      } else if (distrMode_ == DistributionMode.LOCAL_PARTITIONED) {
+        perBuildInstanceDataBytes /= fragment_.getNumInstancesPerHost(queryOptions);
       }
       perBuildInstanceMemEstimate = perBuildInstanceDataBytes;
     }

@@ -60,6 +60,7 @@ class QueryState;
 class ReportExecStatusRequestPB;
 class RuntimeProfile;
 class RuntimeState;
+class TJoinBuildSink;
 class TPlanExecRequest;
 class TRuntimeProfileTree;
 class TUpdateCatalogRequest;
@@ -582,7 +583,8 @@ class Coordinator { // NOLINT: The member variables could be re-ordered to save 
   /// build is separate). 'num_instances' and 'num_backends' are the number of instances
   /// and backends that the fragment runs on.
   void AddFilterSource(const FragmentExecParamsPB& src_fragment_params, int num_instances,
-      int num_backends, const TRuntimeFilterDesc& filter, int join_node_id);
+      int num_backends, const TRuntimeFilterDesc& filter, int join_node_id,
+      const TJoinBuildSink* build_sink);
 
   /// Helper for HandleExecStateTransition(). Releases all resources associated with
   /// query execution. The ExecState state-machine ensures this is called exactly once.
