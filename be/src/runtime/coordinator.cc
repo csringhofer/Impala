@@ -387,7 +387,8 @@ void Coordinator::InitFilterRoutingTable() {
         // though the builder is separate from the actual node.
         DCHECK_EQ(filter.src_node_id, join_sink.dest_node_id);
         AddFilterSource(
-            fragment_params, num_instances, num_backends, filter, filter.src_node_id);
+            fragment_params, num_instances, num_backends, filter, filter.src_node_id,
+            &join_sink);
       }
     }
     for (const TPlanNode& plan_node : fragment->plan.nodes) {
@@ -400,7 +401,8 @@ void Coordinator::InitFilterRoutingTable() {
             && (plan_node.join_node.__isset.hash_join_node
                 || plan_node.join_node.__isset.nested_loop_join_node)) {
           AddFilterSource(
-              fragment_params, num_instances, num_backends, filter, plan_node.node_id);
+              fragment_params, num_instances, num_backends, filter, plan_node.node_id,
+              nullptr);
         } else if (plan_node.__isset.hdfs_scan_node || plan_node.__isset.kudu_scan_node) {
           FilterState* f = filter_routing_table_->GetOrCreateFilterState(filter);
           auto it = filter.planid_to_target_ndx.find(plan_node.node_id);
@@ -425,7 +427,7 @@ void Coordinator::InitFilterRoutingTable() {
 
 void Coordinator::AddFilterSource(const FragmentExecParamsPB& src_fragment_params,
     int num_instances, int num_backends, const TRuntimeFilterDesc& filter,
-    int join_node_id) {
+    int join_node_id, const TJoinBuildSink* build_sink) {
   FilterState* f = filter_routing_table_->GetOrCreateFilterState(filter);
 
   // Determine which instances will produce the filters.
@@ -449,14 +451,43 @@ void Coordinator::AddFilterSource(const FragmentExecParamsPB& src_fragment_param
   // on MAX_BROADCAST_FILTER_PRODUCERS instances. If this is not a broadcast join
   // or it is a broadcast join with local targets, it should be generated
   // everywhere the join is executed.
-  if (filter.is_broadcast_join && !filter.has_local_targets
+  if (filter.is_parallel_broadcast_join && !filter.has_local_targets) {
+    // TODO: select all instances on one or few hosts
+    DCHECK(src_fragment_params.has_num_hosts());
+    DCHECK(src_fragment_params.num_hosts() != 0);
+    // All host must have the same number of fragment instances.
+    if (src_idxs.size() % src_fragment_params.num_hosts() == 0) {
+      int mt_dop = src_idxs.size() / src_fragment_params.num_hosts();
+      //DCHECK_GT(mt_dop, 1);
+      std::random_device rd;
+      std::mt19937 gen(rd());
+      std::uniform_int_distribution<> distrib(0, src_fragment_params.num_hosts());
+      int filtering_host = distrib(gen);
+      vector<int> tmp_idxs;
+      tmp_idxs.reserve(mt_dop);
+      for (int i = 0; i < mt_dop; i++) {
+        tmp_idxs.push_back(src_idxs[filtering_host*mt_dop + i]);
+      }
+      tmp_idxs.swap(src_idxs);
+    } else {
+      LOG(ERROR) << src_idxs.size() << " " << src_fragment_params.num_hosts();
+    }
+
+  } else if (filter.is_broadcast_join && !filter.has_local_targets
       && num_instances > MAX_BROADCAST_FILTER_PRODUCERS) {
+    // TODO: Is it ok to use std rand here?
     random_shuffle(src_idxs.begin(), src_idxs.end());
     src_idxs.resize(MAX_BROADCAST_FILTER_PRODUCERS);
   }
 
+
+  bool is_broadcast = filter.is_broadcast_join || filter.is_parallel_broadcast_join;
+  if (filter.is_parallel_broadcast_join) {
+    DCHECK(!filter.is_broadcast_join);
+  }
+
   bool has_intermediate_aggregator = src_fragment_params.has_filter_agg_info()
-      && !filter.has_local_targets && !filter.is_broadcast_join
+      && !filter.has_local_targets && !is_broadcast
       && filter.type == TRuntimeFilterType::BLOOM;
 
   if (has_intermediate_aggregator) {
@@ -480,7 +511,7 @@ void Coordinator::AddFilterSource(const FragmentExecParamsPB& src_fragment_param
     // updates. We expect to receive a single aggregated filter from each backend
     // for partitioned joins.
     int pending_count =
-        filter.is_broadcast_join ? (filter.has_remote_targets ? 1 : 0) : num_backends;
+        is_broadcast ? (filter.has_remote_targets ? 1 : 0) : num_backends;
     f->set_pending_count(pending_count);
   }
 

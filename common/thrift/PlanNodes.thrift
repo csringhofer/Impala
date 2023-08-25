@@ -189,6 +189,8 @@ struct TRuntimeFilterDesc {
 
   // The ID of the plan node that produces this filter.
   13: optional Types.TPlanNodeId src_node_id
+
+  14: required bool is_parallel_broadcast_join
 }
 
 // The information contained in subclasses of ScanNode captured in two separate

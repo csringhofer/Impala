@@ -759,6 +759,10 @@ struct TQueryOptions {
 
   // See comment in ImpalaService.thrift
   186: optional bool estimate_duplicate_in_preagg = true
+
+  // See comment in ImpalaService.thrift
+  // Same default value as broadcast_bytes_limit.
+  187: optional i64 local_shuffle_bytes_limit = 20000000;
 }
 
 // Impala currently has three types of sessions: Beeswax, HiveServer2 and external

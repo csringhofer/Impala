@@ -977,6 +977,8 @@ enum TImpalaQueryOptions {
   // If True, account for probability of having duplicate grouping key exist in multiple
   // nodes during preaggreation.
   ESTIMATE_DUPLICATE_IN_PREAGG = 185
+
+  LOCAL_SHUFFLE_BYTES_LIMIT = 186
 }
 
 // The summary of a DML statement.

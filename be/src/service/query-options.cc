@@ -1330,6 +1330,12 @@ Status impala::SetQueryOption(TImpalaQueryOptions::type option, const string& va
         query_options->__set_estimate_duplicate_in_preagg(IsTrue(value));
         break;
       }
+      case TImpalaQueryOptions::LOCAL_SHUFFLE_BYTES_LIMIT: {
+        MemSpec mem_spec_val{};
+        RETURN_IF_ERROR(QueryOptionParser::Parse<MemSpec>(option, value, &mem_spec_val));
+        query_options->__set_local_shuffle_bytes_limit(mem_spec_val.value);
+        break;
+      }
       default:
         string key = to_string(option);
         if (IsRemovedQueryOption(key)) {

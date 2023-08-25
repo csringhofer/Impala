@@ -221,6 +221,7 @@ public final class RuntimeFilterGenerator {
     // If true, the join node building this filter is executed using a broadcast join;
     // set in the DistributedPlanner.createHashJoinFragment()
     private boolean isBroadcastJoin_;
+    private boolean isParallelBroadcastJoin_;
     // Estimate of the number of distinct values that will be inserted into this filter,
     // globally across all instances of the source node. Used to compute an optimal size
     // for the filter. A value of -1 means no estimate is available, and default filter
@@ -422,6 +423,7 @@ public final class RuntimeFilterGenerator {
       tFilter.setApplied_on_partition_columns(appliedOnPartitionColumns);
       tFilter.setType(type_);
       tFilter.setFilter_size_bytes(filterSizeBytes_);
+      tFilter.setIs_parallel_broadcast_join(isParallelBroadcastJoin_);
       return tFilter;
     }
 
@@ -735,6 +737,7 @@ public final class RuntimeFilterGenerator {
     public void addTarget(RuntimeFilterTarget target) { targets_.add(target); }
 
     public void setIsBroadcast(boolean isBroadcast) { isBroadcastJoin_ = isBroadcast; }
+    public void setIsParallelBroadcast(boolean val) { isParallelBroadcastJoin_ = val; }
 
     public void computeNdvEstimate() {
       ndvEstimate_ = src_.getChild(1).getCardinality();
@@ -948,8 +951,10 @@ public final class RuntimeFilterGenerator {
       }
       DistributionMode distMode = filter.src_.getDistributionMode();
       filter.setIsBroadcast(distMode == DistributionMode.BROADCAST);
+      filter.setIsParallelBroadcast(distMode ==  DistributionMode.LOCAL_PARTITIONED);
       if (filter.getType() == TRuntimeFilterType.IN_LIST
           && distMode == DistributionMode.PARTITIONED) {
+        // TODO: should we allow IN_LIST filters in the local partitioned case?
         if (LOG.isTraceEnabled()) {
           LOG.trace("Skip IN-list filter on partitioned join: {}", filter.debugString());
         }

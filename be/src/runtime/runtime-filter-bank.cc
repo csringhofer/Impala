@@ -343,6 +343,7 @@ void RuntimeFilterBank::UpdateFilterFromLocal(int32_t filter_id,
     DCHECK(result_filter != nullptr)
         << "Tried to update unregistered filter: " << filter_id;
     DCHECK_GT(produced_filter.pending_producers, 0);
+    //LOG(ERROR) << result_filter->filter_desc();
     if (result_filter->filter_desc().is_broadcast_join) {
       // For broadcast joins, the first filter to arrived is used, and the rest are
       // ignored (because they should have identical contents).

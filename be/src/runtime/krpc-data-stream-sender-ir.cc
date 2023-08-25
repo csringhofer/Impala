@@ -33,6 +33,7 @@ Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
   // Hash / deepcopy in batches of HASH_BATCH_SIZE.
   // This optimization (IMPALA-6461) can be probably removed if deepcopy gets
   // codegend.
+  // TODO: get number of hosts / number if instances per host
   int channel_ids[RowBatch::HASH_BATCH_SIZE];
   int row_idx = 0;
   while (row_idx < num_rows) {
@@ -47,6 +48,7 @@ Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
       PartitionRowCollector& collector = partition_row_collectors_[channel_id];
       RETURN_IF_ERROR(collector.AppendRow(row_batch_iter.Get(), row_desc_));
     }
+
     row_idx += row_count;
   }
   return Status::OK();

@@ -72,10 +72,14 @@ class TestJoinBase(ImpalaTestSuite):
 
 class TestJoinQueries(TestJoinBase):
 
+  LOCAL_SHUFFLE_BYTES_LIMIT= [0, 34359738368]
+
   @classmethod
   def add_test_dimensions(cls):
     super(TestJoinQueries, cls).add_test_dimensions()
     add_exec_option_dimension(cls, 'mt_dop', mt_dop_dim(cls))
+    add_exec_option_dimension(cls, 'local_shuffle_bytes_limit',
+        TestJoinQueries.LOCAL_SHUFFLE_BYTES_LIMIT)
 
   def test_basic_joins(self, vector):
     self.run_test_case('QueryTest/joins', vector)
@@ -169,6 +173,8 @@ class TestTPCHJoinQueries(TestJoinBase):
   @classmethod
   def add_test_dimensions(cls):
     super(TestTPCHJoinQueries, cls).add_test_dimensions()
+    add_exec_option_dimension(cls, 'local_shuffle_bytes_limit',
+        TestJoinQueries.LOCAL_SHUFFLE_BYTES_LIMIT)
 
   @classmethod
   def teardown_class(cls):
