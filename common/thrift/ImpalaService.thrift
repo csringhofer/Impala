@@ -832,7 +832,9 @@ enum TImpalaQueryOptions {
   //   corrFactor = AGG_MEM_CORRELATION_FACTOR ^ max(0, N - 1)
   // Valid values are in [0.0, 1.0]. Setting value 1.0 will result in an equal memory
   // estimate as the default estimation (no change). Default to 0.5.
-  AGG_MEM_CORRELATION_FACTOR = 163
+  AGG_MEM_CORRELATION_FACTOR = 163;
+
+  LOCAL_SHUFFLE_BYTES_LIMIT = 164;
 }
 
 // The summary of a DML statement.

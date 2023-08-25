@@ -47,6 +47,20 @@ class RuntimeState;
 class ScalarExpr;
 class ScalarExprEvaluator;
 
+
+/*
+TODO: try to allow multiple fragments of this in broadcast joins
+- use the initial 16 way partitioning to distribute work
+  - scheduler should create 2/4/8/16 instances for even distribution
+  - each partition would be assigned to single builder
+  - should have a shared state class that communicates with JoinNode and decided
+    global decisions like which partition to spill. Probably also needs shared memchanism
+    mechanism (or just share reservation evenly?) (maybe  use hierarchical mem tracker?)
+
+*/
+
+
+
 /// Method signature of the codegened version of InsertBatch().
 typedef bool (*InsertBatchFn)(PhjBuilderPartition*, TPrefetchMode::type, HashTableCtx*,
     RowBatch*, const std::vector<BufferedTupleStream::FlatRowPtr>&, Status*);

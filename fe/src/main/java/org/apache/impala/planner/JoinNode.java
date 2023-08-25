@@ -107,7 +107,8 @@ public abstract class JoinNode extends PlanNode {
   public enum DistributionMode {
     NONE("NONE"),
     BROADCAST("BROADCAST"),
-    PARTITIONED("PARTITIONED");
+    PARTITIONED("PARTITIONED"),
+    LOCAL_PARTITIONED("LOCAL_PARTITIONED");
 
     private final String description_;
 
@@ -118,8 +119,13 @@ public abstract class JoinNode extends PlanNode {
     @Override
     public String toString() { return description_; }
     public static DistributionMode fromThrift(TJoinDistributionMode distrMode) {
+      // TODO: should this handle LOCAL_PARTITIONED?
       if (distrMode == TJoinDistributionMode.BROADCAST) return BROADCAST;
       return PARTITIONED;
+    }
+
+    public boolean usesPartitioning() {
+      return this == PARTITIONED || this == LOCAL_PARTITIONED;
     }
   }
 

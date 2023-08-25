@@ -657,6 +657,10 @@ struct TQueryOptions {
 
   // See comment in ImpalaService.thrift
   164: optional double agg_mem_correlation_factor = 0.5
+
+  // See comment in ImpalaService.thrift
+  // Same default value as broadcast_bytes_limit.
+  165: optional i64 local_shuffle_bytes_limit = 20000000;
 }
 
 // Impala currently has three types of sessions: Beeswax, HiveServer2 and external
