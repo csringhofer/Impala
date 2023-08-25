@@ -387,7 +387,8 @@ void Coordinator::InitFilterRoutingTable() {
         // though the builder is separate from the actual node.
         DCHECK_EQ(filter.src_node_id, join_sink.dest_node_id);
         AddFilterSource(
-            fragment_params, num_instances, num_backends, filter, filter.src_node_id);
+            fragment_params, num_instances, num_backends, filter, filter.src_node_id,
+            &join_sink);
       }
     }
     for (const TPlanNode& plan_node : fragment->plan.nodes) {
@@ -400,7 +401,8 @@ void Coordinator::InitFilterRoutingTable() {
             && (plan_node.join_node.__isset.hash_join_node
                 || plan_node.join_node.__isset.nested_loop_join_node)) {
           AddFilterSource(
-              fragment_params, num_instances, num_backends, filter, plan_node.node_id);
+              fragment_params, num_instances, num_backends, filter, plan_node.node_id,
+              nullptr);
         } else if (plan_node.__isset.hdfs_scan_node || plan_node.__isset.kudu_scan_node) {
           FilterState* f = filter_routing_table_->GetOrCreateFilterState(filter);
           auto it = filter.planid_to_target_ndx.find(plan_node.node_id);
@@ -425,7 +427,7 @@ void Coordinator::InitFilterRoutingTable() {
 
 void Coordinator::AddFilterSource(const FragmentExecParamsPB& src_fragment_params,
     int num_instances, int num_backends, const TRuntimeFilterDesc& filter,
-    int join_node_id) {
+    int join_node_id, const TJoinBuildSink* build_sink) {
   FilterState* f = filter_routing_table_->GetOrCreateFilterState(filter);
 
   // Determine which instances will produce the filters.

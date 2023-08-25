@@ -30,6 +30,7 @@ ScalarExprEvaluator* KrpcDataStreamSender::GetPartitionExprEvaluator(int i) {
 Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
   const int num_rows = batch->num_rows();
   const int num_channels = GetNumChannels();
+  // TODO: get number of hosts / number if instances per host
   int channel_ids[RowBatch::HASH_BATCH_SIZE];
   int row_idx = 0;
   while (row_idx < num_rows) {
@@ -44,6 +45,7 @@ Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
       PartitionRowCollector& collector = partition_row_collectors_[channel_id];
       RETURN_IF_ERROR(collector.AppendRow(row_batch_iter.Get(), row_desc_));
     }
+
     row_idx += row_count;
   }
   return Status::OK();

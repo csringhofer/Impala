@@ -99,6 +99,8 @@ struct TPlanFragment {
   // COMPUTE_PROCESSING_COST=true. Otherwise, always false.
   // See PlanFragment.java for definition of dominant fragment.
   16: optional bool is_dominant = false
+
+  17: optional bool is_local_partitioned
 }
 
 // location information for a single scan range

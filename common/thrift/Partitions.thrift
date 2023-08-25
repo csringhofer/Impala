@@ -46,6 +46,13 @@ enum TPartitionType {
   DIRECTED = 5
 }
 
+
+enum TLocalPartitioningRole {
+  NONE = 0
+  SEND_TO_ONE_INSTANCE_IN_EACH_HOST = 1
+  SEND_TO_ONE_INSTANCE_WITHIN_HOST = 2
+}
+
 // Specification of how a single logical data stream is partitioned.
 // This leaves out the parameters that determine the physical partition (for hash
 // partitions, the number of partitions; for range partitions, the partitions'
@@ -53,4 +60,5 @@ enum TPartitionType {
 struct TDataPartition {
   1: required TPartitionType type
   2: optional list<Exprs.TExpr> partition_exprs
+  3: optional TLocalPartitioningRole local_partitioning_role
 }

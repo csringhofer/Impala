@@ -88,6 +88,9 @@ Status KrpcDataStreamSenderConfig::Init(
   RETURN_IF_ERROR(DataSinkConfig::Init(tsink, input_row_desc, state));
   DCHECK(tsink_->__isset.stream_sink);
   partition_type_ = tsink_->stream_sink.output_partition.type;
+
+  const auto& destinations = state->fragment_ctx().destinations();
+
   if (partition_type_ == TPartitionType::HASH_PARTITIONED
       || partition_type_ == TPartitionType::KUDU) {
     RETURN_IF_ERROR(
@@ -95,8 +98,43 @@ Status KrpcDataStreamSenderConfig::Init(
             *input_row_desc_, state, &partition_exprs_));
     exchange_hash_seed_ =
         KrpcDataStreamSender::EXCHANGE_HASH_SEED_CONST ^ state->query_id().hi;
+    local_partitioning_role_ =
+        tsink_->stream_sink.output_partition.local_partitioning_role;
   }
-  num_channels_ = state->fragment_ctx().destinations().size();
+
+  if (local_partitioning_role_ != TLocalPartitioningRole::NONE) {
+    map<string, vector<int>> address_to_channels;
+
+    for (int i = 0; i < destinations.size(); i++) {
+      address_to_channels[destinations[i].krpc_backend().SerializeAsString()].push_back(i);
+    }
+    uint64_t max_channels_in_host = 0;
+    for (const auto& key_val: address_to_channels) {
+      max_channels_in_host = std::max(max_channels_in_host, key_val.second.size());
+    }
+    num_channels_ = max_channels_in_host;
+    hash_to_channel_ids_.resize(max_channels_in_host);
+
+    for (const auto& key_val: address_to_channels) {
+      if (local_partitioning_role_
+          == TLocalPartitioningRole::SEND_TO_ONE_INSTANCE_WITHIN_HOST
+          && key_val.first != ExecEnv::GetInstance()->krpc_address().SerializeAsString()) {
+        // Only send to local fragment instances.
+        continue;
+      }
+      const auto& channels_on_host = key_val.second;
+      for (int partition = 0; partition < max_channels_in_host; partition++) {
+        // In hosts with less fragment instances than maximum spread the partitions with
+        // round robin.
+        // Assume that a host can have 0 fragment instances only if it has no probe side
+        // fragment instance, so no local builds side is needed.
+        int target_channel = channels_on_host[partition % channels_on_host.size()];
+        hash_to_channel_ids_[partition].push_back(target_channel);
+      }
+    }
+  } else {
+    num_channels_ = destinations.size();
+  }
   state->CheckAndAddCodegenDisabledMessage(codegen_status_msgs_);
   return Status::OK();
 }
@@ -636,10 +674,19 @@ Status KrpcDataStreamSender::PartitionRowCollector::SendCurrentBatch() {
     DCHECK_EQ(num_rows_, 0);
     return Status::OK();
   }
+  DCHECK_GE(channels_.size(), 1);
   num_rows_ = 0;
-  RETURN_IF_ERROR(channel_->GetParent()->PrepareBatchForSend(
-      collector_batch_.get(), !channel_->IsLocal()));
-  RETURN_IF_ERROR(channel_->TransmitData(&collector_batch_, true /*swap_batch*/));
+  bool is_local_only = channels_.size() == 1 && channels_[0]->IsLocal();
+  RETURN_IF_ERROR(channels_[0]->GetParent()->PrepareBatchForSend(
+      collector_batch_.get(), !is_local_only));
+  if (channels_.size() == 1) {
+    RETURN_IF_ERROR(channels_[0]->TransmitData(&collector_batch_, true /*swap_batch*/));
+  } else {
+    for (Channel* ch: channels_) {
+      RETURN_IF_ERROR(ch->TransmitData(&collector_batch_, false /*swap_batch*/));
+    }
+    in_flight_batch_.swap(collector_batch_);
+  }
   collector_batch_->Reset();
   return Status::OK();
 }
@@ -810,10 +857,11 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
         destination.krpc_backend(), destination.fragment_instance_id(), sink.dest_node_id,
         per_channel_buffer_size, is_local));
 
-    if (partition_type_  == TPartitionType::HASH_PARTITIONED
-        || sink.output_partition.type == TPartitionType::KUDU) {
+    if ((partition_type_  == TPartitionType::HASH_PARTITIONED
+        || sink.output_partition.type == TPartitionType::KUDU)
+        && sink_config.local_partitioning_role_ == TLocalPartitioningRole::NONE) {
       partition_row_collectors_.emplace_back();
-      partition_row_collectors_.back().channel_ = channels_.back().get();
+      partition_row_collectors_.back().channels_.push_back(channels_.back().get());
     }
 
     if (IsDirectedMode()) {
@@ -834,6 +882,16 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
       || partition_type_ == TPartitionType::RANDOM) {
     // Randomize the order we open/transmit to channels to avoid thundering herd problems.
     random_shuffle(channels_.begin(), channels_.end());
+  }
+
+  if (sink_config.local_partitioning_role_ != TLocalPartitioningRole::NONE) {
+    DCHECK_EQ(partition_type_, TPartitionType::HASH_PARTITIONED);
+    for (const vector<int>& channel_ids: sink_config.hash_to_channel_ids_) {
+      partition_row_collectors_.emplace_back();
+      for (int channel_id: channel_ids) {
+        partition_row_collectors_.back().channels_.push_back(channels_[channel_id].get());
+      }
+    }
   }
 
   DCHECK(filepath_to_hosts_.empty() || partition_type_ == TPartitionType::DIRECTED) <<
@@ -893,7 +951,11 @@ Status KrpcDataStreamSender::Prepare(
   }
   for (PartitionRowCollector& collector: partition_row_collectors_) {
     collector.collector_batch_.reset(new OutboundRowBatch(char_mem_tracker_allocator_));
-    collector.row_batch_capacity_ = collector.channel_->RowBatchCapacity();
+    if (collector.channels_.size() > 1) {
+      collector.in_flight_batch_.reset(
+          new OutboundRowBatch(char_mem_tracker_allocator_));
+    }
+    collector.row_batch_capacity_ = collector.channels_[0]->RowBatchCapacity();
   }
   for (auto& [ch, ice_ch] : channel_to_ice_channel_) {
     ice_ch->Prepare(mem_tracker_.get());
@@ -1092,6 +1154,11 @@ void KrpcDataStreamSenderConfig::Codegen(FragmentState* state) {
     }
   }
   AddCodegenStatus(codegen_status, sender_name);
+}
+
+int KrpcDataStreamSender::GetNumChannels() const {
+  const auto& config = (const KrpcDataStreamSenderConfig&) sink_config_;
+  return config.num_channels_;
 }
 
 uint64_t KrpcDataStreamSender::HashRow(TupleRow* row, uint64_t seed) {

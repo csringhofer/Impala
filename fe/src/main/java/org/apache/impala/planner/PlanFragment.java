@@ -180,6 +180,8 @@ public class PlanFragment extends TreeNode<PlanFragment> {
   // A fragment is dominant if it contribute towards the final CoreCount.
   private boolean isDominantFragment_ = false;
 
+  boolean is_local_partitioned_ = false;
+
   public long getProducedRuntimeFiltersMemReservationBytes() {
     return producedRuntimeFiltersMemReservationBytes_;
   }
@@ -364,7 +366,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
    */
   private void castPartitionedJoinExchanges(PlanNode node, Analyzer analyzer) {
     if (node instanceof HashJoinNode
-        && ((JoinNode) node).getDistributionMode() == DistributionMode.PARTITIONED) {
+        && ((JoinNode) node).getDistributionMode().usesPartitioning()) {
       // Contains all exchange nodes in this fragment below the current join node.
       List<ExchangeNode> exchNodes = new ArrayList<>();
       node.collect(ExchangeNode.class, exchNodes);
@@ -1439,4 +1441,6 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     // and preaggregation as a blocking node. Otherwise, follow PlanNode.isBlockingNode().
     return node.isBlockingNode() || node instanceof AggregationNode;
   }
+
+  void setIsLocalPartitioned(boolean v) { is_local_partitioned_ = v; }
 }

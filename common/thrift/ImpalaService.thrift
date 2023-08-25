@@ -969,6 +969,8 @@ enum TImpalaQueryOptions {
   // tuple_cache_debug_dump_dir is specified and enable_tuple_cache_verification is set
   // to true.
   ENABLE_TUPLE_CACHE_VERIFICATION = 183
+
+  LOCAL_SHUFFLE_BYTES_LIMIT = 184
 }
 
 // The summary of a DML statement.
