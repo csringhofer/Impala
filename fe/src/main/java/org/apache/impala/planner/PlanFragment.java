@@ -171,6 +171,8 @@ public class PlanFragment extends TreeNode<PlanFragment> {
   private int thisTreeCpuCore_ = -1;
   private int subtreeCpuCore_ = -1;
 
+  boolean is_local_partitioned_ = false;
+
   public long getProducedRuntimeFiltersMemReservationBytes() {
     return producedRuntimeFiltersMemReservationBytes_;
   }
@@ -344,7 +346,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
    */
   private void castPartitionedJoinExchanges(PlanNode node, Analyzer analyzer) {
     if (node instanceof HashJoinNode
-        && ((JoinNode) node).getDistributionMode() == DistributionMode.PARTITIONED) {
+        && ((JoinNode) node).getDistributionMode().usesPartitioning()) {
       // Contains all exchange nodes in this fragment below the current join node.
       List<ExchangeNode> exchNodes = new ArrayList<>();
       node.collect(ExchangeNode.class, exchNodes);
@@ -1251,4 +1253,6 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     // and preaggregation as a blocking node. Otherwise, follow PlanNode.isBlockingNode().
     return node.isBlockingNode() || node instanceof AggregationNode;
   }
+
+  void setIsLocalPartitioned(boolean v) { is_local_partitioned_ = v; }
 }

@@ -810,6 +810,7 @@ public final class RuntimeFilterGenerator {
       filter.setIsBroadcast(distMode == DistributionMode.BROADCAST);
       if (filter.getType() == TRuntimeFilterType.IN_LIST
           && distMode == DistributionMode.PARTITIONED) {
+        // TODO: should we allow IN_LIST filters in the local partitioned case?
         if (LOG.isTraceEnabled()) {
           LOG.trace("Skip IN-list filter on partitioned join: {}", filter.debugString());
         }

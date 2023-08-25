@@ -835,6 +835,7 @@ enum TImpalaQueryOptions {
 
   // Correlation factor that will be used to calculate a lower memory estimation of
   // aggregation node when the default memory estimation exceed
+
   // LARGE_AGG_MEM_THRESHOLD. The reduction is achieved by calculating a memScale
   // multiplier (a fraction between 0.0 and 1.0). Given N as number of non-literal
   // grouping expressions:
@@ -873,6 +874,8 @@ enum TImpalaQueryOptions {
   // Select codegen optimization level from O0, O1, Os, O2, or O3. Higher levels will
   // overwrite existing codegen cache entries.
   CODEGEN_OPT_LEVEL = 167
+
+  LOCAL_SHUFFLE_BYTES_LIMIT = 168;
 }
 
 // The summary of a DML statement.

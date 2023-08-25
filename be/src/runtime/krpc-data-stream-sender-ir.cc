@@ -29,6 +29,7 @@ ScalarExprEvaluator* KrpcDataStreamSender::GetPartitionExprEvaluator(int i) {
 Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
   const int num_rows = batch->num_rows();
   const int num_channels = GetNumChannels();
+  // TODO: get number of hosts / number if instances per host
   int channel_ids[RowBatch::HASH_BATCH_SIZE];
   int row_idx = 0;
   while (row_idx < num_rows) {
@@ -38,9 +39,22 @@ Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
       channel_ids[row_count++] = HashRow(row, exchange_hash_seed_) % num_channels;
     }
     row_count = 0;
-    FOREACH_ROW_LIMIT(batch, row_idx, RowBatch::HASH_BATCH_SIZE, row_batch_iter) {
-      RETURN_IF_ERROR(AddRowToChannel(channel_ids[row_count++], row_batch_iter.Get()));
+    const auto& config = (const KrpcDataStreamSenderConfig&) sink_config_;
+    if (config.hash_to_channel_ids_.empty()) {
+      FOREACH_ROW_LIMIT(batch, row_idx, RowBatch::HASH_BATCH_SIZE, row_batch_iter) {
+        RETURN_IF_ERROR(AddRowToChannel(channel_ids[row_count++], row_batch_iter.Get()));
+      }
+    } else {
+      FOREACH_ROW_LIMIT(batch, row_idx, RowBatch::HASH_BATCH_SIZE, row_batch_iter) {
+        //  If SEND_TO_ONE_INSTANCE_IN_EACH_HOST, send to num_host channels
+        //  if SEND_TO_ONE_INSTANCE_WITHIN_HOST: there should be only one channel per partition
+        int partition = channel_ids[row_count++];
+        for (int channel_id: config.hash_to_channel_ids_[partition]) {
+           RETURN_IF_ERROR(AddRowToChannel(channel_id, row_batch_iter.Get()));
+        }
+      }
     }
+
     row_idx += row_count;
   }
   return Status::OK();

@@ -81,6 +81,9 @@ Status KrpcDataStreamSenderConfig::Init(
   RETURN_IF_ERROR(DataSinkConfig::Init(tsink, input_row_desc, state));
   DCHECK(tsink_->__isset.stream_sink);
   partition_type_ = tsink_->stream_sink.output_partition.type;
+
+  const auto& destinations = state->fragment_ctx().destinations();
+
   if (partition_type_ == TPartitionType::HASH_PARTITIONED
       || partition_type_ == TPartitionType::KUDU) {
     RETURN_IF_ERROR(
@@ -88,8 +91,43 @@ Status KrpcDataStreamSenderConfig::Init(
             *input_row_desc_, state, &partition_exprs_));
     exchange_hash_seed_ =
         KrpcDataStreamSender::EXCHANGE_HASH_SEED_CONST ^ state->query_id().hi;
+    local_partitioning_role_ =
+        tsink_->stream_sink.output_partition.local_partitioning_role;
   }
-  num_channels_ = state->fragment_ctx().destinations().size();
+
+  if (local_partitioning_role_ != TLocalPartitioningRole::NONE) {
+    map<string, vector<int>> address_to_channels;
+
+    for (int i = 0; i < destinations.size(); i++) {
+      address_to_channels[destinations[i].krpc_backend().SerializeAsString()].push_back(i);
+    }
+    uint64_t max_channels_in_host = 0;
+    for (const auto& key_val: address_to_channels) {
+      max_channels_in_host = std::max(max_channels_in_host, key_val.second.size());
+    }
+    num_channels_ = max_channels_in_host;
+    hash_to_channel_ids_.resize(max_channels_in_host);
+
+    for (const auto& key_val: address_to_channels) {
+      if (local_partitioning_role_
+          == TLocalPartitioningRole::SEND_TO_ONE_INSTANCE_WITHIN_HOST
+          && key_val.first != ExecEnv::GetInstance()->krpc_address().SerializeAsString()) {
+        // Only send to local fragment instances.
+        continue;
+      }
+      const auto& channels_on_host = key_val.second;
+      for (int partition = 0; partition < max_channels_in_host; partition++) {
+        // In hosts with less fragment instances than maximum spread the partitions with
+        // round robin.
+        // Assume that a host can have 0 fragment instances only if it has no probe side
+        // fragment instance, so no local builds side is needed.
+        int target_channel = channels_on_host[partition % channels_on_host.size()];
+        hash_to_channel_ids_[partition].push_back(target_channel);
+      }
+    }
+  } else {
+    num_channels_ = destinations.size();
+  }
   state->CheckAndAddCodegenDisabledMessage(codegen_status_msgs_);
   return Status::OK();
 }
@@ -1012,6 +1050,11 @@ void KrpcDataStreamSenderConfig::Codegen(FragmentState* state) {
 
 Status KrpcDataStreamSender::AddRowToChannel(const int channel_id, TupleRow* row) {
   return channels_[channel_id]->AddRow(row);
+}
+
+int KrpcDataStreamSender::GetNumChannels() const {
+  const auto& config = (const KrpcDataStreamSenderConfig&) sink_config_;
+  return config.num_channels_;
 }
 
 uint64_t KrpcDataStreamSender::HashRow(TupleRow* row, uint64_t seed) {

@@ -64,8 +64,15 @@ class KrpcDataStreamSenderConfig : public DataSinkConfig {
   /// per-row partition values for shuffling exchange;
   std::vector<ScalarExpr*> partition_exprs_;
 
+  TLocalPartitioningRole::type local_partitioning_role_ = TLocalPartitioningRole::NONE;
+
+  /// In local partitioning maps hash modulos to the list of channels to send them to (one
+  /// per host).
+  std::vector<std::vector<int>> hash_to_channel_ids_;
+
   /// The number of channels that this node will create.
-  int  num_channels_;
+  /// TODO hack: used as partition number instead of actual number of channels
+  int num_channels_;
 
   /// Hash seed used for exchanges. Query id will be used to seed the hash function.
   uint64_t exchange_hash_seed_;
@@ -175,7 +182,7 @@ class KrpcDataStreamSender : public DataSink {
 
   /// Returns the number of channels in this data stream sender. Not inlined for the
   /// cross-compiled code as it's to be replaced with a constant during codegen.
-  int IR_NO_INLINE GetNumChannels() const { return channels_.size(); }
+  int IR_NO_INLINE GetNumChannels() const;
 
   /// Evaluates the input row against partition expressions and hashes the expression
   /// values. Returns the final hash value.

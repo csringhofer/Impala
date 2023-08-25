@@ -235,6 +235,7 @@ Status Scheduler::ComputeFragmentExecParams(
 
       // populate src_state->destinations
       for (int i = 0; i < dest_state->instance_states.size(); ++i) {
+        // TODO: may need to handle local partitioning
         PlanFragmentDestinationPB* dest = src_state->exec_params->add_destinations();
         *dest->mutable_fragment_instance_id() =
             dest_state->instance_states[i].exec_params.instance_id();

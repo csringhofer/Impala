@@ -90,6 +90,8 @@ struct TPlanFragment {
   // greater than 0 if query option COMPUTE_PROCESSING_COST=true. Currently not enforced
   // when fragment need to exceed max_fs_writers query option (see IMPALA-8125).
   14: optional i32 effective_instance_count
+
+  15: optional bool is_local_partitioned
 }
 
 // location information for a single scan range
