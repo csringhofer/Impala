@@ -21,6 +21,7 @@
 
 #include "common/init.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/outbound-row-batch.h"
 #include "runtime/raw-value.h"
 #include "runtime/string-value.h"
 #include "runtime/tuple-row.h"
@@ -336,6 +337,7 @@ class RowBatchSerializeBenchmark {
     RowBatch* no_dup_batch =
         obj_pool.Add(new RowBatch(&row_desc, NUM_ROWS, tracker.get()));
     FillBatch(no_dup_batch, 12345, 1, -1);
+    // TODO: check if the is benchmark is still valid with the LZ4 compression.
     OutboundRowBatch no_dup_row_batch(char_mem_tracker_allocator);
     ABORT_IF_ERROR(no_dup_batch->Serialize(&no_dup_row_batch));
 
