@@ -115,20 +115,20 @@ class RowBatchSerializeBaseline {
 
       int64_t compressed_size = compressor.MaxOutputLen(size);
       DCHECK_GT(compressed_size, 0);
-      if (output_batch->compression_scratch_.size() < compressed_size) {
-        output_batch->compression_scratch_.resize(compressed_size);
+      if (output_batch->serializer_->compression_scratch_.size() < compressed_size) {
+        output_batch->serializer_->compression_scratch_.resize(compressed_size);
       }
 
       uint8_t* input = const_cast<uint8_t*>(
           reinterpret_cast<const uint8_t*>(output_batch->tuple_data_.data()));
       uint8_t* compressed_output = const_cast<uint8_t*>(
-          reinterpret_cast<const uint8_t*>(output_batch->compression_scratch_.data()));
+          reinterpret_cast<const uint8_t*>(output_batch->serializer_->compression_scratch_.data()));
       status = compressor.ProcessBlock(
           true, size, input, &compressed_size, &compressed_output);
       DCHECK(status.ok()) << status.GetDetail();
       if (LIKELY(compressed_size < size)) {
-        output_batch->compression_scratch_.resize(compressed_size);
-        output_batch->tuple_data_.swap(output_batch->compression_scratch_);
+        output_batch->serializer_->compression_scratch_.resize(compressed_size);
+        output_batch->tuple_data_.swap(output_batch->serializer_->compression_scratch_);
       }
       VLOG_ROW << "uncompressed size: " << size
                << ", compressed size: " << compressed_size;
@@ -283,15 +283,18 @@ class RowBatchSerializeBenchmark {
   static void TestSerialize(int batch_size, void* data) {
     SerializeArgs* args = reinterpret_cast<SerializeArgs*>(data);
     for (int iter = 0; iter < batch_size; ++iter) {
-      OutboundRowBatch row_batch(char_mem_tracker_allocator);
+      OutboundRowBatch::Serializer serializer(char_mem_tracker_allocator);
+      OutboundRowBatch row_batch(char_mem_tracker_allocator, &serializer);
       ABORT_IF_ERROR(args->batch->Serialize(&row_batch, args->full_dedup));
+      //TODO: close serializer
     }
   }
 
   static void TestSerializeBaseline(int batch_size, void* data) {
     RowBatch* batch = reinterpret_cast<RowBatch*>(data);
     for (int iter = 0; iter < batch_size; ++iter) {
-      OutboundRowBatch row_batch(char_mem_tracker_allocator);
+      OutboundRowBatch::Serializer serializer(char_mem_tracker_allocator);
+      OutboundRowBatch row_batch(char_mem_tracker_allocator, &serializer);
       RowBatchSerializeBaseline::Serialize(batch, &row_batch);
     }
   }
@@ -337,19 +340,21 @@ class RowBatchSerializeBenchmark {
     RowBatch* no_dup_batch =
         obj_pool.Add(new RowBatch(&row_desc, NUM_ROWS, tracker.get()));
     FillBatch(no_dup_batch, 12345, 1, -1);
-    OutboundRowBatch no_dup_row_batch(char_mem_tracker_allocator);
+    OutboundRowBatch::Serializer serializer(char_mem_tracker_allocator);
+    // TODO: cleanup
+    OutboundRowBatch no_dup_row_batch(char_mem_tracker_allocator, &serializer);
     ABORT_IF_ERROR(no_dup_batch->Serialize(&no_dup_row_batch));
 
     RowBatch* adjacent_dup_batch =
         obj_pool.Add(new RowBatch(&row_desc, NUM_ROWS, tracker.get()));
     FillBatch(adjacent_dup_batch, 12345, 5, -1);
-    OutboundRowBatch adjacent_dup_row_batch(char_mem_tracker_allocator);
+    OutboundRowBatch adjacent_dup_row_batch(char_mem_tracker_allocator, &serializer);
     ABORT_IF_ERROR(adjacent_dup_batch->Serialize(&adjacent_dup_row_batch, false));
 
     RowBatch* dup_batch = obj_pool.Add(new RowBatch(&row_desc, NUM_ROWS, tracker.get()));
     // Non-adjacent duplicates.
     FillBatch(dup_batch, 12345, 1, NUM_ROWS / 5);
-    OutboundRowBatch dup_row_batch(char_mem_tracker_allocator);
+    OutboundRowBatch dup_row_batch(char_mem_tracker_allocator, &serializer);
     ABORT_IF_ERROR(dup_batch->Serialize(&dup_row_batch, true));
 
     int baseline;

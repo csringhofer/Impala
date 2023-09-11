@@ -27,6 +27,7 @@
 namespace impala {
 
 template <typename K, typename V> class FixedSizeHashTable;
+class Lz4Compressor;
 class MemTracker;
 class RowBatchSerializeTest;
 class RuntimeState;
@@ -35,10 +36,22 @@ class RuntimeState;
 /// for holding the tuple offsets and tuple data.
 class OutboundRowBatch {
  public:
+   struct Serializer {
+    Serializer(std::shared_ptr<CharMemTrackerAllocator> allocator)
+    : compression_scratch_(*allocator.get()), compressor_(nullptr) {}
+
+    /// Contains the compression scratch for the compressed data in serialization.
+    /// The compression_scratch_ will be swapped with tuple_data_ if the compressed data
+    /// is shorter.
+    TrackedString compression_scratch_;
+    Lz4Compressor* compressor_;
+  };
+
   OutboundRowBatch(std::shared_ptr<CharMemTrackerAllocator> allocator,
-      bool skip_compression=false)
-    : tuple_data_(*allocator.get()), compression_scratch_(*allocator.get()),
-      skip_compression_(skip_compression) {}
+      OutboundRowBatch::Serializer* serializer, bool skip_compression=false)
+    : tuple_data_(*allocator.get()),
+      skip_compression_(skip_compression),
+      serializer_(serializer) {}
 
   const RowBatchHeaderPB* header() const { return &header_; }
 
@@ -65,6 +78,9 @@ class OutboundRowBatch {
          header_.has_compression_type();
   }
 
+  OutboundRowBatch::Serializer* getSerializer() { return serializer_; }
+  void setSkipCompression(bool v) { skip_compression_ = v; }
+
  private:
   friend class RowBatch;
   friend class RowBatchSerializeBaseline;
@@ -80,12 +96,10 @@ class OutboundRowBatch {
   /// Contains the actual data of all the tuples. The data could be compressed.
   TrackedString tuple_data_;
 
-  /// Contains the compression scratch for the compressed data in serialization.
-  /// The compression_scratch_ will be swapped with tuple_data_ if the compressed data
-  /// is shorter.
-  TrackedString compression_scratch_;
-
   bool skip_compression_;
+
+  // Shared between 'OutboundRowBatch'es.
+  Serializer* serializer_;
 };
 
 }

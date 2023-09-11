@@ -267,6 +267,7 @@ Status RowBatch::Serialize(OutboundRowBatch* output_batch, bool full_dedup) {
 
 Status RowBatch::Serialize(DedupMap* distinct_tuples, OutboundRowBatch* output_batch,
     bool* is_compressed, int64_t size) {
+  OutboundRowBatch::Serializer* serializer = output_batch->serializer_;
   char* tuple_data = const_cast<char*>(output_batch->tuple_data_.data());
   std::vector<int32_t>* tuple_offsets = &output_batch->tuple_offsets_;
 
@@ -275,12 +276,13 @@ Status RowBatch::Serialize(DedupMap* distinct_tuples, OutboundRowBatch* output_b
   *is_compressed = false;
 
   if (size > 0 && !output_batch->skip_compression_) {
-    // Try compressing tuple_data to compression_scratch_, swap if compressed data is
-    // smaller
-    Lz4Compressor compressor(nullptr, false);
-    RETURN_IF_ERROR(compressor.Init());
-    auto compressor_cleanup =
-        MakeScopeExitTrigger([&compressor]() { compressor.Close(); });
+    // Try compressing tuple_data_ to compression_scratch_, swap if compressed data is
+    // smaller.
+    if (serializer->compressor_ == nullptr) {
+      serializer->compressor_ = new Lz4Compressor(nullptr, false);
+      RETURN_IF_ERROR(serializer->compressor_->Init());
+    }
+    Lz4Compressor& compressor = *serializer->compressor_;
 
     // If the input size is too large for LZ4 to compress, MaxOutputLen() will return 0.
     int64_t compressed_size = compressor.MaxOutputLen(size);
@@ -288,19 +290,21 @@ Status RowBatch::Serialize(DedupMap* distinct_tuples, OutboundRowBatch* output_b
       return Status(TErrorCode::LZ4_COMPRESSION_INPUT_TOO_LARGE, size);
     }
     DCHECK_GT(compressed_size, 0);
-    if (output_batch->compression_scratch_.size() < compressed_size) {
-      output_batch->compression_scratch_.resize(compressed_size);
+    if (serializer->compression_scratch_.size() < compressed_size) {
+      serializer->compression_scratch_.resize(compressed_size);
     }
 
     uint8_t* input = reinterpret_cast<uint8_t*>(tuple_data);
     uint8_t* compressed_output = const_cast<uint8_t*>(
-        reinterpret_cast<const uint8_t*>(output_batch->compression_scratch_.data()));
+        reinterpret_cast<const uint8_t*>(serializer->compression_scratch_.data()));
     RETURN_IF_ERROR(
         compressor.ProcessBlock(true, size, input, &compressed_size, &compressed_output));
     if (LIKELY(compressed_size < size)) {
-      output_batch->compression_scratch_.resize(compressed_size);
-      output_batch->tuple_data_.swap(output_batch->compression_scratch_);
+      serializer->compression_scratch_.resize(compressed_size);
+      output_batch->tuple_data_.swap(serializer->compression_scratch_);
       *is_compressed = true;
+      // TODO: could copy to a smaller buffer if compressed data is much smaller to
+      //       save memory
     }
     VLOG_ROW << "uncompressed size: " << size << ", compressed size: " << compressed_size;
   }

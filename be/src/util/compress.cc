@@ -307,7 +307,28 @@ uint32_t SnappyCompressor::ComputeChecksum(int64_t input_len, const uint8_t* inp
 }
 
 Lz4Compressor::Lz4Compressor(MemPool* mem_pool, bool reuse_buffer)
-  : Codec(mem_pool, reuse_buffer) {
+  : Codec(mem_pool, reuse_buffer),
+    lz4_state_(nullptr) {
+}
+
+Lz4Compressor::~Lz4Compressor() {
+  // Close should be called before destructor, but this is not always respected in Impala.
+  // Release lz4_state_ if Close() was skipped.
+  if (lz4_state_ != nullptr) Close();
+  DCHECK_EQ(lz4_state_, nullptr);
+}
+
+Status Lz4Compressor::Init() {
+  DCHECK_EQ(lz4_state_, nullptr);
+  // TODO: use mempool, or at least its tracker?
+  lz4_state_ = malloc(LZ4_sizeofState()); // 16416
+  return Status::OK();
+}
+
+void Lz4Compressor::Close() {
+  DCHECK_NE(lz4_state_, nullptr);
+  free(lz4_state_);
+  lz4_state_ = nullptr;
 }
 
 int64_t Lz4Compressor::MaxOutputLen(int64_t input_len, const uint8_t* input) {
@@ -316,14 +337,21 @@ int64_t Lz4Compressor::MaxOutputLen(int64_t input_len, const uint8_t* input) {
 
 Status Lz4Compressor::ProcessBlock(bool output_preallocated, int64_t input_length,
     const uint8_t* input, int64_t* output_length, uint8_t** output) {
+  DCHECK_NE(lz4_state_, nullptr);
   DCHECK_GE(input_length, 0);
   CHECK(output_preallocated) << "Output was not allocated for Lz4 Codec";
   if (input_length == 0) return Status::OK();
   if (MaxOutputLen(input_length, input) == 0) {
     return Status(TErrorCode::LZ4_COMPRESSION_INPUT_TOO_LARGE, input_length);
   }
-  *output_length = LZ4_compress_default(reinterpret_cast<const char*>(input),
-      reinterpret_cast<char*>(*output), input_length, *output_length);
+
+  // default acceleration, larger values provide better speed at the cost of compression
+  const int acceleration = 1; 
+  // TODO: Could use LZ4_compress_fast_extState_fastReset if LZ4 was linked statically.
+  //       This would probably only matter with small chunks of data to compress.
+  *output_length = LZ4_compress_fast_extState(lz4_state_,
+     reinterpret_cast<const char*>(input),
+      reinterpret_cast<char*>(*output), input_length, *output_length, acceleration);
   return Status::OK();
 }
 

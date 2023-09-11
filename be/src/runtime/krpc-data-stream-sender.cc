@@ -46,6 +46,7 @@
 #include "runtime/tuple-row.h"
 #include "service/data-stream-service.h"
 #include "util/aligned-new.h"
+#include "util/compress.h"
 #include "util/debug-util.h"
 #include "util/network-util.h"
 #include "util/pretty-printer.h"
@@ -163,7 +164,7 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
 
   // Initializes the channel.
   // Returns OK if successful, error indication otherwise.
-  Status Init(RuntimeState* state, std::shared_ptr<CharMemTrackerAllocator> allocator);
+  Status Init(RuntimeState* state, std::shared_ptr<CharMemTrackerAllocator> allocator, OutboundRowBatch::Serializer* serializer);
 
   // Serializes the given row batch and send it to the destination. If the preceding
   // RPC is in progress, this function may block until the previous RPC finishes.
@@ -374,7 +375,7 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
 };
 
 Status KrpcDataStreamSender::Channel::Init(
-    RuntimeState* state, std::shared_ptr<CharMemTrackerAllocator> allocator) {
+    RuntimeState* state, std::shared_ptr<CharMemTrackerAllocator> allocator, OutboundRowBatch::Serializer* serializer) {
   // TODO: take into account of var-len data at runtime.
   int capacity =
       max(1, parent_->per_channel_buffer_size_ / max(row_desc_->GetRowSize(), 1));
@@ -385,7 +386,7 @@ Status KrpcDataStreamSender::Channel::Init(
 
   // Init outbound_batches_.
   for (int i = 0; i < NUM_OUTBOUND_BATCHES; ++i) {
-    outbound_batches_.emplace_back(allocator, is_local_);
+    outbound_batches_.emplace_back(allocator, serializer, is_local_);
   }
   return Status::OK();
 }
@@ -806,6 +807,8 @@ Status KrpcDataStreamSender::Prepare(
       new MemTracker(-1, "RowBatchSerialization", mem_tracker_.get()));
   char_mem_tracker_allocator_.reset(
       new CharMemTrackerAllocator(outbound_rb_mem_tracker_));
+
+  serializer_ = new OutboundRowBatch::Serializer(char_mem_tracker_allocator_);
   string process_address =
        NetworkAddressPBToString(ExecEnv::GetInstance()->krpc_address());
   for (int i = 0; i < NUM_OUTBOUND_BATCHES; ++i) {
@@ -813,11 +816,11 @@ Status KrpcDataStreamSender::Prepare(
     // process. TODO: could be optimized to send the uncompressed buffer to the local
     // targets to avoid decompression cost at the receiver.
     bool is_local = channels_.size() == 1 && channels_[0]->IsLocal();
-    outbound_batches_.emplace_back(char_mem_tracker_allocator_, is_local);
+    outbound_batches_.emplace_back(char_mem_tracker_allocator_, serializer_/*.get()*/, is_local);
   }
 
   for (int i = 0; i < channels_.size(); ++i) {
-    RETURN_IF_ERROR(channels_[i]->Init(state, char_mem_tracker_allocator_));
+    RETURN_IF_ERROR(channels_[i]->Init(state, char_mem_tracker_allocator_, serializer_));
   }
   return Status::OK();
 }
@@ -1198,6 +1201,14 @@ void KrpcDataStreamSender::Close(RuntimeState* state) {
   }
 
   outbound_batches_.clear();
+  if (serializer_ != nullptr) {
+    if(serializer_->compressor_ != nullptr) {
+      serializer_->compressor_->Close();
+      delete serializer_->compressor_;
+    } 
+    delete serializer_;
+  }
+
   if (outbound_rb_mem_tracker_.get() != nullptr) {
     outbound_rb_mem_tracker_->Close();
   }

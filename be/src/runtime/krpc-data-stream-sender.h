@@ -221,6 +221,10 @@ class KrpcDataStreamSender : public DataSink {
   static const int NUM_OUTBOUND_BATCHES = 2;
   std::vector<OutboundRowBatch> outbound_batches_;
 
+  /// Shared serializer among outbound_batches_.
+  //std::unique_ptr<OutboundRowBatch::Serializer> serializer_;
+  OutboundRowBatch::Serializer* serializer_;
+
   /// If true, this sender has called FlushFinal() successfully.
   /// Not valid to call Send() anymore.
   bool flushed_ = false;
