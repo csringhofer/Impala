@@ -27,6 +27,7 @@
 namespace impala {
 
 template <typename K, typename V> class FixedSizeHashTable;
+class Lz4Compressor;
 class MemTracker;
 class RowBatchSerializeTest;
 class RuntimeState;
@@ -35,10 +36,9 @@ class RuntimeState;
 /// for holding the tuple offsets and tuple data.
 class OutboundRowBatch {
  public:
-  OutboundRowBatch(std::shared_ptr<CharMemTrackerAllocator> allocator,
-      bool skip_compression=false)
-    : tuple_data_(*allocator.get()), compression_scratch_(*allocator.get()),
-      skip_compression_(skip_compression) {}
+
+  OutboundRowBatch(std::shared_ptr<CharMemTrackerAllocator> allocator)
+    : tuple_data_(*allocator.get()) {}
 
   const RowBatchHeaderPB* header() const { return &header_; }
 
@@ -79,13 +79,6 @@ class OutboundRowBatch {
 
   /// Contains the actual data of all the tuples. The data could be compressed.
   TrackedString tuple_data_;
-
-  /// Contains the compression scratch for the compressed data in serialization.
-  /// The compression_scratch_ will be swapped with tuple_data_ if the compressed data
-  /// is shorter.
-  TrackedString compression_scratch_;
-
-  bool skip_compression_;
 };
 
 }

@@ -61,6 +61,7 @@ public class DataStreamSink extends DataSink {
    * This method estimate total buffer size needed for outbound_batches_ in
    * KrpcDataStreamSender. The total buffer size follow this formula:
    *
+   *   TODO: update this
    *   buffer_size = num_channels * 2 * (tuple_buffer_length + compressed_buffer_length)
    *
    * This method estimate that both tuple_buffer_length and compressed_buffer_length are
@@ -75,12 +76,8 @@ public class DataStreamSink extends DataSink {
     long avgOutboundRowBatchSize = Math.min(
         (long) Math.ceil(rowBatchSize * exchNode_.getAvgSerializedRowSize(exchNode_)),
         PlanNode.ROWBATCH_MAX_MEM_USAGE);
-    // Each channel has 2 OutboundRowBatch (KrpcDataStreamSender::NUM_OUTBOUND_BATCHES).
-    int outboundBatchesPerChannel = 2;
-    // Each OutboundRowBatch has 2 TrackedString, tuple_data_ and compressed_scratch_.
-    int bufferPerOutboundBatch = 2;
-    long bufferSize = numChannels * outboundBatchesPerChannel * bufferPerOutboundBatch
-        * avgOutboundRowBatchSize;
+    int num_buffers = numChannels * 2 + 2;
+    long bufferSize = num_buffers * avgOutboundRowBatchSize;
     return bufferSize;
   }
 

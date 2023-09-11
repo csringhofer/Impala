@@ -355,6 +355,7 @@ Status CompressCatalogObject(const uint8_t* src, uint32_t size, string* dst) {
   RETURN_IF_ERROR(compressor->ProcessBlock(true, size, src, &compressed_data_len,
       &output_buffer_ptr));
   dst->resize(compressed_data_len + sizeof(uint32_t));
+  compressor->Close();
   return Status::OK();
 }
 

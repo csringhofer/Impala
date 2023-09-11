@@ -124,14 +124,18 @@ class SnappyCompressor : public Codec {
 class Lz4Compressor : public Codec {
  public:
   Lz4Compressor(MemPool* mem_pool = nullptr, bool reuse_buffer = false);
-  virtual ~Lz4Compressor() { }
+  virtual ~Lz4Compressor();
 
+  virtual Status Init() override WARN_UNUSED_RESULT;
+  virtual void Close() override;
   virtual int64_t MaxOutputLen(
       int64_t input_len, const uint8_t* input = nullptr) override;
   virtual Status ProcessBlock(bool output_preallocated, int64_t input_length,
       const uint8_t* input, int64_t* output_length,
       uint8_t** output) override WARN_UNUSED_RESULT;
   virtual std::string file_extension() const override { return "lz4"; }
+
+  void* lz4_state_;
 };
 
 /// ZStandard compression codec.

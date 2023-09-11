@@ -46,6 +46,7 @@
 #include "runtime/tuple-row.h"
 #include "service/data-stream-service.h"
 #include "util/aligned-new.h"
+#include "util/compress.h"
 #include "util/debug-util.h"
 #include "util/network-util.h"
 #include "util/pretty-printer.h"
@@ -175,7 +176,7 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // preceding RPC is still in-flight. This is expected to be called from the fragment
   // instance execution thread. Return error status if initialization of the RPC request
   // parameters failed or if the preceding RPC failed. Returns OK otherwise.
-  Status TransmitData(const OutboundRowBatch* outbound_batch);
+  Status TransmitData(std::unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch);
 
   // Copies a single row into this channel's row batch and flushes the row batch once
   // it reaches capacity. This call may block if the row batch's capacity is reached
@@ -240,11 +241,8 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // TODO: rethink whether to keep per-channel buffers vs having all buffers in the
   // datastream sender and sharing them across all channels. These buffers are not used in
   // "UNPARTITIONED" scheme.
-  std::vector<OutboundRowBatch> outbound_batches_;
+  std::unique_ptr<OutboundRowBatch> outbound_batch_;
 
-  // Index into 'outbound_batches_' for the next available OutboundRowBatch to serialize
-  // into. This is read and written by the main execution thread.
-  int next_batch_idx_ = 0;
 
   // Synchronize accesses to the following fields between the main execution thread and
   // the KRPC reactor thread. Note that there should be only one reactor thread invoking
@@ -383,10 +381,9 @@ Status KrpcDataStreamSender::Channel::Init(
   // Create a DataStreamService proxy to the destination.
   RETURN_IF_ERROR(DataStreamService::GetProxy(address_, hostname_, &proxy_));
 
-  // Init outbound_batches_.
-  for (int i = 0; i < NUM_OUTBOUND_BATCHES; ++i) {
-    outbound_batches_.emplace_back(allocator, is_local_);
-  }
+  // Init outbound_batch_.
+  outbound_batch_.reset(new OutboundRowBatch(allocator));
+
   return Status::OK();
 }
 
@@ -584,10 +581,10 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
 }
 
 Status KrpcDataStreamSender::Channel::TransmitData(
-    const OutboundRowBatch* outbound_batch) {
+    unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch) {
   VLOG_ROW << "Channel::TransmitData() fragment_instance_id="
            << PrintId(fragment_instance_id_) << " dest_node=" << dest_node_id_
-           << " #rows=" << outbound_batch->header()->num_rows();
+           << " #rows=" << outbound_batch->get()->header()->num_rows();
   std::unique_lock<SpinLock> l(lock_);
   RETURN_IF_ERROR(WaitForRpcLocked(&l));
   DCHECK(!rpc_in_flight_);
@@ -596,20 +593,22 @@ Status KrpcDataStreamSender::Channel::TransmitData(
   // TODO: Needs better solution for IMPALA-3990 in the long run.
   if (UNLIKELY(remote_recvr_closed_)) return Status::OK();
   rpc_in_flight_ = true;
-  rpc_in_flight_batch_ = outbound_batch;
+  rpc_in_flight_batch_ = outbound_batch->get();
   RETURN_IF_ERROR(DoTransmitDataRpc());
+  if (swap_batch) outbound_batch_.swap(*outbound_batch);
   return Status::OK();
 }
 
 Status KrpcDataStreamSender::Channel::SerializeAndSendBatch(RowBatch* batch) {
-  OutboundRowBatch* outbound_batch = &outbound_batches_[next_batch_idx_];
+  unique_ptr<OutboundRowBatch>* serialization_batch = &parent_->serialization_batch_;
+  DCHECK(serialization_batch->get() != nullptr);
   // Reads 'rpc_in_flight_batch_' without acquiring 'lock_', so reads can be racey.
   ANNOTATE_IGNORE_READS_BEGIN();
-  DCHECK(outbound_batch != rpc_in_flight_batch_);
+  DCHECK(serialization_batch->get() != rpc_in_flight_batch_);
   ANNOTATE_IGNORE_READS_END();
-  RETURN_IF_ERROR(parent_->SerializeBatch(batch, outbound_batch));
-  RETURN_IF_ERROR(TransmitData(outbound_batch));
-  next_batch_idx_ = (next_batch_idx_ + 1) % NUM_OUTBOUND_BATCHES;
+  RETURN_IF_ERROR(parent_->SerializeBatch(batch, serialization_batch->get(), !is_local_));
+  // Swap serialization_batch with outbound_batch_ once the old RPC is finished.
+  RETURN_IF_ERROR(TransmitData(serialization_batch, true /*swap_batch*/));
   return Status::OK();
 }
 
@@ -722,7 +721,7 @@ void KrpcDataStreamSender::Channel::Teardown(RuntimeState* state) {
     while (rpc_in_flight_) rpc_done_cv_.wait(l);
   }
   batch_.reset();
-  outbound_batches_.clear();
+  outbound_batch_.reset(nullptr);
 }
 
 KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
@@ -806,15 +805,16 @@ Status KrpcDataStreamSender::Prepare(
       new MemTracker(-1, "RowBatchSerialization", mem_tracker_.get()));
   char_mem_tracker_allocator_.reset(
       new CharMemTrackerAllocator(outbound_rb_mem_tracker_));
+
   string process_address =
        NetworkAddressPBToString(ExecEnv::GetInstance()->krpc_address());
-  for (int i = 0; i < NUM_OUTBOUND_BATCHES; ++i) {
-    // Only skip compression if there is a single channel and destination is in the same
-    // process. TODO: could be optimized to send the uncompressed buffer to the local
-    // targets to avoid decompression cost at the receiver.
-    bool is_local = channels_.size() == 1 && channels_[0]->IsLocal();
-    outbound_batches_.emplace_back(char_mem_tracker_allocator_, is_local);
+
+  serialization_batch_.reset(new OutboundRowBatch(char_mem_tracker_allocator_));
+  if (partition_type_ == TPartitionType::UNPARTITIONED) {
+    in_flight_batch_.reset(new OutboundRowBatch(char_mem_tracker_allocator_));
   }
+
+  compression_scratch_.reset(new TrackedString(*char_mem_tracker_allocator_.get()));
 
   for (int i = 0; i < channels_.size(); ++i) {
     RETURN_IF_ERROR(channels_[i]->Init(state, char_mem_tracker_allocator_));
@@ -1034,14 +1034,22 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
 
   if (batch->num_rows() == 0) return Status::OK();
   if (partition_type_ == TPartitionType::UNPARTITIONED) {
-    OutboundRowBatch* outbound_batch = &outbound_batches_[next_batch_idx_];
-    RETURN_IF_ERROR(SerializeBatch(batch, outbound_batch, channels_.size()));
+    // Only skip compression if there is a single channel and destination is in the same
+    // process. TODO: could be optimized to send the uncompressed buffer to the local
+    // targets to avoid decompression cost at the receiver.
+    bool is_local = channels_.size() == 1 && channels_[0]->IsLocal();
+    RETURN_IF_ERROR(SerializeBatch(
+        batch, serialization_batch_.get(), !is_local,  channels_.size()));
     // TransmitData() will block if there are still in-flight rpcs (and those will
-    // reference the previously written serialized batch).
+    // reference the previously written in_flight_batch_).
     for (int i = 0; i < channels_.size(); ++i) {
-      RETURN_IF_ERROR(channels_[i]->TransmitData(outbound_batch));
+      // Do not swap serialization_batch_ with the channel's outbound_batch_ to allow
+      // multiple channels to  use the data backing serialization_batch_ in parallel.
+      RETURN_IF_ERROR(
+          channels_[i]->TransmitData(&serialization_batch_, false /*swap_batch*/));
     }
-    next_batch_idx_ = (next_batch_idx_ + 1) % NUM_OUTBOUND_BATCHES;
+    // At this point no RPCs can still refer to the old in_flight_batch_.
+    in_flight_batch_.swap(serialization_batch_);
   } else if (partition_type_ == TPartitionType::RANDOM || channels_.size() == 1) {
     // Round-robin batches among channels. Wait for the current channel to finish its
     // rpc before overwriting its batch.
@@ -1197,7 +1205,10 @@ void KrpcDataStreamSender::Close(RuntimeState* state) {
     channels_[i]->Teardown(state);
   }
 
-  outbound_batches_.clear();
+  serialization_batch_.reset(nullptr);
+  in_flight_batch_.reset(nullptr);
+  compression_scratch_.reset(nullptr);
+
   if (outbound_rb_mem_tracker_.get() != nullptr) {
     outbound_rb_mem_tracker_->Close();
   }
@@ -1208,11 +1219,12 @@ void KrpcDataStreamSender::Close(RuntimeState* state) {
 }
 
 Status KrpcDataStreamSender::SerializeBatch(
-    RowBatch* src, OutboundRowBatch* dest, int num_receivers) {
+    RowBatch* src, OutboundRowBatch* dest, bool compress, int num_receivers) {
   VLOG_ROW << "serializing " << src->num_rows() << " rows";
   {
     SCOPED_TIMER(serialize_batch_timer_);
-    RETURN_IF_ERROR(src->Serialize(dest));
+    RETURN_IF_ERROR(
+        src->Serialize(dest, compress ? compression_scratch_.get() : nullptr));
     int64_t uncompressed_bytes = RowBatch::GetDeserializedSize(*dest);
     COUNTER_ADD(uncompressed_bytes_counter_, uncompressed_bytes * num_receivers);
   }

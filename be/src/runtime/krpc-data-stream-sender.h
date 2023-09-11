@@ -168,7 +168,8 @@ class KrpcDataStreamSender : public DataSink {
   /// various stat counters.
   /// 'num_receivers' is the number of receivers this batch will be sent to. Used for
   /// updating the stat counters.
-  Status SerializeBatch(RowBatch* src, OutboundRowBatch* dest, int num_receivers = 1);
+  Status SerializeBatch(
+      RowBatch* src, OutboundRowBatch* dest, bool compress, int num_receivers = 1);
 
   /// Returns 'partition_expr_evals_[i]'. Used by the codegen'd HashRow() IR function.
   ScalarExprEvaluator* GetPartitionExprEvaluator(int i);
@@ -211,15 +212,16 @@ class KrpcDataStreamSender : public DataSink {
   /// Index of the current channel to send to if random_ == true.
   int current_channel_idx_ = 0;
 
-  /// Index of the next OutboundRowBatch to use for serialization.
-  int next_batch_idx_ = 0;
+  std::unique_ptr<OutboundRowBatch> serialization_batch_;
+
+  std::unique_ptr<TrackedString> compression_scratch_;
 
   /// The outbound row batches are double-buffered so that we can serialize the next
   /// batch while the other is still referenced by the in-flight RPC. Each entry contains
   /// a RowBatchHeaderPB and buffers for the serialized tuple offsets and data. Used only
   /// when the partitioning strategy is UNPARTITIONED.
-  static const int NUM_OUTBOUND_BATCHES = 2;
-  std::vector<OutboundRowBatch> outbound_batches_;
+  std::unique_ptr<OutboundRowBatch> in_flight_batch_;
+
 
   /// If true, this sender has called FlushFinal() successfully.
   /// Not valid to call Send() anymore.
