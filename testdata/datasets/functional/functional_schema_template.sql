@@ -4767,3 +4767,32 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
 )
 PARTITION BY HASH (tkey) PARTITIONS 3 STORED AS KUDU;
 ====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+geospatial_higher_dim
+---- COLUMNS
+id INT
+point3d BINARY
+point3dm BINARY
+linestring3d BINARY
+linestring3dm BINARY
+polygon3d BINARY
+polygon3dm BINARY
+multipoint3d BINARY
+multipoint3dm BINARY
+multilinestring3d BINARY
+multilinestring3dm BINARY
+multipolygon3d BINARY
+multipolygon3dm BINARY
+---- DEPENDENT_LOAD_HIVE
+INSERT OVERWRITE {db_name}{db_suffix}.{table_name} VALUES
+(1, st_Point(1, 2, 3), st_Point(1, 2, 3, 4),
+    st_Linestring('linestring z(1 1 1, 2 2 2)'), st_Linestring('linestring zm(1 1 1 1, 2 2 2 2)'),
+    st_Polygon('polygon z((1 1 1, 2 2 2, 3 0 0, 1 1 1))'), st_Polygon('polygon zm((1 1 1 4, 2 2 2 4, 3 0 0 4, 1 1 1 4))'),
+    st_Multipoint('multipoint z(1 1 1, 2 2 2)'), st_Multipoint('multipoint zm(1 1 1 1, 2 2 2 2)'),
+    st_Multilinestring('multilinestring z((1 1 1, 2 2 2), (3 3 3, 4 4 4))'), st_Multilinestring('multilinestring zm((1 1 1 4, 2 2 2 4), (3 3 3 6, 4 4 4 6))'),
+    st_Multipolygon('multipolygon z(((1 1 1, 2 2 2, 1 1 1), (3 3 3, 4 4 4, 3 3 3)))') , st_Multipolygon('multipolygon zm(((1 1 1 4, 2 2 2 4, 1 1 1 4), (3 3 3 6, 4 4 4 6, 3 3 3 6)))')
+)
+---- LOAD
+====

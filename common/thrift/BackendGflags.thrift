@@ -25,9 +25,10 @@ enum TReservedWordsVersion {
 
 
 // Options for Geospatial function library support
-enum TGeospatialLibrary{
+enum TGeospatialLibrary {
   NONE,
-  HIVE_ESRI
+  HIVE_ESRI,
+  HIVE_ESRI_WITH_NATIVES
 }
 
 // Used to pass gflags from backend to frontend, JniCatalog and JniFrontend

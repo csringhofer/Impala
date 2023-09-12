@@ -48,42 +48,64 @@ import org.apache.impala.catalog.Type;
 import org.apache.impala.hive.executor.BinaryToBinaryHiveLegacyFunctionExtractor;
 import org.apache.impala.hive.executor.HiveJavaFunction;
 import org.apache.impala.hive.executor.HiveLegacyJavaFunction;
+import org.apache.impala.service.BackendConfig;
 
 import com.google.common.base.Preconditions;
 
 import org.apache.impala.analysis.FunctionName;
 import org.apache.impala.thrift.TFunctionBinaryType;
+import org.apache.impala.thrift.TGeospatialLibrary;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class HiveEsriGeospatialBuiltins {
+  private final static Logger LOG = LoggerFactory.getLogger(HiveEsriGeospatialBuiltins.class);
+
   /**
    * Initializes Hive's ESRI geospatial UDFs as builtins.
    */
   public static void initBuiltins(Db db) {
-    addLegacyUDFs(db);
-    addGenericUDFs(db);
-    addVarargsUDFs(db);
+    TGeospatialLibrary lib = BackendConfig.INSTANCE.getGeospatialLibrary();
+    boolean addNatives = lib.equals(TGeospatialLibrary.HIVE_ESRI_WITH_NATIVES);
+    addLegacyUDFs(db, addNatives);
+    addGenericUDFs(db, addNatives);
+    addVarargsUDFs(db, addNatives);
+    if(addNatives) {
+      addNatives(db);
+    }
   }
 
-  private static void addLegacyUDFs(Db db) {
-    List<UDF> legacyUDFs = Arrays.asList(new ST_Area(), new ST_AsBinary(),
-        new ST_AsGeoJson(), new ST_AsJson(), new ST_AsShape(), new ST_AsText(),
+  private static void addLegacyUDFs(Db db, boolean addNatives) {
+    List<UDF> legacyUDFs = new ArrayList<>(Arrays.asList(new ST_Area(), new ST_AsBinary(),
+        new ST_AsGeoJson(), new ST_AsJson(), new ST_AsShape(),
         new ST_Boundary(), new ST_Buffer(), new ST_Centroid(), new ST_CoordDim(),
         new ST_Difference(), new ST_Dimension(), new ST_Distance(), new ST_EndPoint(),
-        new ST_Envelope(), new ST_EnvIntersects(), new ST_ExteriorRing(),
+        new ST_ExteriorRing(),
         new ST_GeodesicLengthWGS84(), new ST_GeomCollection(), new ST_GeometryN(),
-        new ST_GeometryType(), new ST_GeomFromShape(), new ST_GeomFromText(),
+        new ST_GeomFromShape(),
         new ST_GeomFromWKB(), new ST_InteriorRingN(), new ST_Intersection(),
         new ST_Is3D(), new ST_IsClosed(), new ST_IsEmpty(), new ST_IsMeasured(),
         new ST_IsRing(), new ST_IsSimple(), new ST_Length(), new ST_LineFromWKB(),
-        new ST_M(), new ST_MaxM(), new ST_MaxX(), new ST_MaxY(), new ST_MaxZ(),
-        new ST_MinM(), new ST_MinX(), new ST_MinY(), new ST_MinZ(), new ST_MLineFromWKB(),
+        new ST_M(), new ST_MaxM(), new ST_MaxZ(),
+        new ST_MinM(),  new ST_MinZ(), new ST_MLineFromWKB(),
         new ST_MPointFromWKB(), new ST_MPolyFromWKB(), new ST_NumGeometries(),
-        new ST_NumInteriorRing(), new ST_NumPoints(), new ST_Point(),
+        new ST_NumInteriorRing(), new ST_NumPoints(),
         new ST_PointFromWKB(), new ST_PointN(), new ST_PointZ(), new ST_PolyFromWKB(),
-        new ST_Relate(), new ST_SRID(), new ST_StartPoint(), new ST_SymmetricDiff(),
-        new ST_X(), new ST_Y(), new ST_Z(), new ST_SetSRID());
+        new ST_Relate(), new ST_StartPoint(), new ST_SymmetricDiff(),
+        new ST_Z()));
+
+    // TODO: this worked well for cases when the Java UDF had only one overload
+    //       partially rewriting overloads with native may be tricky, e.g for st_point()
+    List<UDF> legacyUDFsWithNativeImplementation = Arrays.asList(new ST_AsText(),
+        new ST_GeomFromText(), new ST_GeometryType(),
+        new ST_Envelope(), new ST_EnvIntersects(),
+        new ST_MaxX(), new ST_MaxY(),
+        new ST_MinX(), new ST_MinY(), new ST_Point(), 
+        new ST_SRID(), new ST_SetSRID(), new ST_X(), new ST_Y()
+    );
+    if (!addNatives) {
+      legacyUDFs.addAll(legacyUDFsWithNativeImplementation);
+    }
 
     for (UDF udf : legacyUDFs) {
       for (Function fn : extractFromLegacyHiveBuiltin(udf, db.getName())) {
@@ -92,40 +114,52 @@ public class HiveEsriGeospatialBuiltins {
     }
   }
 
-  private static void addGenericUDFs(Db db) {
+  private static void addGenericUDFs(Db db, boolean addNatives) {
     List<ScalarFunction> genericUDFs = new ArrayList<>();
 
-    List<Set<Type>> stBinArguments =
-        ImmutableList.of(ImmutableSet.of(Type.DOUBLE, Type.BIGINT),
-            ImmutableSet.of(Type.STRING, Type.BINARY));
-    List<Set<Type>> stBinEnvelopeArguments =
-        ImmutableList.of(ImmutableSet.of(Type.DOUBLE, Type.BIGINT),
-            ImmutableSet.of(Type.STRING, Type.BINARY, Type.BIGINT));
-
-    genericUDFs.addAll(
-        createMappedGenericUDFs(stBinArguments, Type.BIGINT, ST_Bin.class));
-    genericUDFs.addAll(createMappedGenericUDFs(
-        stBinEnvelopeArguments, Type.BINARY, ST_BinEnvelope.class));
     genericUDFs.add(createScalarFunction(
         ST_GeomFromGeoJson.class, Type.BINARY, new Type[] {Type.STRING}));
     genericUDFs.add(createScalarFunction(
         ST_GeomFromJson.class, Type.BINARY, new Type[] {Type.STRING}));
-    genericUDFs.add(createScalarFunction(
-        ST_MultiPolygon.class, Type.BINARY, new Type[] {Type.STRING}));
-    genericUDFs.add(createScalarFunction(
-        ST_MultiLineString.class, Type.BINARY, new Type[] {Type.STRING}));
 
-    createRelationalGenericUDFs(genericUDFs);
+    createRelationalGenericUDFs(genericUDFs, addNatives);
+
+    List<ScalarFunction> genericUDFsWithNativeImplementation = new ArrayList<>();
+
+    // ST_Bin
+    List<Set<Type>> stBinArguments =
+        ImmutableList.of(ImmutableSet.of(Type.DOUBLE, Type.BIGINT),
+            ImmutableSet.of(Type.STRING, Type.BINARY));
+    genericUDFsWithNativeImplementation.addAll(
+        createMappedGenericUDFs(stBinArguments, Type.BIGINT, ST_Bin.class));
+    genericUDFsWithNativeImplementation.add(createScalarFunction(
+        ST_MultiLineString.class, Type.BINARY, new Type[] {Type.STRING}));
+    genericUDFsWithNativeImplementation.add(createScalarFunction(
+        ST_MultiPolygon.class, Type.BINARY, new Type[] {Type.STRING}));
+
+    // ST_BinEnvelope
+    List<Set<Type>> stBinEnvelopeArguments =
+        ImmutableList.of(ImmutableSet.of(Type.DOUBLE, Type.BIGINT),
+            ImmutableSet.of(Type.STRING, Type.BINARY, Type.BIGINT));
+    genericUDFsWithNativeImplementation.addAll(createMappedGenericUDFs(
+        stBinEnvelopeArguments, Type.BINARY, ST_BinEnvelope.class));
+
+    if (!addNatives) {
+      genericUDFs.addAll(genericUDFsWithNativeImplementation);
+    }
 
     for (ScalarFunction function : genericUDFs) {
       db.addBuiltin(function);
     }
   }
 
-  private static void createRelationalGenericUDFs(List<ScalarFunction> genericUDFs) {
-    List<GenericUDF> relationalUDFs = Arrays.asList(new ST_Contains(), new ST_Crosses(),
-        new ST_Disjoint(), new ST_Equals(), new ST_Intersects(), new ST_Overlaps(),
-        new ST_Touches(), new ST_Within());
+  private static void createRelationalGenericUDFs(List<ScalarFunction> genericUDFs,
+      boolean addNatives) {
+    // All relations are implemented in c++.
+    if (addNatives) return;
+    List<GenericUDF> relationalUDFs = new ArrayList(Arrays.asList(new ST_Contains(),
+        new ST_Crosses(), new ST_Disjoint(), new ST_Equals(), new ST_Intersects(),
+        new ST_Overlaps(), new ST_Touches(), new ST_Within()));
 
     List<Set<Type>> relationalUDFArguments =
         ImmutableList.of(ImmutableSet.of(Type.STRING, Type.BINARY),
@@ -137,18 +171,24 @@ public class HiveEsriGeospatialBuiltins {
     }
   }
 
-  private static void addVarargsUDFs(Db db) {
+  private static void addVarargsUDFs(Db db, boolean addNatives) {
     List<ScalarFunction> varargsUDFs = new ArrayList<>();
     varargsUDFs.addAll(
         extractFunctions(ST_Union_Wrapper.class, ST_Union.class, db.getName()));
     varargsUDFs.addAll(
-        extractFunctions(ST_Polygon_Wrapper.class, ST_Polygon.class, db.getName()));
-    varargsUDFs.addAll(
-        extractFunctions(ST_LineString_Wrapper.class, ST_LineString.class, db.getName()));
-    varargsUDFs.addAll(
-        extractFunctions(ST_MultiPoint_Wrapper.class, ST_MultiPoint.class, db.getName()));
-    varargsUDFs.addAll(
         extractFunctions(ST_ConvexHull_Wrapper.class, ST_ConvexHull.class, db.getName()));
+
+    List<ScalarFunction> varargsUDFsWithNativeImplementation = new ArrayList<>();
+    varargsUDFsWithNativeImplementation.addAll(
+        extractFunctions(ST_LineString_Wrapper.class, ST_LineString.class, db.getName()));
+    varargsUDFsWithNativeImplementation.addAll(
+        extractFunctions(ST_MultiPoint_Wrapper.class, ST_MultiPoint.class, db.getName()));
+    varargsUDFsWithNativeImplementation.addAll(
+        extractFunctions(ST_Polygon_Wrapper.class, ST_Polygon.class, db.getName()));
+
+    if (!addNatives) {
+      varargsUDFs.addAll(varargsUDFsWithNativeImplementation);
+    }
 
     for (ScalarFunction function : varargsUDFs) {
       db.addBuiltin(function);
@@ -205,5 +245,97 @@ public class HiveEsriGeospatialBuiltins {
           return createScalarFunction(genericUDF, returnType, arguments);
         })
         .collect(Collectors.toList());
+  }
+
+  private static void addNative(Db db, String fnNameBase, String fnNameSuffix,
+      boolean varArgs, Type retType, Type... argTypes) {
+    String udfName = fnNameBase.toLowerCase();
+    String geospatialFnPrefix = "impala::geo::GeospatialFunctions::";
+    String cppSymbolName = geospatialFnPrefix + fnNameBase + fnNameSuffix;
+
+    db.addScalarBuiltin(udfName, cppSymbolName, true, varArgs, retType, argTypes);
+  }
+
+  private static void addNative(Db db, String fnName, boolean varArgs, Type retType,
+      Type... argTypes) {
+    addNative(db, fnName, "", varArgs, retType, argTypes);
+  }
+
+  // BINARY, BINARY / BINARY, STRING / STRING, BINARY / STRING, STRING
+  private static void addNativePredicateOverloads(Db db, String fnName) {
+    addNative(db, fnName, "_Binary_Binary", false, Type.BOOLEAN, Type.BINARY, Type.BINARY);
+    addNative(db, fnName, "_Binary_Wkt", false, Type.BOOLEAN, Type.BINARY, Type.STRING);
+    addNative(db, fnName, "_Wkt_Binary", false, Type.BOOLEAN, Type.STRING, Type.BINARY);
+    addNative(db, fnName, "_Wkt_Wkt", false, Type.BOOLEAN, Type.STRING, Type.STRING);
+  }
+
+  private static void addNatives(Db db) {
+    try {
+      // Legacy UDFs.
+      // Accessors.
+      addNative(db, "st_MinX", false, Type.DOUBLE, Type.BINARY);
+      addNative(db, "st_MaxX", false, Type.DOUBLE, Type.BINARY);
+      addNative(db, "st_MinY", false, Type.DOUBLE, Type.BINARY);
+      addNative(db, "st_MaxY", false, Type.DOUBLE, Type.BINARY);
+      addNative(db, "st_X", false, Type.DOUBLE, Type.BINARY);
+      addNative(db, "st_Y", false, Type.DOUBLE, Type.BINARY);
+
+      // Constructors.
+      addNative(db, "st_Point", false, Type.BINARY, Type.DOUBLE, Type.DOUBLE);
+      addNative(db, "st_Point", false, Type.BINARY, Type.STRING);
+      addNative(db, "st_LineString", false, Type.BINARY, Type.STRING);
+      addNative(db, "st_LineString", true, Type.BINARY, Type.DOUBLE);
+      addNative(db, "st_MultiPoint", false, Type.BINARY, Type.STRING);
+      addNative(db, "st_MultiPoint", true, Type.BINARY, Type.DOUBLE);
+      addNative(db, "st_MultiLineString", false, Type.BINARY, Type.STRING);
+      addNative(db, "st_Polygon", false, Type.BINARY, Type.STRING);
+      addNative(db, "st_Polygon", true, Type.BINARY, Type.DOUBLE);
+      addNative(db, "st_MultiPolygon", false, Type.BINARY, Type.STRING);
+
+      // Predicates.
+      List<String> relationalUDFs = new ArrayList(Arrays.asList("st_Contains",
+        "st_Crosses", "st_Disjoint", "st_Equals", "st_Intersects", "st_Overlaps",
+        "st_Touches", "st_Within"));
+      for (String fnName: relationalUDFs) {
+        addNativePredicateOverloads(db, fnName);
+      }
+      // st_EnvIntersects is an exception as it has only a single overload.
+      addNative(db, "st_EnvIntersects", false, Type.BOOLEAN, Type.BINARY, Type.BINARY);
+
+      // Other functions.
+      addNative(db, "st_Srid", false, Type.INT, Type.BINARY);
+      addNative(db, "st_SetSrid", false, Type.BINARY, Type.BINARY, Type.INT);
+      addNative(db, "st_GeometryType", false, Type.STRING, Type.BINARY);
+
+      addNative(db, "st_Envelope", false, Type.BINARY, Type.BINARY);
+
+      // Generic UDFs.
+      // Other functions.
+      addNative(db, "st_Bin", "Geom", false, Type.BIGINT, Type.BIGINT, Type.BINARY);
+      addNative(db, "st_Bin", "Geom", false, Type.BIGINT, Type.DOUBLE, Type.BINARY);
+      addNative(db, "st_Bin", "Wkt", false, Type.BIGINT, Type.BIGINT, Type.STRING);
+      addNative(db, "st_Bin", "Wkt", false, Type.BIGINT, Type.DOUBLE, Type.STRING);
+
+      addNative(db, "st_Binenvelope", "BinId", false, Type.BINARY,
+          Type.BIGINT, Type.BIGINT);
+      addNative(db, "st_Binenvelope", "BinId", false, Type.BINARY,
+          Type.DOUBLE, Type.BIGINT);
+      addNative(db, "st_Binenvelope", "Geom", false, Type.BINARY,
+          Type.BIGINT, Type.BINARY);
+      addNative(db, "st_Binenvelope", "Geom", false, Type.BINARY,
+          Type.DOUBLE, Type.BINARY);
+      addNative(db, "st_Binenvelope", "Wkt", false, Type.BINARY,
+          Type.BIGINT, Type.STRING);
+      addNative(db, "st_Binenvelope", "Wkt", false, Type.BINARY,
+          Type.DOUBLE, Type.STRING);
+
+      // Conversions
+      addNative(db, "st_AsText", false, Type.STRING, Type.BINARY);
+      addNative(db, "st_GeomFromText", false, Type.BINARY, Type.STRING);
+      addNative(db, "st_GeomFromText", false, Type.BINARY, Type.STRING, Type.INT);
+
+    } catch (RuntimeException ex) {
+      LOG.error(ex.getMessage());;
+    }
   }
 }

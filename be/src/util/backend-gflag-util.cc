@@ -455,7 +455,10 @@ Status PopulateThriftBackendGflags(TBackendGflags& cfg) {
   cfg.__set_enable_reload_events(FLAGS_enable_reload_events);
   if (FLAGS_geospatial_library == to_string(TGeospatialLibrary::NONE)) {
     cfg.__set_geospatial_library(TGeospatialLibrary::NONE);
-  } else {
+  } else if (
+      FLAGS_geospatial_library == to_string(TGeospatialLibrary::HIVE_ESRI_WITH_NATIVES)) {
+    cfg.__set_geospatial_library(TGeospatialLibrary::HIVE_ESRI_WITH_NATIVES);
+  } else  {
     DCHECK_EQ(FLAGS_geospatial_library, to_string(TGeospatialLibrary::HIVE_ESRI));
     cfg.__set_geospatial_library(TGeospatialLibrary::HIVE_ESRI);
   }

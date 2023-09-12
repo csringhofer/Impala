@@ -1,0 +1,61 @@
+====
+---- QUERY
+select id, st_astext(point3d) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_POINT, expected EsriType 1, found 9.
+====
+---- QUERY
+select id, st_astext(point3dm) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_POINT, expected EsriType 1, found 11.
+====
+---- QUERY
+select id, st_astext(linestring3d) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_LINESTRING, expected EsriType 3, found 10.
+====
+---- QUERY
+select id, st_astext(linestring3dm) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_LINESTRING, expected EsriType 3, found 13.
+====
+---- QUERY
+select id, st_astext(polygon3d) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_POLYGON, expected EsriType 5, found 19.
+====
+---- QUERY
+select id, st_astext(polygon3dm) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_POLYGON, expected EsriType 5, found 15.
+====
+---- QUERY
+select id, st_astext(multipoint3d) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_MULTIPOINT, expected EsriType 8, found 20.
+====
+---- QUERY
+select id, st_astext(multipoint3dm) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_MULTIPOINT, expected EsriType 8, found 18.
+====
+---- QUERY
+select id, st_astext(multilinestring3d) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_MULTILINESTRING, expected EsriType 3, found 10.
+====
+---- QUERY
+select id, st_astext(multilinestring3dm) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_MULTILINESTRING, expected EsriType 3, found 13.
+====
+---- QUERY
+select id, st_astext(multipolygon3d) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_MULTIPOLYGON, expected EsriType 5, found 19.
+====
+---- QUERY
+select id, st_astext(multipolygon3dm) from geospatial_higher_dim;
+---- CATCH
+UDF ERROR: Invalid geometry: OGCType and EsriType do not match. Because the OGCType is ST_MULTIPOLYGON, expected EsriType 5, found 15.
+====

@@ -21,7 +21,8 @@ import pytest
 from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.skip import SkipIfApacheHive
 
-ST_POINT_SIGNATURE = "BINARY\tst_point(STRING)\tJAVA\ttrue"
+ST_POINT_SIGNATURE_JAVA = "BINARY\tst_point(STRING)\tJAVA\ttrue"
+ST_POINT_SIGNATURE_BUILTIN = "BINARY\tst_point(STRING)\tBUILTIN\ttrue"
 SHOW_FUNCTIONS = "show functions in _impala_builtins"
 
 
@@ -37,10 +38,24 @@ class TestGeospatialLibrary(CustomClusterTestSuite):
   @pytest.mark.execute_serially
   def test_disabled(self):
     result = self.execute_query(SHOW_FUNCTIONS)
-    assert ST_POINT_SIGNATURE not in result.data
+    assert ST_POINT_SIGNATURE_JAVA not in result.data
+    assert ST_POINT_SIGNATURE_BUILTIN not in result.data
 
   @SkipIfApacheHive.feature_not_supported
   @pytest.mark.execute_serially
   def test_enabled(self):
     result = self.execute_query(SHOW_FUNCTIONS)
-    assert ST_POINT_SIGNATURE in result.data
+    assert ST_POINT_SIGNATURE_BUILTIN in result.data
+
+  @CustomClusterTestSuite.with_args(start_args='--geospatial_library=HIVE_ESRI')
+  @SkipIfApacheHive.feature_not_supported
+  def test_non_native(self, vector):
+    result = self.execute_query(SHOW_FUNCTIONS)
+    assert ST_POINT_SIGNATURE_JAVA in result.data
+
+    # Test solution without native functions.
+    self.run_test_case('QueryTest/geospatial-esri', vector)
+    self.run_test_case('QueryTest/geospatial-esri-extra', vector)
+    self.run_test_case('QueryTest/geospatial-esri-high-dimension', vector)
+
+

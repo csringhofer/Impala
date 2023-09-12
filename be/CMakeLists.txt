@@ -525,7 +525,9 @@ set (IMPALA_LIBS
   ExecText
   ExecIcebergMetadata
   Exprs
+  ExprsGeo
   ExprsIr
+  ExprsGeoIr
   GlobalFlags
   histogram_proto
   ImpalaThrift

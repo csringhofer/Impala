@@ -380,6 +380,7 @@ visible_functions = [
   [['bin'], 'STRING', ['BIGINT'], 'impala::MathFunctions::Bin'],
   [['hex'], 'STRING', ['BIGINT'], 'impala::MathFunctions::HexInt'],
   [['hex'], 'STRING', ['STRING'], 'impala::MathFunctions::HexString'],
+  [['hex'], 'STRING', ['BINARY'], 'impala::MathFunctions::HexString'],
   [['unhex'], 'STRING', ['STRING'], 'impala::MathFunctions::Unhex'],
   [['conv'], 'STRING', ['BIGINT', 'TINYINT', 'TINYINT'],
    'impala::MathFunctions::ConvInt'],

@@ -158,7 +158,7 @@ parser.add_option("--enable_external_fe_support", dest="enable_external_fe_suppo
                   action="store_true", default=False,
                   help="If true, impalads will start with the external_fe_port defined.")
 parser.add_option("--geospatial_library", dest="geospatial_library",
-                  action="store", default="HIVE_ESRI",
+                  action="store", default="HIVE_ESRI_WITH_NATIVES",
                   help="Sets which implementation of geospatial libraries should be "
                   "initialized")
 parser.add_option("--enable_catalogd_ha", dest="enable_catalogd_ha",

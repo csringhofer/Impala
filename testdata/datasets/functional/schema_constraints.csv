@@ -436,3 +436,5 @@ table_name:timestamp_primary_key, constraint:restrict_to, table_format:kudu/none
 # Table where all column values are unique but have some NULLs.
 # Depends on functional.alltypessmall.
 table_name:unique_with_nulls, constraint:restrict_to, table_format:parquet/none/none
+
+table_name:geospatial_higher_dim, constraint:restrict_to, table_format:parquet/none/none

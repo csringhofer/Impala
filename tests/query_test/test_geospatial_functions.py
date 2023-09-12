@@ -26,6 +26,15 @@ class TestGeospatialFuctions(ImpalaTestSuite):
   def get_workload(cls):
     return 'functional-query'
 
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestGeospatialFuctions, cls).add_test_dimensions()
+    # Tests do not use tables at the moment, skip other fileformats than Parquet.
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'parquet')
+
   @SkipIfApacheHive.feature_not_supported
   def test_esri_geospatial_functions(self, vector):
+    self.run_test_case('QueryTest/geospatial-esri-extra', vector)
+    self.run_test_case('QueryTest/geospatial-esri-native-higher-dimension', vector)
     self.run_test_case('QueryTest/geospatial-esri', vector)
