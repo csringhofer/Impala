@@ -111,7 +111,7 @@ shared_ptr<KrpcDataStreamRecvr> KrpcDataStreamMgr::CreateRecvr(
   DCHECK(profile != nullptr);
   DCHECK(parent_tracker != nullptr);
   DCHECK(client != nullptr);
-  VLOG_FILE << "creating receiver for fragment_instance_id="<< PrintId(finst_id)
+  VLOG_QUERY << "creating receiver for fragment_instance_id="<< PrintId(finst_id)
             << ", node=" << dest_node_id;
   shared_ptr<KrpcDataStreamRecvr> recvr(new KrpcDataStreamRecvr(this, parent_tracker,
       row_desc, runtime_state, finst_id, dest_node_id, num_senders, is_merging,
@@ -250,6 +250,7 @@ void KrpcDataStreamMgr::AddData(const TransmitDataRequestPB* request,
 
 void KrpcDataStreamMgr::EnqueueDeserializeTask(const TUniqueId& finst_id,
     PlanNodeId dest_node_id, int sender_id, int num_requests) {
+  //LOG(INFO) << "EnqueueDeserializeTask " << sender_id;
   for (int i = 0; i < num_requests; ++i) {
     DeserializeTask payload = {finst_id, dest_node_id, sender_id};
     deserialize_pool_.Offer(move(payload));
@@ -258,6 +259,7 @@ void KrpcDataStreamMgr::EnqueueDeserializeTask(const TUniqueId& finst_id,
 
 void KrpcDataStreamMgr::DeserializeThreadFn(int thread_id, const DeserializeTask& task) {
   shared_ptr<KrpcDataStreamRecvr> recvr;
+  //LOG(INFO) << "DeserializeThreadFn" << task.sender_id;
   {
     bool already_unregistered;
     lock_guard<mutex> l(lock_);
@@ -305,7 +307,7 @@ void KrpcDataStreamMgr::CloseSender(const EndDataStreamRequestPB* request,
 
 Status KrpcDataStreamMgr::DeregisterRecvr(
     const TUniqueId& finst_id, PlanNodeId dest_node_id) {
-  VLOG_QUERY << "DeregisterRecvr(): fragment_instance_id=" << PrintId(finst_id)
+  VLOG_FILE << "DeregisterRecvr(): fragment_instance_id=" << PrintId(finst_id)
              << ", node=" << dest_node_id;
   uint32_t hash_value = GetHashValue(finst_id, dest_node_id);
   lock_guard<mutex> l(lock_);
@@ -324,6 +326,7 @@ Status KrpcDataStreamMgr::DeregisterRecvr(
       closed_stream_expirations_.insert(
           make_pair(MonotonicMillis() + STREAM_EXPIRATION_TIME_MS, recvr_id));
       closed_stream_cache_.insert(recvr_id);
+      //VLOG_QUERY << "DeregisterRecvr finished()";
       return Status::OK();
     }
     ++range.first;

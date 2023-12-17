@@ -37,11 +37,18 @@ class TestExchangeDelays(CustomClusterTestSuite):
   def get_workload(self):
     return 'functional-query'
 
+  # These tests are run with --use_krpc_for_local_shuffle=true as senders in local
+  # channels are blocked until prepare is complete. This means that
+  # stress_datastream_recvr_delay_ms is also added to the sender before sending the first
+  # batch, which is against the goal of these tests.
+  # TODO: setting different delays may make this work with local channels
+
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
       "--stress_datastream_recvr_delay_ms={0}".format(DELAY_MS)
       + " --datastream_sender_timeout_ms=5000"
-      + " --impala_slow_rpc_threshold_ms=500")
+      + " --impala_slow_rpc_threshold_ms=500"
+      + " --use_krpc_for_local_shuffle=true")
   def test_exchange_small_delay(self, vector):
     """Test delays in registering data stream receivers where the first one or two
     batches will time out before the receiver registers, but subsequent batches will
@@ -54,7 +61,8 @@ class TestExchangeDelays(CustomClusterTestSuite):
   @CustomClusterTestSuite.with_args(
       "--stress_datastream_recvr_delay_ms={0}".format(DELAY_MS)
       + " --datastream_sender_timeout_ms=1"
-      + " --impala_slow_rpc_threshold_ms=500")
+      + " --impala_slow_rpc_threshold_ms=500"
+      + " --use_krpc_for_local_shuffle=true")
   def test_exchange_large_delay(self, vector):
     """Test delays in registering data stream receivers where all of the batches sent
     will time out before the receiver registers. Before IMPALA-2987, this scenario
@@ -77,7 +85,8 @@ class TestExchangeDelays(CustomClusterTestSuite):
   @CustomClusterTestSuite.with_args(
       "--stress_datastream_recvr_delay_ms={0}".format(DELAY_MS)
       + " --datastream_sender_timeout_ms=1"
-      + " --impala_slow_rpc_threshold_ms=500")
+      + " --impala_slow_rpc_threshold_ms=500"
+      + " --use_krpc_for_local_shuffle=true")
   def test_exchange_large_delay_zero_rows(self, vector):
     """Test the special case when no batches are sent and the EOS message times out."""
     self.run_test_case('QueryTest/exchange-delays-zero-rows', vector)

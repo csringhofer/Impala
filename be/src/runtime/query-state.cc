@@ -39,6 +39,7 @@
 #include "runtime/fragment-state.h"
 #include "runtime/initial-reservations.h"
 #include "runtime/krpc-data-stream-mgr.h"
+#include "runtime/local-row-batch-channel.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/query-exec-mgr.h"
 #include "runtime/runtime-filter-bank.h"
@@ -294,6 +295,9 @@ Status QueryState::Init(const ExecQueryFInstancesRequestPB* exec_rpc_params,
   fragment_info_.fragment_instance_ctxs.swap(
       non_const_fragment_info.fragment_instance_ctxs);
   fragment_info_.__isset.fragment_instance_ctxs = true;
+
+  local_row_batch_channel_manager_ = new LocalRowBatchChannelManager();
+  obj_pool_.Add(local_row_batch_channel_manager_);
 
   // Claim the query-wide minimum reservation. Do this last so that we don't need
   // to handle releasing it if a later step fails.
@@ -997,6 +1001,7 @@ void QueryState::Cancel() {
   for (auto entry: fis_map_) entry.second->Cancel();
   // Cancel data streams for all fragment instances.
   ExecEnv::GetInstance()->stream_mgr()->Cancel(query_id());
+  local_row_batch_channel_manager_->Cancel();
 }
 
 void QueryState::PublishFilter(const PublishFilterParamsPB& params, RpcContext* context) {
@@ -1021,4 +1026,5 @@ Status QueryState::StartSpilling(RuntimeState* runtime_state, MemTracker* mem_tr
   }
   return Status::OK();
 }
+
 }

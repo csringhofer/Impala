@@ -426,7 +426,7 @@ class DataStreamTest : public testing::Test {
     VLOG_QUERY << "join receiver\n";
     for (int i = 0; i < receiver_info_.size(); ++i) {
       receiver_info_[i]->thread_handle->join();
-      receiver_info_[i]->stream_recvr->Close();
+      receiver_info_[i]->stream_recvr->Close(nullptr);
     }
   }
 

@@ -25,6 +25,7 @@
 #include "runtime/fragment-state.h"
 #include "runtime/krpc-data-stream-mgr.h"
 #include "runtime/krpc-data-stream-recvr.h"
+#include "runtime/local-row-batch-channel.h"
 #include "runtime/row-batch.h"
 #include "runtime/runtime-state.h"
 #include "util/debug-util.h"
@@ -98,19 +99,21 @@ Status ExchangeNode::Prepare(RuntimeState* state) {
     SleepForMs(FLAGS_stress_datastream_recvr_delay_ms);
   }
 #endif
-
   RETURN_IF_ERROR(ExecEnv::GetInstance()->buffer_pool()->RegisterClient(
       Substitute("Exchg Recvr (id=$0)", id_), nullptr,
       ExecEnv::GetInstance()->buffer_reservation(), mem_tracker(),
       numeric_limits<int64_t>::max(), runtime_profile(), &recvr_buffer_pool_client_,
       MemLimit::HARD));
-
   // TODO: figure out appropriate buffer size
   DCHECK_GT(num_senders_, 0);
   stream_recvr_ = ExecEnv::GetInstance()->stream_mgr()->CreateRecvr(
       &input_row_desc_, *state, state->fragment_instance_id(), id_, num_senders_,
       FLAGS_exchg_node_buffer_size_bytes, is_merging_, runtime_profile(), mem_tracker(),
       &recvr_buffer_pool_client_);
+  LocalRowBatchChannelManager* local_channel_mgr =
+      state->query_state()->GetLocalRowBatchChannelManager();
+  RETURN_IF_ERROR(local_channel_mgr->RegisterReceiver(
+      id_, state->fragment_instance_id(), stream_recvr_.get()));
 
   return Status::OK();
 }
@@ -159,7 +162,9 @@ Status ExchangeNode::Reset(RuntimeState* state, RowBatch* row_batch) {
 void ExchangeNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   if (less_than_.get() != nullptr) less_than_->Close(state);
-  if (stream_recvr_ != nullptr) stream_recvr_->Close();
+  if (stream_recvr_ != nullptr) {
+    stream_recvr_->Close(state);
+  }
   ExecEnv::GetInstance()->buffer_pool()->DeregisterClient(&recvr_buffer_pool_client_);
   ExecNode::Close(state);
 }
@@ -225,7 +230,9 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
         *eos = true;
         return Status::OK();
       }
-      if (output_batch->AtCapacity()) return Status::OK();
+      if (output_batch->AtCapacity()) {
+        return Status::OK();
+      }
     }
 
     // we need more rows
@@ -234,7 +241,9 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
     *eos = (input_batch_ == nullptr);
     // No need to call CancelStream() on the receiver here as all incoming row batches
     // have been consumed so we should have replied to all senders already.
-    if (*eos) return Status::OK();
+    if (*eos) {
+      return Status::OK();
+    }
     next_row_idx_ = 0;
     DCHECK(input_batch_->row_desc()->LayoutIsPrefixOf(*output_batch->row_desc()));
   }

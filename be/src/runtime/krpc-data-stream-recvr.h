@@ -38,6 +38,7 @@ class RpcContext;
 namespace impala {
 
 class KrpcDataStreamMgr;
+class LocalRowBatchChannel;
 class MemTracker;
 class RowBatch;
 class RuntimeProfile;
@@ -98,7 +99,7 @@ class KrpcDataStreamRecvr {
 
   /// Deregister from KrpcDataStreamMgr instance, which shares ownership of this instance.
   /// Called from fragment instance execution threads only.
-  void Close();
+  void Close(RuntimeState* state);
 
   /// Create a SortedRunMerger instance to merge rows from multiple sender according to
   /// the specified row comparator. Fetches the first batches from the individual sender
@@ -120,6 +121,8 @@ class KrpcDataStreamRecvr {
   /// the cancellation.
   void CancelStream();
 
+  Status RegisterLocalChannels();
+
   const TUniqueId& fragment_instance_id() const { return fragment_instance_id_; }
   PlanNodeId dest_node_id() const { return dest_node_id_; }
   const RowDescriptor* row_desc() const { return row_desc_; }
@@ -129,6 +132,7 @@ class KrpcDataStreamRecvr {
 
  private:
   friend class KrpcDataStreamMgr;
+  friend class LocalRowBatchChannel;
   class SenderQueue;
 
   KrpcDataStreamRecvr(KrpcDataStreamMgr* stream_mgr, MemTracker* parent_tracker,
@@ -144,6 +148,9 @@ class KrpcDataStreamRecvr {
   /// later.
   void AddBatch(const TransmitDataRequestPB* request, TransmitDataResponsePB* response,
       kudu::rpc::RpcContext* context);
+
+  Status AddLocalBatch(RowBatch* batch, LocalRowBatchChannel* local_channel,
+      bool* deferred_by_receiver);
 
   /// Tries adding the first entry of 'deferred_rpcs_' queue for the sender queue
   /// identified by 'sender_id'. If is_merging_ is false, it always defaults to

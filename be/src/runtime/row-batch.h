@@ -341,6 +341,10 @@ class RowBatch {
   static int64_t GetDeserializedSize(const RowBatchHeaderPB& header,
       const kudu::Slice& tuple_offsets);
 
+  // Returns size of tuple pointers and tuple_data_pool_. If no external buffers are
+  // referenced, this is enough to deep copy the row batch.
+  int64_t GetOwnedSizeWithoutBuffers() const;
+
   int ALWAYS_INLINE num_rows() const { return num_rows_; }
   int ALWAYS_INLINE capacity() const { return capacity_; }
 

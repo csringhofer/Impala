@@ -39,6 +39,7 @@
 #include "runtime/descriptors.h"
 #include "runtime/exec-env.h"
 #include "runtime/fragment-state.h"
+#include "runtime/local-row-batch-channel.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/row-batch.h"
@@ -60,6 +61,10 @@
 DEFINE_int64(data_stream_sender_buffer_size, 16 * 1024,
     "(Advanced) Max size in bytes which a row batch in a data stream sender's channel "
     "can accumulate before the row batch is sent over the wire.");
+
+DEFINE_bool(use_krpc_for_local_shuffle, false,
+    "(Advanced) Disables optimized implementation for shuffle between fragment instances "
+    "in the same process.");
 
 using std::condition_variable_any;
 using namespace apache::thrift;
@@ -129,7 +134,7 @@ void KrpcDataStreamSenderConfig::Close() {
 //
 // Upon completion of a RPC, the callback TransmitDataCompleteCb() is invoked. If the RPC
 // fails due to remote service's queue being full, TransmitDataCompleteCb() will schedule
-// the retry callback RetryCb() after some delay dervied from
+// the retry callback RetryCb() after some delay derived from
 // 'FLAGS_rpc_retry_internal_ms'.
 //
 // When a data stream sender is shut down, it will call Teardown() on all channels to
@@ -172,11 +177,19 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // Returns OK if successful, error indication otherwise.
   Status Init(RuntimeState* state, std::shared_ptr<CharMemTrackerAllocator> allocator);
 
+  // Initializes local chnannel. Unlike Init() this must be called after Prepare phase
+  // has finished for this fragment instance.
+  Status Open(RuntimeState* state);
+
   // Serializes the given row batch and send it to the destination. If the preceding
   // RPC is in progress, this function may block until the previous RPC finishes.
   // Return error status if serialization or the preceding RPC failed. Return OK
   // otherwise.
   Status SerializeAndSendBatch(RowBatch* batch);
+
+  Status SendBatch(RowBatch* batch,unique_ptr<OutboundRowBatch>* outbound_batch);
+
+  Status SendLocalBatch(RowBatch* batch);
 
   // Transmits the serialized row batch 'outbound_batch'. This function may block if the
   // preceding RPC is still in-flight. This is expected to be called from the fragment
@@ -240,6 +253,10 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // The row batch for accumulating rows copied from AddRow().
   // Only used if the partitioning scheme is "KUDU" or "HASH_PARTITIONED".
   scoped_ptr<RowBatch> batch_;
+
+  scoped_ptr<RowBatch> local_in_flight_batch_;
+
+  LocalRowBatchChannel* local_channel_ = nullptr;
 
   // Owns an outbound row batch that can be referenced by the in-flight RPC. Contains
   // a RowBatchHeaderPB and the buffers for the serialized tuple offsets and data.
@@ -384,14 +401,34 @@ Status KrpcDataStreamSender::Channel::Init(
       max(1, parent_->per_channel_buffer_size_ / max(row_desc_->GetRowSize(), 1));
   batch_.reset(new RowBatch(row_desc_, capacity, parent_->mem_tracker()));
 
-  // Create a DataStreamService proxy to the destination.
-  RETURN_IF_ERROR(DataStreamService::GetProxy(address_, hostname_, &proxy_));
-
-  // Init outbound_batch_.
-  outbound_batch_.reset(new OutboundRowBatch(allocator));
+  if (!is_local_) {
+    // Create a DataStreamService proxy to the destination.
+    RETURN_IF_ERROR(DataStreamService::GetProxy(address_, hostname_, &proxy_));
+    // Init outbound_batch_.
+    outbound_batch_.reset(new OutboundRowBatch(allocator));
+  }
 
   return Status::OK();
 }
+
+Status KrpcDataStreamSender::Channel::Open(RuntimeState* state) {
+  // Remote channels are already initialized in Init() (during Prepare phase).
+  if (!is_local_) return Status::OK();
+  DCHECK_EQ(local_channel_, nullptr);
+
+  // TODO: moving this initialization to the first time of sending a batch could improve
+  //       parallelism during prepare + open
+  LocalRowBatchChannelManager* manager =
+      state->query_state()->GetLocalRowBatchChannelManager();
+  TUniqueId receiver;
+  receiver.__set_hi(fragment_instance_id_.hi());
+  receiver.__set_lo(fragment_instance_id_.lo());
+  RETURN_IF_ERROR(manager->RegisterSender(state,
+      dest_node_id_, receiver, parent_->sender_id_, &rpc_done_cv_, &local_channel_));
+  DCHECK_NE(local_channel_, nullptr);
+  return Status::OK();
+}
+
 
 void KrpcDataStreamSender::Channel::MarkDone(const Status& status) {
   if (UNLIKELY(!status.ok())) COUNTER_ADD(parent_->rpc_failure_counter_, 1);
@@ -431,6 +468,10 @@ Status KrpcDataStreamSender::Channel::WaitForRpc() {
 Status KrpcDataStreamSender::Channel::WaitForRpcLocked(std::unique_lock<SpinLock>* lock) {
   DCHECK(lock != nullptr);
   DCHECK(lock->owns_lock());
+
+  if (is_local_) {
+    return Status::OK();
+  }
 
   ScopedTimer<MonotonicStopWatch> timer(parent_->profile()->inactive_timer(),
       parent_->state_->total_network_send_timer());
@@ -518,6 +559,7 @@ void KrpcDataStreamSender::Channel::TransmitDataCompleteCb() {
     int64_t row_batch_size = RowBatch::GetSerializedSize(*rpc_in_flight_batch_);
     int64_t network_time = total_time - resp_.receiver_latency_ns();
     COUNTER_ADD(parent_->bytes_sent_counter_, row_batch_size);
+    COUNTER_ADD(parent_->bytes_sent_via_krpc_counter_, row_batch_size);
     if (LIKELY(network_time > 0)) {
       // 'row_batch_size' is bounded by FLAGS_rpc_max_message_size which shouldn't exceed
       // max 32-bit signed value so multiplication below should not overflow.
@@ -586,6 +628,7 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
   return Status::OK();
 }
 
+
 Status KrpcDataStreamSender::Channel::TransmitData(
     unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch) {
   VLOG_ROW << "Channel::TransmitData() fragment_instance_id="
@@ -608,21 +651,72 @@ Status KrpcDataStreamSender::Channel::TransmitData(
   return Status::OK();
 }
 
+Status KrpcDataStreamSender::Channel::SendBatch(RowBatch* batch,
+  unique_ptr<OutboundRowBatch>* outbound_batch) {
+  if (is_local_) {
+    // Still needs to copy batch for each channel in broadcast case.
+    return SerializeAndSendBatch(batch);
+  } else {
+    return TransmitData(outbound_batch, false /*swap_batch*/);
+  }
+}
+
+Status KrpcDataStreamSender::Channel::SendLocalBatch(RowBatch* batch) {
+  DCHECK_NE(local_channel_, nullptr);
+  int64_t row_batch_size = batch->GetOwnedSizeWithoutBuffers();
+  DCHECK_GT(row_batch_size, 0);
+  COUNTER_ADD(parent_->bytes_sent_counter_, row_batch_size);
+  COUNTER_ADD(parent_->bytes_sent_via_local_channel_counter_, row_batch_size);
+  return local_channel_->SendBatch(batch);
+}
+
 Status KrpcDataStreamSender::Channel::SerializeAndSendBatch(RowBatch* batch) {
-  unique_ptr<OutboundRowBatch>* serialization_batch = &parent_->serialization_batch_;
-  DCHECK(serialization_batch->get() != nullptr);
-  // Reads 'rpc_in_flight_batch_' without acquiring 'lock_', so reads can be racey.
-  ANNOTATE_IGNORE_READS_BEGIN();
-  DCHECK(serialization_batch->get() != rpc_in_flight_batch_);
-  ANNOTATE_IGNORE_READS_END();
-  RETURN_IF_ERROR(parent_->SerializeBatch(batch, serialization_batch->get(), !is_local_));
-  // Swap serialization_batch with outbound_batch_ once the old RPC is finished.
-  RETURN_IF_ERROR(TransmitData(serialization_batch, true /*swap_batch*/));
+  if (local_channel_ != nullptr) {
+    if (local_in_flight_batch_.get() != nullptr) {
+      RETURN_IF_ERROR(local_channel_->WaitForInFlightBatch());
+    }
+    if (local_in_flight_batch_.get() == nullptr
+        || local_in_flight_batch_->capacity() < batch->capacity()) {
+      // Need a new batch as DeepCopyTo doesn't handle the case when the dst batch
+      // has smaller capacity than the src.
+      local_in_flight_batch_.reset(
+          new RowBatch(row_desc_, batch->capacity(), parent_->mem_tracker()));
+    } else {
+      local_in_flight_batch_->Reset();
+    }
+
+    batch->DeepCopyTo(local_in_flight_batch_.get());
+    RETURN_IF_ERROR(SendLocalBatch(local_in_flight_batch_.get()));
+  } else {
+    unique_ptr<OutboundRowBatch>* serialization_batch = &parent_->serialization_batch_;
+    DCHECK(serialization_batch->get() != nullptr);
+    // Reads 'rpc_in_flight_batch_' without acquiring 'lock_', so reads can be racey.
+    ANNOTATE_IGNORE_READS_BEGIN();
+    DCHECK(serialization_batch->get() != rpc_in_flight_batch_);
+    ANNOTATE_IGNORE_READS_END();
+    RETURN_IF_ERROR(parent_->SerializeBatch(batch, serialization_batch->get(), !is_local_));
+    // Swap serialization_batch with outbound_batch_ once the old RPC is finished.
+    RETURN_IF_ERROR(TransmitData(serialization_batch, true /*swap_batch*/));
+  }
   return Status::OK();
 }
 
 Status KrpcDataStreamSender::Channel::SendCurrentBatch() {
-  RETURN_IF_ERROR(SerializeAndSendBatch(batch_.get()));
+  if (is_local_) {
+    if (local_in_flight_batch_.get() == nullptr) {
+      local_in_flight_batch_.reset(
+          new RowBatch(row_desc_, batch_->capacity(), parent_->mem_tracker()));
+    }
+    DCHECK_NE(local_in_flight_batch_.get(), nullptr);
+    DCHECK_NE(local_channel_, nullptr);
+    RETURN_IF_ERROR(SendLocalBatch(batch_.get()));
+    //local_channel_->SendBatch(batch_.get());
+    local_in_flight_batch_.swap(batch_);
+  } else {
+    DCHECK_EQ(local_in_flight_batch_.get(), nullptr);
+    DCHECK_EQ(local_channel_, nullptr);
+    RETURN_IF_ERROR(SerializeAndSendBatch(batch_.get()));
+  }
   batch_->Reset();
   return Status::OK();
 }
@@ -675,14 +769,20 @@ void KrpcDataStreamSender::Channel::EndDataStreamCompleteCb() {
 Status KrpcDataStreamSender::Channel::DoEndDataStreamRpc() {
   DCHECK(rpc_in_flight_);
   EndDataStreamRequestPB eos_req;
-  rpc_controller_.Reset();
-  *eos_req.mutable_dest_fragment_instance_id() = fragment_instance_id_;
-  eos_req.set_sender_id(parent_->sender_id_);
-  eos_req.set_dest_node_id(dest_node_id_);
-  eos_resp_.Clear();
-  rpc_start_time_ns_ = MonotonicNanos();
-  proxy_->EndDataStreamAsync(eos_req, &eos_resp_, &rpc_controller_,
-      boost::bind(&KrpcDataStreamSender::Channel::EndDataStreamCompleteCb, this));
+  if (local_channel_ != nullptr) {
+    // TODO: is this supposed to be async?
+    local_channel_->SendEos();
+  } else {
+    rpc_controller_.Reset();
+    *eos_req.mutable_dest_fragment_instance_id() = fragment_instance_id_;
+    eos_req.set_sender_id(parent_->sender_id_);
+    eos_req.set_dest_node_id(dest_node_id_);
+    eos_resp_.Clear();
+    rpc_start_time_ns_ = MonotonicNanos();
+    proxy_->EndDataStreamAsync(eos_req, &eos_resp_, &rpc_controller_,
+        boost::bind(&KrpcDataStreamSender::Channel::EndDataStreamCompleteCb, this));
+  }
+
   return Status::OK();
 }
 
@@ -714,10 +814,12 @@ Status KrpcDataStreamSender::Channel::SendEosAsync() {
     COUNTER_ADD(parent_->eos_sent_counter_, 1);
     RETURN_IF_ERROR(DoEndDataStreamRpc());
   }
+  //LOG(INFO) << "Channel::SendEosAsync() finished";
   return Status::OK();
 }
 
 void KrpcDataStreamSender::Channel::Teardown(RuntimeState* state) {
+  //LOG(INFO) << "KrpcDataStreamSender::Channel::Teardown";
   // Normally, the channel should have been flushed before calling Teardown(), which means
   // that all the data should already be drained. If the fragment was was closed or
   // cancelled, there may still be some in-flight RPCs and buffered row batches to be
@@ -725,12 +827,18 @@ void KrpcDataStreamSender::Channel::Teardown(RuntimeState* state) {
   std::unique_lock<SpinLock> l(lock_);
   shutdown_ = true;
   // Cancel any in-flight RPC.
-  if (rpc_in_flight_) {
+  if (rpc_in_flight_ && local_channel_ == nullptr) {
     rpc_controller_.Cancel();
     while (rpc_in_flight_) rpc_done_cv_.wait(l);
   }
+  // Unregister local channel before resetting the batch as the receiver can still
+  // use the in-flight batch at this point.
+  if (local_channel_ != nullptr) {
+    local_channel_->UnregisterSender();
+  }
   batch_.reset();
   outbound_batch_.reset(nullptr);
+  local_in_flight_batch_.reset(nullptr);
 }
 
 KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
@@ -758,7 +866,7 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
   string process_address =
       NetworkAddressPBToString(ExecEnv::GetInstance()->krpc_address());
   for (const auto& destination : destinations) {
-    bool is_local =
+    bool is_local = !FLAGS_use_krpc_for_local_shuffle &&
         process_address == NetworkAddressPBToString(destination.krpc_backend());
     channels_.emplace_back(new Channel(this, row_desc_, destination.address().hostname(),
         destination.krpc_backend(), destination.fragment_instance_id(), sink.dest_node_id,
@@ -796,6 +904,10 @@ Status KrpcDataStreamSender::Prepare(
   rpc_retry_counter_ = ADD_COUNTER(profile(), "RpcRetry", TUnit::UNIT);
   rpc_failure_counter_ = ADD_COUNTER(profile(), "RpcFailure", TUnit::UNIT);
   bytes_sent_counter_ = ADD_COUNTER(profile(), "TotalBytesSent", TUnit::BYTES);
+  bytes_sent_via_krpc_counter_ =
+      ADD_COUNTER(profile(), "BytesSentViaKrpc", TUnit::BYTES);
+  bytes_sent_via_local_channel_counter_ =
+      ADD_COUNTER(profile(), "BytesSentViaLocalChannel", TUnit::BYTES);
   state->AddBytesSentCounter(bytes_sent_counter_);
   bytes_sent_time_series_counter_ =
       ADD_TIME_SERIES_COUNTER(profile(), "BytesSent", bytes_sent_counter_);
@@ -834,6 +946,9 @@ Status KrpcDataStreamSender::Prepare(
 Status KrpcDataStreamSender::Open(RuntimeState* state) {
   SCOPED_TIMER(profile_->total_time_counter());
   RETURN_IF_ERROR(DataSink::Open(state));
+  for (int i = 0; i < channels_.size(); ++i) {
+    RETURN_IF_ERROR(channels_[i]->Open(state));
+  }
   return ScalarExprEvaluator::Open(partition_expr_evals_, state);
 }
 
@@ -1053,9 +1168,9 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
     // reference the previously written in_flight_batch_).
     for (int i = 0; i < channels_.size(); ++i) {
       // Do not swap serialization_batch_ with the channel's outbound_batch_ to allow
-      // multiple channels to  use the data backing serialization_batch_ in parallel.
+      // multiple channels to use the data backing serialization_batch_ in parallel.
       RETURN_IF_ERROR(
-          channels_[i]->TransmitData(&serialization_batch_, false /*swap_batch*/));
+          channels_[i]->SendBatch(batch, &serialization_batch_));
     }
     // At this point no RPCs can still refer to the old in_flight_batch_.
     in_flight_batch_.swap(serialization_batch_);
@@ -1158,7 +1273,9 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
   }
   COUNTER_ADD(total_sent_rows_counter_, batch->num_rows());
   expr_results_pool_->Clear();
+
   RETURN_IF_ERROR(state->CheckQueryState());
+
   return Status::OK();
 }
 

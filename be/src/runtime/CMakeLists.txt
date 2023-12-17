@@ -65,6 +65,7 @@ add_library(Runtime
   krpc-data-stream-recvr.cc
   krpc-data-stream-sender.cc
   lib-cache.cc
+  local-row-batch-channel.cc
   mem-tracker.cc
   mem-pool.cc
   query-driver.cc

@@ -560,7 +560,7 @@ class TestObservability(ImpalaTestSuite):
     assert "  MemoryUsage" not in profile
     assert "- MemoryUsage" in profile
 
-    assert "ExchangeScanRatio: 4.63" in profile
+    assert "ExchangeScanRatio: 6.0" in profile
 
     keys = ["TotalBytesSent", "TotalScanBytesSent", "TotalInnerBytesSent"]
     counters = defaultdict(int)

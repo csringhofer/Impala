@@ -52,6 +52,7 @@ class FragmentState;
 class FragmentInstanceState;
 class InitialReservations;
 class LlvmCodeGen;
+class LocalRowBatchChannelManager;
 class CodeGenCache;
 class MemTracker;
 class PlanNode;
@@ -315,6 +316,10 @@ class QueryState {
     return fragment_state_map_;
   }
 
+  LocalRowBatchChannelManager* GetLocalRowBatchChannelManager() {
+    return local_row_batch_channel_manager_;
+  }
+
  private:
   friend class QueryExecMgr;
 
@@ -491,6 +496,9 @@ class QueryState {
 
   /// Indicator of whether to disable the codegen cache for the query.
   bool disable_codegen_cache_ = false;
+
+
+  LocalRowBatchChannelManager* local_row_batch_channel_manager_;
 
   /// Create QueryState w/ a refcnt of 0 and a memory limit of 'mem_limit' bytes applied
   /// to the query mem tracker. The query is associated with the resource pool set in

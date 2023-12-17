@@ -49,6 +49,7 @@ class DescriptorTbl;
 class EndDataStreamRequestPB;
 class EndDataStreamResponsePB;
 class KrpcDataStreamRecvr;
+class LocalRowBatchChannel;
 class RuntimeState;
 class TransmitDataRequestPB;
 class TransmitDataResponsePB;
@@ -177,9 +178,16 @@ struct TransmitDataCtx {
   /// has been responded to. Not owned.
   kudu::rpc::RpcContext* rpc_context;
 
+  LocalRowBatchChannel* local_channel;
+
   TransmitDataCtx(const TransmitDataRequestPB* request, TransmitDataResponsePB* response,
       kudu::rpc::RpcContext* rpc_context)
-    : request(request), response(response), rpc_context(rpc_context) { }
+    : request(request), response(response), rpc_context(rpc_context),
+      local_channel(nullptr) { }
+
+  TransmitDataCtx(LocalRowBatchChannel* local_channel)
+    : request(nullptr), response(nullptr), rpc_context(nullptr),
+      local_channel(local_channel) { }
 };
 
 /// Context for an EndDataStream() RPC. This structure is constructed when the RPC is

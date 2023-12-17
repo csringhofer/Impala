@@ -451,6 +451,10 @@ int64_t RowBatch::GetSerializedSize(const OutboundRowBatch& batch) {
   return batch.tuple_data_.size() + batch.tuple_offsets_.size() * sizeof(int32_t);
 }
 
+int64_t RowBatch::GetOwnedSizeWithoutBuffers() const {
+  return tuple_ptrs_size_ + tuple_data_pool_.total_allocated_bytes();
+}
+
 void RowBatch::AcquireState(RowBatch* src) {
   DCHECK(row_desc_->LayoutEquals(*src->row_desc_)) << row_desc_->DebugString() << "\n"
     << src->row_desc_->DebugString();
