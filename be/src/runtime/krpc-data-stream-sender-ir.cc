@@ -49,9 +49,7 @@ Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
         //  If SEND_TO_ONE_INSTANCE_IN_EACH_HOST, send to num_host channels
         //  if SEND_TO_ONE_INSTANCE_WITHIN_HOST: there should be only one channel per partition
         int partition = channel_ids[row_count++];
-        for (int channel_id: config.hash_to_channel_ids_[partition]) {
-           RETURN_IF_ERROR(AddRowToChannel(channel_id, row_batch_iter.Get()));
-        }
+        RETURN_IF_ERROR(AddRowToChannels(partition, row_batch_iter.Get()));
       }
     }
 

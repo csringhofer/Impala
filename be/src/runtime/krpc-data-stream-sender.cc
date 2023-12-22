@@ -272,6 +272,7 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   bool IsLocal() const { return is_local_; }
 
  private:
+  friend class KrpcDataStreamSender;
   // The parent data stream sender owning this channel. Not owned.
   KrpcDataStreamSender* parent_;
 
@@ -1176,6 +1177,55 @@ Status KrpcDataStreamSender::AddRowToChannel(const int channel_id, TupleRow* row
   return channels_[channel_id]->AddRow(row);
 }
 
+Status KrpcDataStreamSender::AddRowToChannels(const int partition, TupleRow* row) {
+  const auto& config = (const KrpcDataStreamSenderConfig&) sink_config_;
+  Channel* first_non_local_channel = nullptr;
+  const auto& channel_ids = config.hash_to_channel_ids_[partition];
+  if (channel_ids.size() == 1) {
+    Channel* ch = channels_[channel_ids[0]].get();
+    if (LIKELY(row != nullptr)) {
+      RETURN_IF_ERROR(ch->AddRow(row));
+    } else {
+      RETURN_IF_ERROR(ch->FlushBatches());
+    }
+    return Status::OK();
+  }
+  for (int channel_id: channel_ids) {
+    if (!channels_[channel_id]->is_local_) {
+      first_non_local_channel = channels_[channel_id].get();
+      break;
+    }
+  }
+  DCHECK_NE(first_non_local_channel, nullptr);
+  if (!first_non_local_channel->batch_->AtCapacity() && row != nullptr) {
+    // Collect rows in first channel.
+    return first_non_local_channel->AddRow(row);
+  }
+  if (row == nullptr && first_non_local_channel->batch_->num_rows() == 0) {
+    return Status::OK();
+  }
+  for (int channel_id: channel_ids) {
+    Channel* ch = channels_[channel_id].get();
+    if (ch == first_non_local_channel) continue; 
+    if (ch->is_local_) {
+      RETURN_IF_ERROR(ch->SerializeAndSendBatch(first_non_local_channel->batch_.get()));
+    } else {
+      RETURN_IF_ERROR(ch->WaitForRpc());
+    }
+  }
+  RETURN_IF_ERROR(first_non_local_channel->SendCurrentBatch());
+  DCHECK_NE(first_non_local_channel->outbound_batch_.get(), nullptr);
+  for (int channel_id: channel_ids) {
+    Channel* ch = channels_[channel_id].get();
+    if (ch == first_non_local_channel) continue;
+    if (!ch->is_local_) {
+      RETURN_IF_ERROR(ch->TransmitData(&first_non_local_channel->outbound_batch_, false));
+    }
+  }
+  if (row == nullptr) return Status::OK();
+  return first_non_local_channel->AddRow(row);
+}
+
 int KrpcDataStreamSender::GetNumChannels() const {
   const auto& config = (const KrpcDataStreamSenderConfig&) sink_config_;
   return config.num_channels_;
@@ -1352,9 +1402,17 @@ Status KrpcDataStreamSender::FlushFinal(RuntimeState* state) {
   // If we hit an error here, we can return without closing the remaining channels as
   // the error is propagated back to the coordinator, which in turn cancels the query,
   // which will cause the remaining open channels to be closed.
-  for (unique_ptr<Channel>& channel : channels_) {
-    RETURN_IF_ERROR(channel->FlushBatches());
+  const auto& config = (const KrpcDataStreamSenderConfig&) sink_config_;
+  if (config.hash_to_channel_ids_.empty()) {
+    for (unique_ptr<Channel>& channel : channels_) {
+      RETURN_IF_ERROR(channel->FlushBatches());
+    }
+  } else {
+    for (int partition = 0; partition < config.num_channels_; partition++) {
+      RETURN_IF_ERROR(AddRowToChannels(partition, nullptr));
+    }
   }
+  
   for (unique_ptr<Channel>& channel : channels_) {
     RETURN_IF_ERROR(channel->WaitForRpc());
   }

@@ -199,6 +199,9 @@ class KrpcDataStreamSender : public DataSink {
   /// Adds the given row to 'channels_[channel_id]'.
   Status AddRowToChannel(const int channel_id, TupleRow* row);
 
+  Status AddRowToChannels(const int partition, TupleRow* row);
+
+
   /// Functions to dump the content of the "filename to hosts" related mappings into logs.
   void DumpFilenameToHostsMapping() const;
   void DumpDestinationHosts() const;
