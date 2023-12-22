@@ -92,6 +92,7 @@ endif()
 add_library(ExprsTests STATIC
   datasketches-test.cc
   expr-test.cc
+  timestamp-expr-test.cc
   iceberg-functions-test.cc
   timezone_db-test.cc
 )
@@ -101,6 +102,7 @@ ADD_UNIFIED_BE_LSAN_TEST(datasketches-test
  "TestDataSketchesHll.*:TestDataSketchesKll.*:TestDataSketchesCpc.*:TestDataSketchesTheta.*")
 ADD_UNIFIED_BE_LSAN_TEST(iceberg-functions-test "TestIcebergFunctions.*")
 ADD_UNIFIED_BE_LSAN_TEST(expr-test "Instantiations/ExprTest.*")
+ADD_UNIFIED_BE_LSAN_TEST(timestamp-expr-test "Instantiations/TimestampExprTest.*")
 # Exception to unified be tests: custom main initiailizes LLVM
 ADD_BE_LSAN_TEST(expr-codegen-test)
 ADD_UNIFIED_BE_LSAN_TEST(timezone_db-test
