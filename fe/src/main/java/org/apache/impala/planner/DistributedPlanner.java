@@ -597,18 +597,30 @@ public class DistributedPlanner {
     Analyzer analyzer = ctx_.getRootAnalyzer();
     PlanNode rhsTree = rightChildFragment.getPlanRoot();
     long rhsDataSize = -1;
-    long broadcastCost = -1;
-    int mt_dop = ctx_.getQueryOptions().mt_dop;
-    int leftChildNodes = leftChildFragment.getNumNodes();
     if (rhsTree.getCardinality() != -1) {
       rhsDataSize = Math.round(
           rhsTree.getCardinality() * ExchangeNode.getAvgSerializedRowSize(rhsTree));
+    }
+    PlanNode lhsTree = leftChildFragment.getPlanRoot();
+    long lhsDataSize = -1;
+    if (lhsTree.getCardinality() != -1) {
+      lhsDataSize = Math.round(
+          lhsTree.getCardinality() * ExchangeNode.getAvgSerializedRowSize(lhsTree));
+    }
+    long broadcastCost = -1;
+    int mt_dop = ctx_.getQueryOptions().mt_dop;
+    int leftChildNodes = leftChildFragment.getNumNodes();
+    boolean prefers_parallel_broadcast = false;
+    if (rhsDataSize != -1) {
       if (leftChildNodes != -1) {
         // RHS data must be broadcast once to each node.
         // TODO: IMPALA-9176: this is inaccurate for NAAJ until IMPALA-9176 is fixed
         // because it must be broadcast once per instance.
         long dataPayload = rhsDataSize * leftChildNodes;
         long hashTblBuildCost = dataPayload;
+        PlanNode leftPlanRoot = leftChildFragment.getPlanRoot();
+        double actual_dop = leftPlanRoot.getNumInstances()/ (double)leftPlanRoot.getNumNodes();
+        double dop_speedup = Math.max(1.0, Math.sqrt(actual_dop)) - 1.0;
         if (mt_dop > 1 && ctx_.getQueryOptions().use_dop_for_costing) {
           // In the broadcast join a single thread per node is building the hash
           // table of size N compared to the partition case where m threads are
@@ -622,12 +634,21 @@ public class DistributedPlanner {
           // TODO: revisit this calculation if COMPUTE_PROCESSING_COST=true.
           //   Num instances might change during Planner.computeProcessingCost(),
           //   later after parallel plan created.
-          PlanNode leftPlanRoot = leftChildFragment.getPlanRoot();
-          int actual_dop = leftPlanRoot.getNumInstances()/leftPlanRoot.getNumNodes();
+
           hashTblBuildCost *= (long) (ctx_.getQueryOptions().broadcast_to_partition_factor
-              * Math.max(1.0, Math.sqrt(actual_dop)));
+              * dop_speedup);
         }
         broadcastCost = dataPayload + hashTblBuildCost;
+        double local_partitioning_overhead = lhsDataSize * 0.2; // guess for cost of extra exchange node
+        double local_partitioning_speedup = dop_speedup * rhsDataSize;
+        // LOG.info("lhsDataSize: " + lhsDataSize);
+        // LOG.info("rhsDataSize: " + rhsDataSize);
+        // LOG.info("dop_speedup: " + dop_speedup);
+        // LOG.info("local_partitioning_overhead: " + (long)local_partitioning_overhead);
+        // LOG.info("local_partitioning_speedup: " + (long)local_partitioning_speedup);
+        if (local_partitioning_overhead < local_partitioning_speedup) {
+          prefers_parallel_broadcast = true;
+        }
       }
     }
     if (LOG.isTraceEnabled()) {
@@ -639,7 +660,6 @@ public class DistributedPlanner {
 
     // repartition: both left- and rightChildFragment are partitioned on the
     // join exprs, and a hash table is built with the rightChildFragment's output.
-    PlanNode lhsTree = leftChildFragment.getPlanRoot();
     List<Expr> lhsJoinExprs = new ArrayList<>();
     List<Expr> rhsJoinExprs = new ArrayList<>();
     for (Expr joinConjunct: node.getEqJoinConjuncts()) {
@@ -673,7 +693,7 @@ public class DistributedPlanner {
     }
 
     DistributionMode distrMode = computeJoinDistributionMode(
-        node, broadcastCost, partitionCost, rhsDataSize);
+        node, broadcastCost, partitionCost, rhsDataSize, prefers_parallel_broadcast);
     node.setDistributionMode(distrMode);
 
     PlanFragment hjFragment = null;
@@ -734,7 +754,7 @@ public class DistributedPlanner {
   * unknown, e.g., due to missing stats.
   */
  private DistributionMode computeJoinDistributionMode(JoinNode node,
-     long broadcastCost, long partitionCost, long rhsDataSize) {
+     long broadcastCost, long partitionCost, long rhsDataSize, boolean prefers_parallel_broadcast) {
    // Check join types that require a specific distribution strategy to run correctly.
    JoinOperator op = node.getJoinOp();
    if (op == JoinOperator.RIGHT_OUTER_JOIN || op == JoinOperator.RIGHT_SEMI_JOIN
@@ -748,6 +768,8 @@ public class DistributedPlanner {
      return node.getDistributionModeHint();
    }
 
+   LOG.info("broadcastCost: {} partitionCost: {} prefers_parallel_broadcast: {}",
+       broadcastCost, partitionCost, prefers_parallel_broadcast);
    // Use the default mode when the costs are unknown or tied.
    if (broadcastCost == -1 || partitionCost == -1 || broadcastCost == partitionCost) {
      return DistributionMode.fromThrift(
@@ -766,7 +788,7 @@ public class DistributedPlanner {
 
    if (broadcastCost <= partitionCost && (memLimit == 0 || htSize <= memLimit) &&
            (broadcast_bytes_limit == 0 || htSize <= broadcast_bytes_limit)) {
-     if (local_partitioning_bytes_limit >= htSize) return DistributionMode.BROADCAST;
+     if (local_partitioning_bytes_limit >= htSize || !prefers_parallel_broadcast) return DistributionMode.BROADCAST;
      else return DistributionMode.LOCAL_PARTITIONED;
    }
    // Partitioned was cheaper or the broadcast HT would not fit within the mem limit.
