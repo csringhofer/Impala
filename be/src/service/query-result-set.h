@@ -18,6 +18,7 @@
 #ifndef IMPALA_SERVICE_QUERY_RESULT_SET_H
 #define IMPALA_SERVICE_QUERY_RESULT_SET_H
 
+#include "codegen/llvm-codegen.h"
 #include "common/status.h"
 #include "gen-cpp/Data_types.h"
 #include "gen-cpp/Results_types.h"
@@ -31,6 +32,9 @@
 namespace impala {
 
 class RowBatch;
+class RowBatchContext;
+class RowDescriptor;
+class RuntimeState;
 class ScalarExprEvaluator;
 class TupleRow;
 
@@ -49,6 +53,12 @@ class QueryResultSet {
   virtual Status AddRows(const std::vector<ScalarExprEvaluator*>& expr_evals,
       RowBatch* batch, int start_idx, int num_rows) = 0;
 
+  virtual bool DelayedMaterializationEnabled() const { return false; }
+  virtual Status InitDelayedMaterialization(const RowDescriptor& row_desc,
+      const int fetch_size, const std::vector<ScalarExprEvaluator*>& expr_evals,
+      RuntimeState* state) {
+    return Status::OK();
+  }
   /// Add the TResultRow to this result set. When a row comes from a DDL/metadata
   /// operation, the row in the form of TResultRow.
   virtual Status AddOneRow(const TResultRow& row) = 0;
@@ -67,6 +77,9 @@ class QueryResultSet {
   /// Returns the size of this result set in number of rows.
   virtual size_t size() = 0;
 
+  /// Perform any required finalization
+  virtual void Flush() { }
+
   /// Returns a result set suitable for Beeswax-based clients. If 'stringift_map_keys' is
   /// true, converts map keys to strings; see IMPALA-11778.
   static QueryResultSet* CreateAsciiQueryResultSet(
@@ -80,8 +93,11 @@ class QueryResultSet {
       apache::hive::service::cli::thrift::TProtocolVersion::type version,
       const TResultSetMetadata& metadata,
       apache::hive::service::cli::thrift::TRowSet* rowset, bool stringify_map_keys,
-      int expected_result_count);
+      int expected_result_count, bool delay_materialization);
 
+  void SetCodegenPtr(const std::shared_ptr<LlvmCodeGen>& codegen) {
+    codegen_ = codegen;
+  }
 protected:
   /// Wrapper to call ComplexValueWriter::CollectionValueToJSON() or
   /// ComplexValueWriter::StructValToJSON() for a given complex column. expr_eval must be
@@ -89,6 +105,10 @@ protected:
   /// true, converts map keys to strings; see IMPALA-11778.
   static void PrintComplexValue(ScalarExprEvaluator* expr_eval, const TupleRow* row,
       std::stringstream *stream, const ColumnType& type, bool stringify_map_keys);
+
+  /// Reference to root fragment codegen structures. Needed to allow delayed
+  /// materialization after query shutdown.
+  std::shared_ptr<LlvmCodeGen> codegen_;
 };
 }
 

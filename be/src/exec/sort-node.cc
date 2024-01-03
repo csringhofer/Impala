@@ -177,7 +177,7 @@ Status SortNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
     // Throw away rows in the output batch until the offset is skipped.
     int rows_to_keep = num_rows_skipped_ - offset_;
     if (rows_to_keep > 0) {
-      row_batch->CopyRows(0, row_batch->num_rows() - rows_to_keep, rows_to_keep);
+      row_batch->MoveRows(0, row_batch->num_rows() - rows_to_keep, rows_to_keep);
       row_batch->set_num_rows(rows_to_keep);
     } else {
       row_batch->set_num_rows(0);

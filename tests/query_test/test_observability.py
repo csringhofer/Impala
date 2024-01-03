@@ -637,6 +637,14 @@ class TestObservability(ImpalaTestSuite):
           counters.append(counter)
     return counters
 
+  def _get_profile_counter_value(self, profile, name):
+    """Finds all time series counters in 'profile' with a matching name."""
+    for node in profile.nodes:
+      for counter in node.counters or []:
+        if counter.name == name:
+          return counter.value
+    return None
+
   @pytest.mark.execute_serially
   def test_thrift_profile_contains_host_resource_metrics(self):
     """Tests that the thrift profile contains time series counters for CPU and network
@@ -654,6 +662,37 @@ class TestObservability(ImpalaTestSuite):
       assert len(counters) == 1
       counter = counters[0]
       assert len(counter.values) > 0
+
+  @pytest.mark.execute_serially
+  def test_delayed_result_materialization(self):
+    for spool_val in ['false', 'true']:
+      self.hs2_client.set_configuration({'delay_materialize_results_threshold': 0,
+                                         'spool_query_results': spool_val})
+      result = self.hs2_client.execute("select int_col from functional.alltypes",
+                                       profile_format=TRuntimeProfileFormat.THRIFT)
+      assert(len(result.data) == 7300 and result.data[0] == "0")
+      assert(self._get_profile_counter_value(result.profile, "ResultFlushTimer") != 0)
+
+  @pytest.mark.execute_serially
+  def test_delayed_result_materialization_resultcache(self):
+    self.hs2_client.set_configuration({'delay_materialize_results_threshold': 0,
+                                       'impala.resultset.cache.size': 10})
+    result = self.hs2_client.execute("select sleep(100)",
+                                     profile_format=TRuntimeProfileFormat.THRIFT)
+    result = self.hs2_client.execute("select sleep(100)",
+                                     profile_format=TRuntimeProfileFormat.THRIFT)
+    assert(len(result.data) == 1 and result.data[0] == "True")
+    assert(self._get_profile_counter_value(result.profile, "ResultFlushTimer") == 0)
+
+  @pytest.mark.execute_serially
+  def test_no_delayed_result_materialization(self):
+    self.hs2_client.set_configuration({'delay_materialize_results_threshold': 0.2,
+                                       'impala.resultset.cache.size': 0})
+    result = self.hs2_client.execute("select sleep(100)",
+                                     profile_format=TRuntimeProfileFormat.THRIFT)
+    assert(len(result.data) == 1 and result.data[0] == "True")
+    assert(self._get_profile_counter_value(result.profile, "ResultFlushTimer") == 0)
+    assert(self._get_profile_counter_value(result.profile, "FetchLockWaitTimer") > 0)
 
   @pytest.mark.execute_serially
   def test_query_profile_thrift_timestamps(self):

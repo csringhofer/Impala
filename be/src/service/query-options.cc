@@ -1224,6 +1224,13 @@ Status impala::SetQueryOption(const string& key, const string& value,
         query_options->__set_enable_tuple_cache(enable_tuple_cache);
         break;
       }
+      case TImpalaQueryOptions::DELAY_MATERIALIZE_RESULTS_THRESHOLD: {
+        double double_val = 0.0f;
+        RETURN_IF_ERROR(QueryOptionParser::ParseAndCheckInclusiveRange<double>(
+            option, value, 0.0, 1.0, &double_val));
+        query_options->__set_delay_materialize_results_threshold(double_val);
+        break;
+      }
       default:
         if (IsRemovedQueryOption(key)) {
           LOG(WARNING) << "Ignoring attempt to set removed query option '" << key << "'";

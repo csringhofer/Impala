@@ -88,7 +88,7 @@ const int RET_SCALE = 1;
 
 class ExprCodegenTest : public ::testing::Test {
  protected:
-  scoped_ptr<TestEnv> test_env_;
+  std::unique_ptr<TestEnv> test_env_;
   RuntimeState* runtime_state_;
   FragmentState* fragment_state_;
   FunctionContext* fn_ctx_;
@@ -103,7 +103,7 @@ class ExprCodegenTest : public ::testing::Test {
     return codegen->InlineConstFnAttrs(ret_type, arg_types, fn);
   }
 
-  Status CreateFromFile(const string& filename, scoped_ptr<LlvmCodeGen>* codegen) {
+  Status CreateFromFile(const string& filename, std::unique_ptr<LlvmCodeGen>* codegen) {
     RETURN_IF_ERROR(LlvmCodeGen::CreateFromFile(fragment_state_,
         fragment_state_->obj_pool(), NULL, filename, "test", codegen));
     return (*codegen)->MaterializeModule();
@@ -323,7 +323,7 @@ TEST_F(ExprCodegenTest, TestInlineConstFnAttrs) {
   // Get TestGetFnAttrs() IR function
   stringstream test_udf_file;
   test_udf_file << getenv("IMPALA_HOME") << "/be/build/latest/exprs/expr-codegen-test.ll";
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::unique_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(CreateFromFile(test_udf_file.str(), &codegen));
   llvm::Function* fn = codegen->GetFunction(TEST_GET_FN_ATTR_SYMBOL, false);
   ASSERT_TRUE(fn != NULL);
@@ -357,7 +357,6 @@ TEST_F(ExprCodegenTest, TestInlineConstFnAttrs) {
   EXPECT_EQ(result.is_null, false);
   EXPECT_EQ(result.val8, 100003);
   CheckFnAttr();
-  codegen->Close();
 }
 
 }

@@ -117,6 +117,7 @@ ClientRequestState::ClientRequestState(const TQueryCtx& query_ctx, Frontend* fro
       "DEBUG build of Impala. Use RELEASE builds to measure query performance.");
 #endif
   row_materialization_timer_ = ADD_TIMER(server_profile_, "RowMaterializationTimer");
+  result_flush_timer_ = ADD_TIMER(server_profile_, "ResultFlushTimer");
   num_rows_fetched_counter_ = ADD_COUNTER(server_profile_, "NumRowsFetched", TUnit::UNIT);
   row_materialization_rate_ =
       server_profile_->AddDerivedCounter("RowMaterializationRate", TUnit::UNIT_PER_SECOND,
@@ -127,6 +128,9 @@ ClientRequestState::ClientRequestState(const TQueryCtx& query_ctx, Frontend* fro
   client_wait_timer_ = ADD_TIMER(server_profile_, "ClientFetchWaitTimer");
   client_wait_time_stats_ =
       ADD_SUMMARY_STATS_TIMER(server_profile_, "ClientFetchWaitTimeStats");
+  fetch_lock_wait_timer_ = ADD_TIMER(server_profile_, "FetchLockWaitTimer");
+  num_fetch_streams_counter_ =
+      server_profile_->AddHighWaterMarkCounter("MaxFetchStreams", TUnit::UNIT);
   rpc_read_timer_ = ADD_TIMER(server_profile_, "RPCReadTimer");
   rpc_write_timer_ = ADD_TIMER(server_profile_, "RPCWriteTimer");
   rpc_count_ = ADD_COUNTER(server_profile_, "RPCCount", TUnit::UNIT);
@@ -1764,6 +1768,32 @@ void ClientRequestState::MarkActive() {
   lock_guard<mutex> l(expiration_data_lock_);
   last_active_time_ms_ = UnixMillis();
   ++ref_count_;
+}
+
+void ClientRequestState::AddFetchLockWaitTime(int64_t fetch_lock_wait_ns) {
+  fetch_lock_wait_timer_->Add(fetch_lock_wait_ns);
+}
+
+void ClientRequestState::AddResultFlushTime(int64_t result_flush_ns) {
+  result_flush_timer_->Add(result_flush_ns);
+}
+
+bool ClientRequestState::UseDelayedMaterialization() {
+  if (!delay_materialization_) {
+    // Enable delayed materialization if multiple fetch streams are present and
+    // fetch lock wait time exceeds threshold or
+    // when delay_materialize_results_threshold for testing purposes
+    double materialize_threshold =
+        query_ctx_.client_request.query_options.delay_materialize_results_threshold;
+    if (result_cache_max_size_ <= 0 &&
+        (num_fetch_streams_counter_->value() > 1 || !materialize_threshold) &&
+        row_materialization_timer_->value() > 0 &&
+        fetch_lock_wait_timer_->value() >
+            row_materialization_timer_->value() * materialize_threshold) {
+      delay_materialization_ = true;
+    }
+  }
+  return delay_materialization_;
 }
 
 Status ClientRequestState::UpdateTableAndColumnStats(

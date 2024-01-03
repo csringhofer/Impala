@@ -63,7 +63,7 @@ TEST_F(CodegenFnPtrTest, StoreNonVoidPtrAndLoad) {
 
 class LlvmCodeGenTest : public testing::Test {
  protected:
-  scoped_ptr<TestEnv> test_env_;
+  std::unique_ptr<TestEnv> test_env_;
   FragmentState* fragment_state_;
 
   virtual void SetUp() {
@@ -99,14 +99,11 @@ class LlvmCodeGenTest : public testing::Test {
       ASSERT_OK(object3.Init(
           unique_ptr<llvm::Module>(new llvm::Module("Test", object3.context()))));
 
-      object1.Close();
-      object2.Close();
-      object3.Close();
     }
   }
 
   // Wrapper to call private test-only methods on LlvmCodeGen object
-  Status CreateFromFile(const string& filename, scoped_ptr<LlvmCodeGen>* codegen) {
+  Status CreateFromFile(const string& filename, std::unique_ptr<LlvmCodeGen>* codegen) {
     RETURN_IF_ERROR(LlvmCodeGen::CreateFromFile(fragment_state_,
         fragment_state_->obj_pool(), NULL, filename, "test", codegen));
     return (*codegen)->MaterializeModule();
@@ -183,9 +180,8 @@ TEST_F(LlvmCodeGenTest, MultithreadedLifetime) {
 // Test loading a non-existent file
 TEST_F(LlvmCodeGenTest, BadIRFile) {
   string module_file = "NonExistentFile.ir";
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::unique_ptr<LlvmCodeGen> codegen;
   EXPECT_FALSE(CreateFromFile(module_file.c_str(), &codegen).ok());
-  codegen->Close();
 }
 
 // IR for the generated linner loop:
@@ -240,7 +236,7 @@ TEST_F(LlvmCodeGenTest, ReplaceFnCall) {
   PathBuilder::GetFullPath("llvm-ir/test-loop.bc", &module_file);
 
   // Part 1: Load the module and make sure everything is loaded correctly.
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::unique_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(CreateFromFile(module_file.c_str(), &codegen));
   EXPECT_TRUE(codegen.get() != nullptr);
 
@@ -306,7 +302,6 @@ TEST_F(LlvmCodeGenTest, ReplaceFnCall) {
   TestLoopFn new_loop_fn2 = new_loop2.load();
   new_loop_fn2(5, &counter);
   EXPECT_EQ(0, counter);
-  codegen->Close();
 }
 
 // Test function for c++/ir interop for strings.  Function will do:
@@ -372,7 +367,7 @@ llvm::Function* CodegenStringTest(LlvmCodeGen* codegen) {
 // struct.  Just create a simple StringValue struct and make sure the IR can read it
 // and modify it.
 TEST_F(LlvmCodeGenTest, StringValue) {
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(fragment_state_, NULL, "test", &codegen));
   EXPECT_TRUE(codegen.get() != NULL);
 
@@ -409,12 +404,11 @@ TEST_F(LlvmCodeGenTest, StringValue) {
   int32_t len = 0;
   memcpy(static_cast<void*>(&len), static_cast<void*>(&bytes[8]), sizeof(int32_t));
   EXPECT_EQ(1, len);   // str_val.len
-  codegen->Close();
 }
 
 // Test calling memcpy intrinsic
 TEST_F(LlvmCodeGenTest, MemcpyTest) {
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(fragment_state_, NULL, "test", &codegen));
   ASSERT_TRUE(codegen.get() != NULL);
 
@@ -447,7 +441,6 @@ TEST_F(LlvmCodeGenTest, MemcpyTest) {
   test_fn(dst, src, 4);
 
   EXPECT_EQ(memcmp(src, dst, 4), 0);
-  codegen->Close();
 }
 
 // Test codegen for hash
@@ -456,11 +449,9 @@ TEST_F(LlvmCodeGenTest, HashTest) {
   const char* data1 = "test string";
   const char* data2 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(fragment_state_, NULL, "test", &codegen));
   ASSERT_TRUE(codegen.get() != NULL);
-  const auto close_codegen =
-      MakeScopeExitTrigger([&codegen]() { codegen->Close(); });
 
   LlvmBuilder builder(codegen->context());
   llvm::Value* llvm_data1 = codegen->GetStringConstant(&builder, data1, strlen(data1));
@@ -520,12 +511,11 @@ TEST_F(LlvmCodeGenTest, HandleLinkageError) {
   string ir_file_path("llvm-ir/test-loop.bc");
   string module_file;
   PathBuilder::GetFullPath(ir_file_path, &module_file);
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::unique_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(CreateFromFile(module_file.c_str(), &codegen));
   EXPECT_TRUE(codegen.get() != nullptr);
   Status status = LinkModuleFromLocalFs(codegen.get(), module_file);
   EXPECT_STR_CONTAINS(status.GetDetail(), "symbol multiply defined");
-  codegen->Close();
 }
 
 // Test that the default whitelisting disables the expected attributes.
@@ -550,10 +540,9 @@ TEST_F(LlvmCodeGenTest, CpuAttrWhitelist) {
 // Test that exercises the code path that deletes non-finalized methods before it
 // finalizes the llvm module.
 TEST_F(LlvmCodeGenTest, CleanupNonFinalizedMethodsTest) {
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(fragment_state_, nullptr, "test", &codegen));
   ASSERT_TRUE(codegen.get() != nullptr);
-  const auto close_codegen = MakeScopeExitTrigger([&codegen]() { codegen->Close(); });
   LlvmBuilder builder(codegen->context());
   LlvmCodeGen::FnPrototype incomplete_prototype(
       codegen.get(), "IncompleteFn", codegen->void_type());
@@ -573,8 +562,8 @@ TEST_F(LlvmCodeGenTest, CleanupNonFinalizedMethodsTest) {
 class LlvmOptTest :
     public testing::TestWithParam<std::tuple<TCodeGenOptLevel::type, bool>> {
  protected:
-  scoped_ptr<MetricGroup> metrics_;
-  scoped_ptr<TestEnv> test_env_;
+  std::unique_ptr<MetricGroup> metrics_;
+  std::unique_ptr<TestEnv> test_env_;
   FragmentState* fragment_state_;
   TQueryOptions query_opts_;
 
@@ -609,7 +598,7 @@ class LlvmOptTest :
   }
 
   // Wrapper to call private test-only methods on LlvmCodeGen object
-  Status CreateFromFile(const string& filename, scoped_ptr<LlvmCodeGen>* codegen) {
+  Status CreateFromFile(const string& filename, std::unique_ptr<LlvmCodeGen>* codegen) {
     RETURN_IF_ERROR(LlvmCodeGen::CreateFromFile(fragment_state_,
         fragment_state_->obj_pool(), nullptr, filename, "test", codegen));
     return (*codegen)->MaterializeModule();
@@ -638,7 +627,7 @@ class LlvmOptTest :
     }
   }
 
-  void LoadTestOpt(scoped_ptr<LlvmCodeGen>& codegen) {
+  void LoadTestOpt(std::unique_ptr<LlvmCodeGen>& codegen) {
     const string func("_Z9loop_nullPii");
     typedef void (*LoopFn)(int*, int);
 
@@ -661,10 +650,9 @@ class LlvmOptTest :
 };
 
 TEST_P(LlvmOptTest, OptFunction) {
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::unique_ptr<LlvmCodeGen> codegen;
   LoadTestOpt(codegen);
   VerifyCounters(codegen.get(), std::get<1>(GetParam()));
-  codegen->Close();
 }
 
 TEST_P(LlvmOptTest, CachedOptFunction) {
@@ -672,10 +660,9 @@ TEST_P(LlvmOptTest, CachedOptFunction) {
   bool expect_unoptimized = std::get<1>(GetParam());
   EnableCodegenCache();
 
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::unique_ptr<LlvmCodeGen> codegen;
   LoadTestOpt(codegen);
   VerifyCounters(codegen.get(), expect_unoptimized);
-  codegen->Close();
 
   int64_t query_id = 0;
   constexpr std::array<TCodeGenOptLevel::type, 5> opt_levels{{TCodeGenOptLevel::O0,
@@ -688,7 +675,7 @@ TEST_P(LlvmOptTest, CachedOptFunction) {
     // Higher levels are by definition O1+, which expects optimized size.
     // Lower or equal levels should use the cached value from before the loop.
     VerifyCounters(codegen.get(), level > opt_level ? false : expect_unoptimized);
-    codegen->Close();
+    codegen.reset();
   }
 
   // Check for cache hits/misses. Levels greater than opt_level will be a hit, others

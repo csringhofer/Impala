@@ -921,6 +921,10 @@ enum TImpalaQueryOptions {
   // potentially insert tuple cache nodes into the plan. This can only be set if the
   // allow_tuple_caching feature startup flag is set to true.
   ENABLE_TUPLE_CACHE = 174
+
+  // Threshold for fetch lock wait time as percent of row materialization time
+  // before switching to delayed result materialization
+  DELAY_MATERIALIZE_RESULTS_THRESHOLD = 175
 }
 
 // The summary of a DML statement.

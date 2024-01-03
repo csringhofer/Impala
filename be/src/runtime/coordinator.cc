@@ -1046,6 +1046,11 @@ Status Coordinator::GetNext(QueryResultSet* results, int max_rows, bool* eos,
         parent_request_state_->fetch_rows_timeout_us();
   }
 
+  // Add a shared_ptr reference in the results object to codegen structures since delayed
+  // result materialization can call codegen functions after fragment shutdown
+  if (parent_request_state_->UseDelayedMaterialization()) {
+    results->SetCodegenPtr(coord_instance_->GetCodegenPtr());
+  }
   Status status = coord_sink_->GetNext(runtime_state, results, max_rows, eos, timeout_us);
   if (!first_row_fetched_ && results->size() > 0) {
     query_events_->MarkEvent("First row fetched");

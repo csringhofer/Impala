@@ -292,9 +292,9 @@ class RowBatch {
     memcpy(dest, src, num_tuples_per_row_ * sizeof(Tuple*));
   }
 
-  /// Copy 'num_rows' rows from 'src' to 'dest' within the batch. Useful for exec
+  /// Move 'num_rows' rows from 'src' to 'dest' within the batch. Useful for exec
   /// nodes that skip an offset and copied more than necessary.
-  void CopyRows(int64_t dest, int64_t src, int64_t num_rows) {
+  void MoveRows(int64_t dest, int64_t src, int64_t num_rows) {
     DCHECK_LE(dest, src);
     DCHECK_LE(src + num_rows, capacity_);
     memmove(tuple_ptrs_ + num_tuples_per_row_ * dest,
@@ -323,6 +323,13 @@ class RowBatch {
   /// TODO: the current implementation of deep copy can produce an oversized
   /// row batch if there are duplicate tuples in this row batch.
   void DeepCopyTo(RowBatch* dst);
+
+  /// Deep copy num_rows from this row batch into dst stating at start_idx, using memory
+  /// allocated from dst's tuple_data_pool_.
+  /// This variant supports copy of a subset of the rows and non-empty dst row batch
+  /// TODO: the current implementation of DeepCopyRows can produce an oversized
+  /// row batch if there are duplicate tuples in this row batch.
+  void DeepCopyRows(RowBatch* dst, int start_idx, int num_rows);
 
   /// Create a serialized version of this row batch in output_batch, attaching all of the
   /// data it references to output_batch.tuple_data. This function attempts to detect

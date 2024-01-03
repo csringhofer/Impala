@@ -113,6 +113,12 @@ void BlockingPlanRootSink::Cancel(RuntimeState* state) {
 
 Status BlockingPlanRootSink::GetNext(RuntimeState* state, QueryResultSet* results,
     int num_results, bool* eos, int64_t timeout_us) {
+  if (results->DelayedMaterializationEnabled()) {
+    // Initialize results for delayed materialization if the enable
+    // threshold is passed. This is a no-op on subsequent fetches.
+    RETURN_IF_ERROR(results->InitDelayedMaterialization(*row_desc_,
+          num_results, output_expr_evals_, state));
+  }
   // Used to track how long the consumer waits for RowBatches to be produced and
   // materialized.
   DCHECK_GE(timeout_us, 0);

@@ -196,6 +196,7 @@ Status ImpalaServer::FetchInternal(TUniqueId query_id, SessionState* session,
   QueryHandle query_handle;
   RETURN_IF_ERROR(
       WaitForResults(query_id, &query_handle, &block_on_wait_time_us, &timed_out));
+  HighWaterMarkScopedAdder stream_count_adder(query_handle->GetFetchStreamsCounter());
   if (timed_out) {
     fetch_results->status.__set_statusCode(thrift::TStatusCode::STILL_EXECUTING_STATUS);
     fetch_results->__set_hasMoreRows(true);
@@ -203,40 +204,61 @@ Status ImpalaServer::FetchInternal(TUniqueId query_id, SessionState* session,
     return Status::OK();
   }
 
-  lock_guard<mutex> frl(*query_handle->fetch_rows_lock());
-  lock_guard<mutex> l(*query_handle->lock());
+  scoped_ptr<QueryResultSet> result_set;
 
-  // Check for cancellation or an error.
-  RETURN_IF_ERROR(query_handle->query_status());
+  // Release locks before returning to allow result materializaton to be
+  // completed in parallel
+  {
+    MonotonicStopWatch fetch_lock_timer;
+    fetch_lock_timer.Start();
 
-  if (query_handle->num_rows_fetched() == 0) {
-    query_handle->set_fetched_rows();
+    lock_guard<mutex> frl(*query_handle->fetch_rows_lock());
+
+    fetch_lock_timer.Stop();
+    query_handle->AddFetchLockWaitTime(fetch_lock_timer.ElapsedTime());
+
+    lock_guard<mutex> l(*query_handle->lock());
+
+    // Check for cancellation or an error.
+    RETURN_IF_ERROR(query_handle->query_status());
+
+    if (query_handle->num_rows_fetched() == 0) {
+      query_handle->set_fetched_rows();
+    }
+
+    if (fetch_first) RETURN_IF_ERROR(query_handle->RestartFetch());
+
+    fetch_results->results.__set_startRowOffset(query_handle->num_rows_fetched());
+
+    // Child queries should always return their results in row-major format, rather than
+    // inheriting the parent session's setting.
+    bool is_child_query = query_handle->parent_query_id() != TUniqueId();
+    TProtocolVersion::type version = is_child_query ?
+        TProtocolVersion::HIVE_CLI_SERVICE_PROTOCOL_V1 : session->hs2_version;
+
+    // In the first fetch, expect 0 results to avoid reserving unnecessarily large result
+    // vectors for small queries. If there are more fetches (so there are more rows than
+    // num_rows_fetched), then expect subsequent fetches to be fully filled.
+    int expected_result_count = query_handle->num_rows_fetched() == 0 ? 0
+        : fetch_size;
+
+    result_set.reset(QueryResultSet::CreateHS2ResultSet(
+        version, *(query_handle->result_metadata()), &(fetch_results->results),
+        query_handle->query_options().stringify_map_keys, expected_result_count,
+        query_handle->UseDelayedMaterialization()));
+    RETURN_IF_ERROR(
+        query_handle->FetchRows(fetch_size, result_set.get(), block_on_wait_time_us));
+    fetch_results->__set_hasMoreRows(!query_handle->eos());
   }
-
-  if (fetch_first) RETURN_IF_ERROR(query_handle->RestartFetch());
-
-  fetch_results->results.__set_startRowOffset(query_handle->num_rows_fetched());
-
-  // Child queries should always return their results in row-major format, rather than
-  // inheriting the parent session's setting.
-  bool is_child_query = query_handle->parent_query_id() != TUniqueId();
-  TProtocolVersion::type version = is_child_query ?
-      TProtocolVersion::HIVE_CLI_SERVICE_PROTOCOL_V1 : session->hs2_version;
-
-  // In the first fetch, expect 0 results to avoid reserving unnecessarily large result
-  // vectors for small queries. If there are more fetches (so there are more rows than
-  // num_rows_fetched), then expect subsequent fetches to be fully filled.
-  int expected_result_count = query_handle->num_rows_fetched() == 0 ? 0
-      : fetch_size;
-
-  scoped_ptr<QueryResultSet> result_set(QueryResultSet::CreateHS2ResultSet(
-      version, *(query_handle->result_metadata()), &(fetch_results->results),
-      query_handle->query_options().stringify_map_keys, expected_result_count));
-  RETURN_IF_ERROR(
-      query_handle->FetchRows(fetch_size, result_set.get(), block_on_wait_time_us));
+  if (result_set->DelayedMaterializationEnabled()) {
+    MonotonicStopWatch result_flush_timer;
+    result_flush_timer.Start();
+    result_set->Flush();
+    result_flush_timer.Stop();
+    query_handle->AddResultFlushTime(result_flush_timer.ElapsedTime());
+  }
   *num_results = result_set->size();
   fetch_results->__isset.results = true;
-  fetch_results->__set_hasMoreRows(!query_handle->eos());
   return Status::OK();
 }
 
@@ -585,7 +607,7 @@ Status ImpalaServer::SetupResultsCacheing(const QueryHandle& query_handle,
     const TResultSetMetadata* result_set_md = query_handle->result_metadata();
     QueryResultSet* result_set =
         QueryResultSet::CreateHS2ResultSet(session->hs2_version, *result_set_md, nullptr,
-            query_handle->query_options().stringify_map_keys, 0);
+            query_handle->query_options().stringify_map_keys, 0, false);
     RETURN_IF_ERROR(query_handle->SetResultCache(result_set, cache_num_rows));
   }
   return Status::OK();

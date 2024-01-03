@@ -658,4 +658,9 @@ void FragmentInstanceState::PrintVolumeIds() {
       << "Hdfs split stats (<volume id>:<# splits>/<split lengths>) for query="
       << PrintId(query_id()) << ":\n" << str.str();
 }
+
+const std::shared_ptr<LlvmCodeGen>& FragmentInstanceState::GetCodegenPtr() const {
+  return fragment_state_->GetCodegenPtr();
+}
+
 }

@@ -492,6 +492,21 @@ class ClientRequestState {
   void UnRegisterRemainingRPCs();
   // Copy pending RPCs for a retried query
   void CopyRPCs(ClientRequestState& from_request);
+
+  // Enable delayed result materialization for subsequent result batches
+  bool UseDelayedMaterialization();
+
+  // Return fetch stream counter so that is can be updated externally using
+  // scoped references
+  RuntimeProfile::HighWaterMarkCounter* GetFetchStreamsCounter() const {
+    return num_fetch_streams_counter_;
+  }
+  // Adds time to fetch_lock_wait_timer_
+  void AddFetchLockWaitTime(int64_t fetch_lock_wait_n);
+
+  // Adds time to result_flush_timer
+  void AddResultFlushTime(int64_t result_flush_ns);
+
  protected:
   /// Updates the end_time_us_ of this query if it isn't set. The end time is determined
   /// when this function is called for the first time, calling it multiple times does not
@@ -651,6 +666,12 @@ class ClientRequestState {
   MonotonicStopWatch client_wait_sw_;
   int64_t last_client_wait_time_ = 0;
 
+  /// Tracks number of streams that fetched from the query
+  RuntimeProfile::HighWaterMarkCounter* num_fetch_streams_counter_ = nullptr;
+  /// Tracks how long clients wait to acquire the fetch lock
+  RuntimeProfile::Counter* fetch_lock_wait_timer_;
+  /// Tracks time spent in delayed result materialization
+  RuntimeProfile::Counter* result_flush_timer_;
   // Tracks time spent by client calls reading RPC arguments
   RuntimeProfile::Counter* rpc_read_timer_;
   // Tracks time spent by client calls writing RPC results
@@ -755,6 +776,9 @@ class ClientRequestState {
   /// Manages interactions with the AdmissionController, which may be either local or
   /// remote.
   std::unique_ptr<AdmissionControlClient> admission_control_client_;
+
+  /// if true, materialize rows ouside of fetch lock
+  bool delay_materialization_ = false;
 
   /// Executes a local catalog operation (an operation that does not need to execute
   /// against the catalog service). Includes USE, SHOW, DESCRIBE, and EXPLAIN statements.

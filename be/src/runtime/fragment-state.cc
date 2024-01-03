@@ -191,8 +191,12 @@ FragmentState::FragmentState(QueryState* query_state, const TPlanFragment& fragm
 
 FragmentState::~FragmentState() {}
 
+const std::shared_ptr<LlvmCodeGen>& FragmentState::GetCodegenPtr() const {
+  return codegen_;
+}
+
 void FragmentState::ReleaseResources() {
-  if (codegen_ != nullptr) codegen_->Close();
+  if (codegen_ != nullptr) codegen_.reset();
   if (plan_tree_ != nullptr) plan_tree_->Close();
   if (sink_config_ != nullptr) sink_config_->Close();
 }

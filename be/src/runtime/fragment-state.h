@@ -54,6 +54,9 @@ class FragmentState {
   /// returns that status on every subsequent call. Is thread-safe.
   Status InvokeCodegen(RuntimeProfile::EventSequence* event_sequence);
 
+  /// Get shared pointer to the codegen object to faciliate late destruction
+  const std::shared_ptr<LlvmCodeGen>& GetCodegenPtr() const;
+
   /// Release resources held by codegen, the plan tree and data sink config.
   void ReleaseResources();
 
@@ -198,7 +201,7 @@ class FragmentState {
   PlanNode* plan_tree_ = nullptr;
   DataSinkConfig* sink_config_ = nullptr;
 
-  boost::scoped_ptr<LlvmCodeGen> codegen_;
+  std::shared_ptr<LlvmCodeGen> codegen_;
 
   /// Stores the result of calling InitAndCodegen() to check for any errors encountered
   /// during that call.

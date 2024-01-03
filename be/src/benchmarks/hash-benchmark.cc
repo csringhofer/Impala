@@ -507,7 +507,7 @@ int main(int argc, char **argv) {
   DataProvider int_provider(&mem_pool, int_profile);
   DataProvider mixed_provider(&mem_pool, mixed_profile);
 
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   status = LlvmCodeGen::CreateImpalaCodegen(fragment_state, NULL, "test", &codegen);
   if (!status.ok()) {
     cout << "Could not start codegen.";
@@ -585,7 +585,7 @@ int main(int argc, char **argv) {
   mixed_suite.AddBenchmark("Codegen", TestCodegenMixedHash, &mixed_data);
   cout << mixed_suite.Measure();
 
-  codegen->Close();
+  codegen.reset();
   mem_pool.FreeAll();
   return 0;
 }

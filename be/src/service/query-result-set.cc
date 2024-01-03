@@ -53,6 +53,83 @@ constexpr int ASCII_PRECISION = 16;
 
 namespace impala {
 
+/// Class for tracking resources used for delayed result materialization
+class RowBatchContext {
+ public:
+  RowBatchContext(RuntimeState* state, const int fetch_size,
+      const RowDescriptor& row_desc) :
+    state_(state),
+    mem_tracker_(new MemTracker((impala::IntGauge*)nullptr, -1,
+        "Result row batch", state_->query_mem_tracker())),
+    expr_mem_tracker_(new MemTracker((impala::IntGauge*)nullptr, -1,
+        "Result expr", mem_tracker_.get())),
+    expr_perm_pool_(new MemPool(expr_mem_tracker_.get())),
+    expr_results_pool_(new MemPool(expr_mem_tracker_.get())),
+    row_desc_(new RowDescriptor(row_desc)),
+    pendingRowBatch_(new RowBatch(row_desc_.get(), fetch_size, mem_tracker_.get())),
+    expr_evals_() {
+  }
+
+  ~RowBatchContext() {
+    pendingRowBatch_.reset();
+    ScalarExprEvaluator::Close(expr_evals_, state_);
+    if (expr_perm_pool_) expr_perm_pool_->FreeAll();
+    if (expr_results_pool_) expr_results_pool_->FreeAll();
+    if (expr_mem_tracker_) expr_mem_tracker_->Close();
+    if (mem_tracker_) mem_tracker_->Close();
+  }
+
+  /// Clone expr_evals so they can be used outside of fetch for delayed materialization
+  Status InitExprEvals(const std::vector<ScalarExprEvaluator*>& expr_evals) {
+    RETURN_IF_ERROR(ScalarExprEvaluator::Clone(state_->obj_pool(), state_,
+          expr_perm_pool_.get(), expr_results_pool_.get(),
+          expr_evals, &expr_evals_));
+    return Status::OK();
+  }
+
+  /// Copy all columns starting at 'start_idx' and ending at 'num_rows'
+  /// from 'batch' into pendingRowBatch_
+  Status CopyRows(RowBatch* batch, int start_idx, int num_rows) {
+    batch->DeepCopyRows(GetRowBatch(), start_idx, num_rows);
+    return Status::OK();
+  }
+
+  RowBatch* GetRowBatch() const { return pendingRowBatch_.get(); }
+
+  /// Return the number of buffered rows
+  size_t size() const {
+    return pendingRowBatch_ ? pendingRowBatch_.get()->num_rows() : 0;
+  }
+
+  std::vector<ScalarExprEvaluator*>& GetExprEvals() { return expr_evals_; }
+
+ private:
+
+  /// Handle to shared runtime state. This is reentrant
+  RuntimeState* const state_;
+
+  /// Mem tracker used for pendingRowBatch_
+  boost::scoped_ptr<MemTracker> mem_tracker_;
+
+  /// Child mem tracker used by expr_perm_pool_ and expr_evals_
+  boost::scoped_ptr<MemTracker> expr_mem_tracker_;
+
+  /// Expr mem pool used by expr_evals_
+  boost::scoped_ptr<MemPool> expr_perm_pool_;
+
+  /// Expr results pool used by expr_evals_
+  boost::scoped_ptr<MemPool> expr_results_pool_;
+
+  /// RowDescriptor referenced by pendingRowBatch_
+  boost::scoped_ptr<RowDescriptor> row_desc_;
+
+  /// RowBatch for storing buffered rows
+  std::unique_ptr<RowBatch> pendingRowBatch_;
+
+  /// Cloned expr evals used for delayed materialization
+  std::vector<ScalarExprEvaluator*> expr_evals_;
+};
+
 /// Ascii result set for Beeswax. Rows are returned in ascii text encoding, using "\t" as
 /// column delimiter.
 class AsciiQueryResultSet : public QueryResultSet {
@@ -102,12 +179,12 @@ class AsciiQueryResultSet : public QueryResultSet {
 class HS2ColumnarResultSet : public QueryResultSet {
  public:
   HS2ColumnarResultSet(const TResultSetMetadata& metadata, TRowSet* rowset,
-      bool stringify_map_keys, int expected_result_count);
+      bool stringify_map_keys, int expected_result_count, bool delay_materialization);
 
   virtual ~HS2ColumnarResultSet() {}
 
-  /// Evaluate 'expr_evals' over rows in 'batch' and convert to the HS2 columnar
-  /// representation.
+  /// Add all rows from batch to the result, either materializing immediately or
+  /// buffering into row_batch_context_
   virtual Status AddRows(const vector<ScalarExprEvaluator*>& expr_evals, RowBatch* batch,
       int start_idx, int num_rows) override;
 
@@ -119,7 +196,25 @@ class HS2ColumnarResultSet : public QueryResultSet {
   virtual int AddRows(const QueryResultSet* other, int start_idx, int num_rows) override;
 
   virtual int64_t ByteSize(int start_idx, int num_rows) override;
-  virtual size_t size() override { return num_rows_; }
+  virtual size_t size() override {
+    return row_batch_context_ ? row_batch_context_->size() : num_rows_;
+  }
+  virtual Status InitDelayedMaterialization(const RowDescriptor& row_desc,
+      const int fetch_size, const std::vector<ScalarExprEvaluator*>& expr_evals,
+      RuntimeState* state) override;
+  virtual bool DelayedMaterializationEnabled() const override {
+    return delay_materialization_;
+  }
+
+  /// Materialize buffered rows into HS2 columnar format
+  virtual void Flush() override {
+    if (row_batch_context_) {
+      DCHECK_EQ(0, num_rows_);
+      RowBatch* row_batch = row_batch_context_->GetRowBatch();
+      AddRowsInternal(row_batch_context_->GetExprEvals(), row_batch, 0,
+          row_batch->num_rows());
+    }
+  }
 
  private:
   /// Metadata of the result set
@@ -142,7 +237,16 @@ class HS2ColumnarResultSet : public QueryResultSet {
   // fetch request. Used to reserve results vector memory.
   const int expected_result_count_;
 
+  boost::scoped_ptr<RowBatchContext> row_batch_context_;
+
+  bool delay_materialization_;
+
   void InitColumns();
+
+  /// Evaluate 'expr_evals' over rows in 'batch' and convert to the HS2 columnar
+  /// representation.
+  void AddRowsInternal(const vector<ScalarExprEvaluator*>& expr_evals, RowBatch* batch,
+      int start_idx, int num_rows);
 };
 
 /// Row oriented result set for HiveServer2, used to serve HS2 requests with protocol
@@ -186,12 +290,13 @@ QueryResultSet* QueryResultSet::CreateAsciiQueryResultSet(
 
 QueryResultSet* QueryResultSet::CreateHS2ResultSet(
     TProtocolVersion::type version, const TResultSetMetadata& metadata, TRowSet* rowset,
-    bool stringify_map_keys, int expected_result_count) {
+    bool stringify_map_keys, int expected_result_count,
+    bool delay_materialization) {
   if (version < TProtocolVersion::HIVE_CLI_SERVICE_PROTOCOL_V6) {
     return new HS2RowOrientedResultSet(metadata, rowset);
   } else {
-    return new HS2ColumnarResultSet(
-        metadata, rowset, stringify_map_keys, expected_result_count);
+    return new HS2ColumnarResultSet(metadata, rowset, stringify_map_keys,
+        expected_result_count, delay_materialization);
   }
 }
 
@@ -352,10 +457,11 @@ uint32_t TColumnByteSize(const ThriftTColumn& col, uint32_t start_idx, uint32_t 
 // column-orientation.
 HS2ColumnarResultSet::HS2ColumnarResultSet(
     const TResultSetMetadata& metadata, TRowSet* rowset, bool stringify_map_keys,
-    int expected_result_count)
+    int expected_result_count, bool delay_materialization)
   : metadata_(metadata), result_set_(rowset), num_rows_(0),
     stringify_map_keys_(stringify_map_keys),
-    expected_result_count_(expected_result_count) {
+    expected_result_count_(expected_result_count),
+    delay_materialization_(delay_materialization) {
   if (rowset == NULL) {
     owned_result_set_.reset(new TRowSet());
     result_set_ = owned_result_set_.get();
@@ -363,8 +469,30 @@ HS2ColumnarResultSet::HS2ColumnarResultSet(
   InitColumns();
 }
 
+Status HS2ColumnarResultSet::InitDelayedMaterialization(const RowDescriptor& row_desc,
+    const int fetch_size, const std::vector<ScalarExprEvaluator*>& expr_evals,
+    RuntimeState* state) {
+  if (!row_batch_context_) {
+    DCHECK(delay_materialization_);
+    row_batch_context_.reset(new RowBatchContext(state, fetch_size, row_desc));
+    return row_batch_context_->InitExprEvals(expr_evals);
+  }
+  return Status::OK();
+}
+
 Status HS2ColumnarResultSet::AddRows(const vector<ScalarExprEvaluator*>& expr_evals,
     RowBatch* batch, int start_idx, int num_rows) {
+  // Copy rows to local batch if deferring materialization
+  if (row_batch_context_) {
+    return row_batch_context_->CopyRows(batch, start_idx, num_rows);
+  }
+  AddRowsInternal(expr_evals, batch, start_idx, num_rows);
+  return Status::OK();
+}
+
+void HS2ColumnarResultSet::AddRowsInternal(
+    const vector<ScalarExprEvaluator*>& expr_evals, RowBatch* batch,
+    int start_idx, int num_rows) {
   DCHECK_GE(batch->num_rows(), start_idx + num_rows);
   int expected_result_count =
       std::max((int64_t) expected_result_count_, num_rows + num_rows_);
@@ -377,7 +505,6 @@ Status HS2ColumnarResultSet::AddRows(const vector<ScalarExprEvaluator*>& expr_ev
         expected_result_count, stringify_map_keys_, &(result_set_->columns[i]));
   }
   num_rows_ += num_rows;
-  return Status::OK();
 }
 
 // Add a row from a TResultRow
@@ -397,6 +524,7 @@ Status HS2ColumnarResultSet::AddOneRow(const TResultRow& row) {
 int HS2ColumnarResultSet::AddRows(
     const QueryResultSet* other, int start_idx, int num_rows) {
   const HS2ColumnarResultSet* o = static_cast<const HS2ColumnarResultSet*>(other);
+  DCHECK(!o->row_batch_context_);
   DCHECK_EQ(metadata_.columns.size(), o->metadata_.columns.size());
   if (start_idx >= o->num_rows_) return 0;
   const int rows_added = min<int64_t>(num_rows, o->num_rows_ - start_idx);

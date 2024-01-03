@@ -375,6 +375,20 @@ class RuntimeProfile::HighWaterMarkCounter : public RuntimeProfileBase::Counter 
   AtomicInt64 current_value_;
 };
 
+/// Class for maintaining scoped reference counts with HighWaterMarkCounter
+class HighWaterMarkScopedAdder {
+ public:
+  HighWaterMarkScopedAdder(RuntimeProfile::HighWaterMarkCounter* counter)
+    : counter_(counter) {
+    counter_->Add(1L);
+  }
+  ~HighWaterMarkScopedAdder() {
+    counter_->Add(-1L);
+  }
+ private:
+  RuntimeProfile::HighWaterMarkCounter* counter_;
+};
+
 /// A DerivedCounter also has a name and unit, but the value is computed.
 /// Do not call Set() and Add().
 class RuntimeProfile::DerivedCounter : public RuntimeProfileBase::Counter {

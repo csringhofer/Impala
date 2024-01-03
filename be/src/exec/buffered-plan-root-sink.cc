@@ -182,6 +182,12 @@ Status BufferedPlanRootSink::GetNext(RuntimeState* state, QueryResultSet* result
     const int num_rows_to_read =
         num_results <= 0 ? FETCH_NUM_BATCHES * state->batch_size() : num_results;
 
+    if (results->DelayedMaterializationEnabled()) {
+      // Initialize results for delayed materialization if the enable
+      // threshold is passed. This is a no-op on subsequent fetches.
+      RETURN_IF_ERROR(results->InitDelayedMaterialization(*row_desc_,
+            num_rows_to_read, output_expr_evals_, state));
+    }
     // True if the consumer timed out waiting for the producer to send rows or if the
     // consumer timed out while materializing rows, false otherwise.
     bool timed_out = false;

@@ -26,7 +26,6 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
-#include <boost/scoped_ptr.hpp>
 
 #include <boost/unordered_set.hpp>
 
@@ -175,13 +174,11 @@ class LlvmCodeGen {
   /// 'parent_mem_tracker' - if non-NULL, the CodeGen MemTracker is created under this.
   /// 'id' is used for outputting the IR module for debugging.
   static Status CreateImpalaCodegen(FragmentState* state, MemTracker* parent_mem_tracker,
-      const std::string& id, boost::scoped_ptr<LlvmCodeGen>* codegen);
+      const std::string& id, std::shared_ptr<LlvmCodeGen>* codegen);
 
+  /// Releases all resources associated with the codegen object.
   ~LlvmCodeGen();
 
-  /// Releases all resources associated with the codegen object. It is invalid to call
-  /// any other API methods after calling close.
-  void Close();
 
   RuntimeProfile* runtime_profile() { return profile_; }
   RuntimeProfile::Counter* ir_generation_timer() { return ir_generation_timer_; }
@@ -667,7 +664,7 @@ class LlvmCodeGen {
   /// materialize the function and its callees recursively.
   static Status CreateFromFile(FragmentState* state, ObjectPool* pool,
       MemTracker* parent_mem_tracker, const std::string& file,
-      const std::string& id, boost::scoped_ptr<LlvmCodeGen>* codegen);
+      const std::string& id, std::unique_ptr<LlvmCodeGen>* codegen);
 
   /// Creates a LlvmCodeGen instance initialized with the module bitcode in memory.
   /// 'codegen' will contain the created object on success. The functions in the module
@@ -675,7 +672,7 @@ class LlvmCodeGen {
   /// materialize the function and its callees recursively.
   static Status CreateFromMemory(FragmentState* state, ObjectPool* pool,
       MemTracker* parent_mem_tracker, const std::string& id,
-      boost::scoped_ptr<LlvmCodeGen>* codegen);
+      std::shared_ptr<LlvmCodeGen>* codegen);
 
   /// Loads an LLVM module from 'file' which is the local path to the LLVM bitcode file.
   /// The functions in the module are materialized lazily. Getting a reference to the

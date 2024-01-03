@@ -153,7 +153,7 @@ void LlvmCodeGenCacheTest::CheckResult(
     CodeGenCacheEntry& entry, const string& module_id, bool is_double) {
   ASSERT_TRUE(!entry.Empty());
   ASSERT_TRUE(entry.cached_engine_pointer != nullptr);
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(
       LlvmCodeGen::CreateImpalaCodegen(fragment_state_, nullptr, "test1", &codegen));
   if (is_double) {
@@ -169,14 +169,14 @@ void LlvmCodeGenCacheTest::CheckResult(
   codegen->execution_engine()->finalizeObject();
   codegen->DestroyModule();
   CheckResult(codegen.get(), is_double);
-  codegen->Close();
+  codegen.reset();
 }
 
 // The function is to create and return a CodeGenObjectCache which contains a specific
 // compiled codegened function.
 shared_ptr<CodeGenObjectCache> LlvmCodeGenCacheTest::CreateObjCache(
     bool is_double, string* module_id) {
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   shared_ptr<CodeGenObjectCache> engine_cache = make_shared<CodeGenObjectCache>();
   EXPECT_TRUE(
       LlvmCodeGen::CreateImpalaCodegen(fragment_state_, nullptr, "test", &codegen).ok());
@@ -198,7 +198,7 @@ shared_ptr<CodeGenObjectCache> LlvmCodeGenCacheTest::CreateObjCache(
   CheckObjCacheExists(codegen.get());
   codegen->DestroyModule();
   CheckResult(codegen.get(), is_double);
-  codegen->Close();
+  codegen.reset();
   if (module_id != nullptr) *module_id = m_id;
   return engine_cache;
 }
@@ -264,13 +264,13 @@ void LlvmCodeGenCacheTest::TestBasicFunction(TCodeGenCacheMode::type mode) {
   bool is_normal_mode = !CodeGenCacheModeAnalyzer::is_optimal(mode);
 
   // Create a LlvmCodeGen containing a codegen function Echo.
-  scoped_ptr<LlvmCodeGen> codegen_echo;
+  std::shared_ptr<LlvmCodeGen> codegen_echo;
   ASSERT_OK(
       LlvmCodeGen::CreateImpalaCodegen(fragment_state_, nullptr, "test", &codegen_echo));
   string module_id_echo;
   codegen_echo->engine_cache_ = CreateObjCache(false /*is_double*/, &module_id_echo);
   // Create a LlvmCodeGen containing a codegen function Double.
-  scoped_ptr<LlvmCodeGen> codegen_double;
+  std::shared_ptr<LlvmCodeGen> codegen_double;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(
       fragment_state_, nullptr, "test_double", &codegen_double));
   string module_id_double;
@@ -297,7 +297,7 @@ void LlvmCodeGenCacheTest::TestBasicFunction(TCodeGenCacheMode::type mode) {
       codegen_cache_.get(), 1 /*num_entry_in_use*/, mem_charge_echo /*bytes_in_use*/);
   EXPECT_OK(codegen_cache_->Lookup(cache_key, mode, &entry, &codegen_obj_cache_));
   CheckResult(entry, module_id_echo);
-  codegen_echo->Close();
+  codegen_echo.reset();
   // Close the LlvmCodeGen, but should not affect the stored cache.
   EXPECT_OK(codegen_cache_->Lookup(cache_key, mode, &entry, &codegen_obj_cache_));
   CheckResult(entry, module_id_echo);
@@ -309,7 +309,7 @@ void LlvmCodeGenCacheTest::TestBasicFunction(TCodeGenCacheMode::type mode) {
   EXPECT_OK(codegen_cache_->Lookup(cache_key, mode, &entry, &codegen_obj_cache_));
   CheckResult(entry, module_id_double, true /*is_double*/);
   EXPECT_EQ(codegen_cache_->codegen_cache_entries_evicted_->GetValue(), 1);
-  codegen_double->Close();
+  codegen_double.reset();
   codegen_cache_.reset();
 }
 
@@ -357,7 +357,7 @@ void LlvmCodeGenCacheTest::TestAtCapacity(TCodeGenCacheMode::type mode) {
   bool is_normal_mode = !CodeGenCacheModeAnalyzer::is_optimal(mode);
 
   // Create two LlvmCodeGen objects containing a different codegen function separately.
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
 
   test_env_->ResetCodegenCache(metrics_.get());
   CodeGenCache* cache = test_env_->codegen_cache();
@@ -366,7 +366,7 @@ void LlvmCodeGenCacheTest::TestAtCapacity(TCodeGenCacheMode::type mode) {
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(fragment_state_, nullptr, "test", &codegen));
   AddLlvmCodegenEcho(codegen.get());
   codegen->GenerateFunctionNamesHashCode();
-  scoped_ptr<LlvmCodeGen> codegen_double;
+  std::shared_ptr<LlvmCodeGen> codegen_double;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(
       fragment_state_, nullptr, "test_double", &codegen_double));
   AddLlvmCodegenDouble(codegen_double.get());
@@ -424,8 +424,8 @@ void LlvmCodeGenCacheTest::TestAtCapacity(TCodeGenCacheMode::type mode) {
   CheckResult(codegen.get());
   CheckMetrics(cache, 3 /*hit*/, 2 /*miss*/, 2 /*evict*/);
 
-  codegen->Close();
-  codegen_double->Close();
+  codegen.reset();
+  codegen_double.reset();
   test_env_->ResetCodegenCache();
 }
 
@@ -433,11 +433,11 @@ void LlvmCodeGenCacheTest::TestAtCapacity(TCodeGenCacheMode::type mode) {
 /// we want, should switch to the cache missing path.
 void LlvmCodeGenCacheTest::TestSkipCache() {
   // Initial a LlvmCodeGen object with a normal function.
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(fragment_state_, nullptr, "test", &codegen));
   AddLlvmCodegenEcho(codegen.get());
   // Create an empty function from other LlvmCodeGen to create the failure later.
-  scoped_ptr<LlvmCodeGen> codegen_empty;
+  std::shared_ptr<LlvmCodeGen> codegen_empty;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(
       fragment_state_, nullptr, "test_empty", &codegen_empty));
   llvm::Function* empty_func;
@@ -464,8 +464,8 @@ void LlvmCodeGenCacheTest::TestSkipCache() {
   // Expect a look up failure.
   EXPECT_FALSE(codegen->LookupCache(cache_key));
   CheckMetrics(test_env_->codegen_cache(), 1 /*hit*/, 1 /*miss*/, 0 /*evict*/);
-  codegen->Close();
-  codegen_empty->Close();
+  codegen.reset();
+  codegen_empty.reset();
 }
 
 // Test the basic function of using the codegen cache.
@@ -549,7 +549,7 @@ void LlvmCodeGenCacheTest::TestSwitchModeHelper(TCodeGenCacheMode::type mode, st
     int expect_entry_num = -1, int expect_engine_num = -1,
     CodeGenObjectCache** engine_cache = nullptr) {
   // Create a LlvmCodeGen containing a codegen function Echo.
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(fragment_state_, nullptr, "test", &codegen));
   string module_id_echo;
   codegen->engine_cache_ = CreateObjCache(false /*is_double*/, &module_id_echo);
@@ -571,7 +571,7 @@ void LlvmCodeGenCacheTest::TestSwitchModeHelper(TCodeGenCacheMode::type mode, st
   EXPECT_OK(codegen_cache_->Lookup(cache_key, mode, &entry, &codegen_obj_cache_));
   CheckResult(entry, module_id_echo);
   if (engine_cache) *engine_cache = codegen->engine_cache();
-  codegen->Close();
+  codegen.reset();
 }
 
 // Test to switch among different modes.
@@ -632,7 +632,7 @@ TEST_F(LlvmCodeGenCacheTest, SwitchMode) {
 /// Helper function to store a specific key to the global codegen cache.
 void LlvmCodeGenCacheTest::StoreHelper(TCodeGenCacheMode::type mode, string key) {
   // Create a LlvmCodeGen containing a codegen function Echo.
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::shared_ptr<LlvmCodeGen> codegen;
   ASSERT_OK(LlvmCodeGen::CreateImpalaCodegen(fragment_state_, nullptr, "test", &codegen));
   shared_ptr<CodeGenObjectCache> engine_cache =
       CreateObjCache(true /*is_double*/, nullptr /*module_id*/);
@@ -642,7 +642,7 @@ void LlvmCodeGenCacheTest::StoreHelper(TCodeGenCacheMode::type mode, string key)
   CodeGenCacheKeyConstructor::construct(key, &cache_key);
   EXPECT_OK(codegen_cache_->Store(cache_key, codegen.get(), mode, opt_level_));
   CheckObjCacheExists(codegen.get());
-  codegen->Close();
+  codegen.reset();
 }
 
 /// Concurrently store random entries to the global codegen cache, and check if all

@@ -485,6 +485,24 @@ void RowBatch::DeepCopyTo(RowBatch* dst) {
   dst->CommitRows(num_rows_);
 }
 
+void RowBatch::DeepCopyRows(RowBatch* dst, int start_idx, int num_rows) {
+  DCHECK(this != dst);
+  DCHECK(dst->row_desc_->Equals(*row_desc_));
+  DCHECK_GE(start_idx, 0);
+  DCHECK_GE(num_rows, 0);
+  DCHECK_LE(start_idx + num_rows, num_rows_);
+  DCHECK_GE(dst->capacity_, dst->num_rows_ + num_rows);
+  int row_index = dst->AddRows(num_rows);
+  FOREACH_ROW_LIMIT(this, start_idx, num_rows, it) {
+    TupleRow* src_row = it.Get();
+    TupleRow* dst_row = reinterpret_cast<TupleRow*>(dst->tuple_ptrs_ +
+        row_index++ * dst->num_tuples_per_row_);
+    src_row->DeepCopy(
+        dst_row, row_desc_->tuple_descriptors(), &dst->tuple_data_pool_, false);
+  }
+  dst->CommitRows(num_rows);
+}
+
 // TODO: consider computing size of batches as they are built up
 int64_t RowBatch::TotalByteSize(DedupMap* distinct_tuples) {
   DCHECK(distinct_tuples == nullptr || distinct_tuples->size() == 0);

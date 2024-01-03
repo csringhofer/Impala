@@ -699,6 +699,9 @@ struct TQueryOptions {
 
   // See comment in ImpalaService.thrift
   175: optional bool enable_tuple_cache = false;
+
+  // See comment in ImpalaService.thrift
+  176: optional double delay_materialize_results_threshold = 0.2;
 }
 
 // Impala currently has three types of sessions: Beeswax, HiveServer2 and external

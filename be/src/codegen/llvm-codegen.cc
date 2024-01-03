@@ -186,7 +186,7 @@ Status LlvmCodeGen::InitializeLlvm(const char* procname, bool load_backend) {
   if (FLAGS_perf_map) CodegenSymbolEmitter::WritePerfMap();
 
   ObjectPool init_pool;
-  scoped_ptr<LlvmCodeGen> init_codegen;
+  std::shared_ptr<LlvmCodeGen> init_codegen;
   RETURN_IF_ERROR(LlvmCodeGen::CreateFromMemory(
       nullptr, &init_pool, nullptr, "init", &init_codegen));
   // LLVM will construct "use" lists only when the entire module is materialized.
@@ -206,7 +206,6 @@ Status LlvmCodeGen::InitializeLlvm(const char* procname, bool load_backend) {
 
   // Initialize the global shared call graph.
   shared_call_graph_.Init(init_codegen->module_);
-  init_codegen->Close();
   return Status::OK();
 }
 
@@ -249,7 +248,7 @@ LlvmCodeGen::LlvmCodeGen(FragmentState* state, ObjectPool* pool,
 
 Status LlvmCodeGen::CreateFromFile(FragmentState* state, ObjectPool* pool,
     MemTracker* parent_mem_tracker, const string& file, const string& id,
-    scoped_ptr<LlvmCodeGen>* codegen) {
+    std::unique_ptr<LlvmCodeGen>* codegen) {
   codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_->total_time_counter());
   SCOPED_THREAD_COUNTER_MEASUREMENT((*codegen)->llvm_thread_counters());
@@ -261,12 +260,13 @@ Status LlvmCodeGen::CreateFromFile(FragmentState* state, ObjectPool* pool,
   if (!status.ok()) goto error;
   return Status::OK();
 error:
-  (*codegen)->Close();
+  codegen->reset();
   return status;
 }
 
 Status LlvmCodeGen::CreateFromMemory(FragmentState* state, ObjectPool* pool,
-    MemTracker* parent_mem_tracker, const string& id, scoped_ptr<LlvmCodeGen>* codegen) {
+    MemTracker* parent_mem_tracker, const string& id,
+    std::shared_ptr<LlvmCodeGen>* codegen) {
   codegen->reset(new LlvmCodeGen(state, pool, parent_mem_tracker, id));
   SCOPED_TIMER((*codegen)->profile_->total_time_counter());
   SCOPED_TIMER((*codegen)->prepare_module_timer_);
@@ -316,7 +316,7 @@ Status LlvmCodeGen::CreateFromMemory(FragmentState* state, ObjectPool* pool,
   if (!status.ok()) goto error;
   return Status::OK();
 error:
-  (*codegen)->Close();
+  codegen->reset();
   return status;
 }
 
@@ -417,7 +417,7 @@ void LlvmCodeGen::StripGlobalCtorsDtors(llvm::Module* module) {
 
 Status LlvmCodeGen::CreateImpalaCodegen(FragmentState* state,
     MemTracker* parent_mem_tracker, const string& id,
-    scoped_ptr<LlvmCodeGen>* codegen_ret) {
+    std::shared_ptr<LlvmCodeGen>* codegen_ret) {
   DCHECK(state != nullptr);
   RETURN_IF_ERROR(CreateFromMemory(
       state, state->obj_pool(), parent_mem_tracker, id, codegen_ret));
@@ -517,10 +517,6 @@ unique_ptr<CodegenSymbolEmitter> LlvmCodeGen::SetupSymbolEmitter(
 }
 
 LlvmCodeGen::~LlvmCodeGen() {
-  DCHECK(execution_engine_ == nullptr) << "Must Close() before destruction";
-}
-
-void LlvmCodeGen::Close() {
   if (async_compile_thread_ != nullptr) async_compile_thread_->Join();
 
   if (memory_manager_ != nullptr) {
@@ -1612,12 +1608,11 @@ void LlvmCodeGen::CodegenDebugTrace(
 Status LlvmCodeGen::GetSymbols(const string& file, const string& module_id,
     unordered_set<string>* symbols) {
   ObjectPool pool;
-  scoped_ptr<LlvmCodeGen> codegen;
+  std::unique_ptr<LlvmCodeGen> codegen;
   RETURN_IF_ERROR(CreateFromFile(nullptr, &pool, nullptr, file, module_id, &codegen));
   for (const llvm::Function& fn : codegen->module_->functions()) {
     if (fn.isMaterializable()) symbols->insert(fn.getName());
   }
-  codegen->Close();
   return Status::OK();
 }
 

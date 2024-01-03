@@ -165,6 +165,8 @@ class FragmentInstanceState {
         (strncmp(name, FINST_THREAD_NAME_PREFIX.c_str(), name_len) == 0 ||
          strncmp(name, "join-build-thread", 17) == 0);
   }
+  /// Get shared pointer to the codegen object to faciliate late destruction
+  const std::shared_ptr<LlvmCodeGen>& GetCodegenPtr() const;
 
   static const std::string FINST_THREAD_GROUP_NAME;
   static const std::string FINST_THREAD_NAME_PREFIX;
