@@ -1633,6 +1633,8 @@ public class MetastoreEvents {
       if (whitelistedTblProperties.isEmpty()) {
         return false;
       }
+  
+
       // There are lot of other alter statements which doesn't require file metadata
       // reload but these are the most common types for alter statements.
       if (isFieldSchemaChanged(beforeTable, afterTable) ||
@@ -2639,6 +2641,12 @@ public class MetastoreEvents {
             getFullyQualifiedTblName());
         return;
       }
+      LOG.info("alloc sleep start");
+      try {
+          Thread.sleep(1000*30);
+      } catch (Exception ex) {
+      }
+      LOG.info("alloc sleep end");
       try {
         List<Long> writeIds = txnToWriteIdList_.stream()
             .map(TxnToWriteId::getWriteId)
@@ -2838,6 +2846,13 @@ public class MetastoreEvents {
     @Override
     protected void process() throws MetastoreNotificationException {
       try {
+        LOG.info("abort sleep start");
+        try {
+          Thread.sleep(1000*60);
+        } catch (Exception ex) {
+        }
+        LOG.info("abort sleep end");
+
         addAbortedWriteIdsToTables(catalog_.getWriteIds(txnId_));
       } catch (CatalogException e) {
         throw new MetastoreNotificationNeedsInvalidateException(debugString("Failed to "

@@ -147,6 +147,13 @@ if hive_major_version >= 3:
    # but configuring a worker thread allows manual compaction.
    'hive.compactor.worker.threads': 4,
 
+
+   'metastore.compactor.cleaner.on': 'true',
+   
+   'metastore.compactor.initiator.on': 'true',
+   
+   'metastore.housekeeping.threads.on': 'true',
+
    # Hive 3 now requires separate directories for managed vs external tables.
    # Since only transactional tables are considered managed, most tests run against
    # tables that are now considered external. So, use /test-warehouse for the external
