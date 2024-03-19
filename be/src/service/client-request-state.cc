@@ -1783,16 +1783,18 @@ bool ClientRequestState::UseDelayedMaterialization() {
     // Enable delayed materialization if multiple fetch streams are present and
     // fetch lock wait time exceeds threshold or
     // when delay_materialize_results_threshold for testing purposes
-    double materialize_threshold =
-        query_ctx_.client_request.query_options.delay_materialize_results_threshold;
-    if (result_cache_max_size_ <= 0 &&
-        (num_fetch_streams_counter_->value() > 1 || !materialize_threshold) &&
-        row_materialization_timer_->value() > 0 &&
-        fetch_lock_wait_timer_->value() >
-            row_materialization_timer_->value() * materialize_threshold) {
+    //double materialize_threshold =
+    //    query_ctx_.client_request.query_options.delay_materialize_results_threshold;
+    if (result_cache_max_size_ <= 0 // &&
+        //(num_fetch_streams_counter_->value() > 1 || !materialize_threshold) &&
+        //row_materialization_timer_->value() > 0 &&
+        //fetch_lock_wait_timer_->value() >
+        //    row_materialization_timer_->value() * materialize_threshold
+            ) {
       delay_materialization_ = true;
     }
   }
+  //delay_materialization_ = true;
   return delay_materialization_;
 }
 

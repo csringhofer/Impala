@@ -250,6 +250,7 @@ Status ImpalaServer::FetchInternal(TUniqueId query_id, SessionState* session,
         query_handle->FetchRows(fetch_size, result_set.get(), block_on_wait_time_us));
     fetch_results->__set_hasMoreRows(!query_handle->eos());
   }
+  sleep(1);
   if (result_set->DelayedMaterializationEnabled()) {
     MonotonicStopWatch result_flush_timer;
     result_flush_timer.Start();
