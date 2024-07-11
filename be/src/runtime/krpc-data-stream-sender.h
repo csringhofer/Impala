@@ -19,6 +19,7 @@
 #ifndef IMPALA_RUNTIME_KRPC_DATA_STREAM_SENDER_H
 #define IMPALA_RUNTIME_KRPC_DATA_STREAM_SENDER_H
 
+#include <condition_variable>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -164,30 +165,138 @@ class KrpcDataStreamSender : public DataSink {
  private:
   class Channel;
   class IcebergPositionDeleteChannel;
+  class OutboundQueue;
 
   // Per partition structure to collect rows before sending the OutboundRowBatch to
   // Channel. Only used in HASH/KUDU partitioning.
   struct PartitionRowCollector {
     std::unique_ptr<OutboundRowBatch> collector_batch_;
+    KrpcDataStreamSender* parent_ = nullptr;
     Channel* channel_ = nullptr;
+    OutboundQueue* queue_ = nullptr;
     int num_rows_ = 0;
     int row_batch_capacity_ = 0;
 
     // Copies a single row into collector_batch_ and flushes it (SendCurrentBatch())
-    // once row count or memory capacity is reached. This call may block if capacity is
-    // reached and channel_'s preceding RPC is still in progress. Returns error status
-    // if serialization failed or if the preceding RPC failed. Returns OK otherwise.
+    // once row count or memory capacity is reached. May block in WaitForCapacity() if
+    // the batch pool is exhausted. Returns error status if serialization failed or if
+    // any RPC failed. Returns OK otherwise.
     Status IR_ALWAYS_INLINE AppendRow(
         const TupleRow* row, const RowDescriptor* row_desc);
 
-    // Finalizes and compresses collector_batch_ and sends it with channel_'s
-    // TransmitData(). This call may block if channel_'s preceding RPC is still
-    // in progress. Swaps collector_batch_ with the channel's outbound_batch_.
-    // Returns error status if compression failed or if the preceding RPC failed.
+    // Finalizes and compresses collector_batch_ and submits it to queue_.
+    // May block in WaitForCapacity() if the batch pool is exhausted.
+    // Replaces collector_batch_ with a fresh batch obtained from the pool.
+    // Returns error status if serialization failed or if any RPC failed.
     // Returns OK otherwise.
     Status SendCurrentBatch();
   };
   std::vector<PartitionRowCollector> partition_row_collectors_;
+
+  // Manages in-flight OutboundRowBatch sends to one or more channels. For broadcast
+  // (UNPARTITIONED) senders a single queue fans out to all channels; for partitioned
+  // senders each channel has its own queue. The parent KrpcDataStreamSender owns the
+  // batch pool and limits the total number of in-flight OutboundRowBatches.
+  class OutboundQueue {
+  public:
+    // Constructs a queue for the given set of channels.
+    OutboundQueue(const std::vector<std::unique_ptr<Channel>>& channels,
+        KrpcDataStreamSender* parent);
+
+    // Constructs a single-channel queue for per-partition queuing (HASH/KUDU).
+    OutboundQueue(Channel* channel, KrpcDataStreamSender* parent);
+
+    // Enqueues 'batch' for delivery to all channels. Non-blocking. The caller must
+    // have obtained 'batch' from the parent's batch pool (via WaitForCapacity()).
+    // Dispatches the batch immediately to any currently idle channels and enqueues it
+    // for busy ones. Returns error status if any channel RPC failed.
+    Status Add(std::unique_ptr<OutboundRowBatch>* batch);
+
+    // Signals that no more batches will be added. Sets 'eos_' so that each in-flight
+    // channel will send its EOS RPC immediately from the reactor thread once it delivers
+    // its last data batch. Idle channels (currently in idle_channels_) are sent EOS
+    // directly before this call returns. Returns without waiting for in-flight batches
+    // to complete; call WaitTillEmpty() after to block until the queue is empty.
+    // Returns error status if sending EOS to an idle channel failed.
+    Status FlushFinal();
+
+    // Waits until the queue is fully empty (queue_.empty()) and all channels have had
+    // their EOS RPC complete (or are permanently closed). Must be called after
+    // FlushFinal(). Returns error status if any channel RPC failed or the query was
+    // cancelled.
+    Status WaitTillEmpty();
+
+    // Called from a channel's TransmitData completion callback on the KRPC reactor
+    // thread once the RPC for 'batch' has finished on 'channel'. 'status' is the RPC
+    // result; 'closed' is true if the remote receiver reported DATASTREAM_RECVR_CLOSED.
+    // Returns the next batch to send on 'channel' (taken from the queue), or nullptr
+    // if the channel should wait. Sets '*eos' to true if the channel has delivered its
+    // last data batch and should send an EOS RPC immediately.
+    // Invariant: never returns a non-null batch and sets '*eos' at the same time.
+    OutboundRowBatch* RpcFinished(OutboundRowBatch* batch, Channel* channel,
+        const Status& status, bool closed, bool* eos);
+
+    // Called from a channel's EndDataStream completion callback on the KRPC reactor
+    // thread once the EOS RPC for 'channel' has finished. 'status' is the RPC result.
+    // Increments eos_completed_count_ and wakes WaitTillEmpty() if all channels are done.
+    void EosFinished(Channel* channel, const Status& status);
+  private:
+    // Protects all fields below.
+    // Lock ordering: OutboundQueue::lock_ must not be acquired while holding
+    // Channel::lock_ or batch_pool_lock_. While holding OutboundQueue::lock_, both
+    // Channel::lock_ (e.g. in Add() -> TransmitData()) and batch_pool_lock_ (e.g. in
+    // RpcFinished() -> ReleaseBatch()/SetBatchPoolError()) may be acquired.
+    // RpcFinished() acquires OutboundQueue::lock_ only after releasing Channel::lock_.
+    SpinLock lock_;
+
+    // Signalled when the front of the queue is released, allowing WaitTillEmpty() to
+    // recheck whether the queue is empty.
+    std::condition_variable_any queue_empty_cv_;
+
+    // All channels managed by this queue.
+    std::vector<Channel*> channels_;
+
+    // Channels that are currently idle (not sending any batch). These are sent to
+    // immediately when Add() enqueues a new batch.
+    std::vector<Channel*> idle_channels_;
+
+    // Wrapper for a queued OutboundRowBatch with a per-entry ref counter tracking
+    // how many channels still need to send it.
+    struct QueuedBatch {
+      std::unique_ptr<OutboundRowBatch> batch;
+      // Number of non-closed channels that still need to send this batch.
+      int consumers_left = 0;
+    };
+
+    // Batches currently in flight. The front of the queue is the oldest batch, sent
+    // first. A batch is removed from the front only once all channels have finished
+    // sending it (QueuedBatch::consumers_left reaches 0).
+    std::list<QueuedBatch> queue_;
+
+    // Parent sender. Not owned.
+    KrpcDataStreamSender* parent_;
+
+    // Number of channels that have reported DATASTREAM_RECVR_CLOSED and are therefore
+    // permanently excluded from future sends.
+    int closed_channel_count_ = 0;
+
+    // Set by FlushFinal(). When true, RpcFinished() signals each channel to send EOS
+    // immediately once it has delivered its last data batch.
+    bool eos_ = false;
+
+    // Number of channels for which the EOS RPC has completed (EndDataStreamCompleteCb
+    // fired and reported a final result). Together with closed_channel_count_, used by
+    // WaitTillEmpty() to determine when all channels are done.
+    int eos_completed_count_ = 0;
+
+    // Sticky error status. Set on the first RPC failure.
+    Status status_;
+
+    // Notifies queue_empty_cv_ if every channel is accounted for, i.e.
+    // eos_completed_count_ + closed_channel_count_ == channels_.size().
+    // Must be called with lock_ held.
+    void NotifyIfAllChannelsDone();
+  };
 
   /// Serializes the src batch into the serialized row batch 'dest' and updates
   /// various stat counters.
@@ -239,20 +348,9 @@ class KrpcDataStreamSender : public DataSink {
   /// Index of the current channel to send to if random_ == true.
   int current_channel_idx_ = 0;
 
-  /// Pointer to OutboundRowBatch that will be used for serialization.
-  /// Swapped with in_flight_batch_ (UNPARTITIONED case) or the channel's outbound_batch_
-  /// (PARTITIONED case) after serialization.
-  std::unique_ptr<OutboundRowBatch> serialization_batch_;
-
   /// Buffer used for compression after serialization. Swapped with the OutboundRowBatch's
   /// tuple_data_ if the compressed data is smaller.
   std::unique_ptr<TrackedString> compression_scratch_;
-
-  /// Pointer to OutboundRowBatch referenced by the in-flight RPC(s). Used only
-  /// when the partitioning strategy is UNPARTITIONED. In the broadcasting case
-  /// multiple channels use it at the same time to hold the buffers backing the RPC
-  /// sidecars.
-  std::unique_ptr<OutboundRowBatch> in_flight_batch_;
 
   /// If true, this sender has called FlushFinal() successfully.
   /// Not valid to call Send() anymore.
@@ -339,11 +437,57 @@ class KrpcDataStreamSender : public DataSink {
   /// A mapping between host addresses to channels. Used for DIRECTED distribution mode
   /// where only one channel is associated with each host address.
   std::unordered_map<NetworkAddressPB, Channel*> host_to_channel_;
+
   /// A mapping from Channel to IcebergPositionDeleteChannel. Only used in DIRECTED mode
   /// where IcebergPositionDeleteChannel applies a specific serialization algorithm on
   /// position delete records.
   std::unordered_map<Channel*, std::unique_ptr<IcebergPositionDeleteChannel>>
     channel_to_ice_channel_;
+
+  // Unified queue vector. For UNPARTITIONED there is one queue shared by all channels.
+  // For all other partition types there is one queue per channel (same index).
+  // Empty when no queuing is used (e.g. single-channel HASH/KUDU).
+  std::vector<std::unique_ptr<OutboundQueue>> queues_;
+
+  // --- Broadcast batch pool ---
+  // Owned pool of free OutboundRowBatch buffers for the UNPARTITIONED send path.
+  // KrpcDataStreamSender controls the total number of in-flight batches; the
+  // OutboundQueue is unbounded and calls ReleaseBatch() when a batch is fully delivered.
+
+  // Protects free_batch_pool_, batch_pool_error_, and is used by batch_pool_cv_.
+  SpinLock batch_pool_lock_;
+
+  // Signalled when a buffer is returned to free_batch_pool_ or when batch_pool_error_
+  // is set, allowing WaitForCapacity() to unblock.
+  std::condition_variable_any batch_pool_cv_;
+
+  // Pool of free OutboundRowBatch buffers available for serialization.
+  std::list<std::unique_ptr<OutboundRowBatch>> free_batch_pool_;
+
+  // Maximum number of OutboundRowBatches that may be simultaneously in-flight
+  // (i.e. queued or being sent).
+  int batch_pool_max_size_ = 0;
+
+  // Number of OutboundRowBatches created so far (both in-pool and in-flight).
+  // Protected by batch_pool_lock_. Incremented lazily in WaitForCapacity() up to
+  // batch_pool_max_size_; never decremented.
+  int batches_allocated_ = 0;
+
+  // Sticky error propagated from a channel RPC failure into WaitForCapacity().
+  Status batch_pool_error_;
+
+  // Blocks until a free OutboundRowBatch buffer is available in free_batch_pool_,
+  // then moves it into '*batch'. Returns error status if a channel RPC failed or the
+  // query was cancelled. Must be called before SerializeBatch() each iteration.
+  Status WaitForCapacity(std::unique_ptr<OutboundRowBatch>* batch);
+
+  // Returns 'batch' to free_batch_pool_ and signals WaitForCapacity(). Called from
+  // OutboundQueue::RpcFinished() on the KRPC reactor thread.
+  void ReleaseBatch(std::unique_ptr<OutboundRowBatch> batch);
+
+  // Sets batch_pool_error_ and wakes WaitForCapacity(). Called from OutboundQueue
+  // on the first RPC failure.
+  void SetBatchPoolError(const Status& status);
 };
 
 } // namespace impala
