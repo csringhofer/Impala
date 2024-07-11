@@ -19,6 +19,7 @@
 #ifndef IMPALA_RUNTIME_KRPC_DATA_STREAM_SENDER_H
 #define IMPALA_RUNTIME_KRPC_DATA_STREAM_SENDER_H
 
+#include <condition_variable>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -164,6 +165,25 @@ class KrpcDataStreamSender : public DataSink {
  private:
   class Channel;
 
+  class OutboundQueue {
+  public:
+    OutboundQueue(const std::vector<std::unique_ptr<Channel>>& channels, int queue_size, KrpcDataStreamSender* parent);
+    Status AddBlocking(std::unique_ptr<OutboundRowBatch>* batch);
+    void FlushFinal();
+    OutboundRowBatch* RpcFinished(OutboundRowBatch* batch, Channel* channel);
+  private:
+    SpinLock lock_;
+    std::condition_variable_any has_capacity_cv_;
+    std::vector<Channel*> channels_;
+    std::vector<Channel*> free_channels_;
+    std::list<std::unique_ptr<OutboundRowBatch>> queue_;
+    std::list<std::unique_ptr<OutboundRowBatch>> free_batches_;
+    KrpcDataStreamSender* parent_;
+    int max_queue_size_;
+    int closed_channel_count_ = 0;
+    bool closed_ = false;
+  };
+
   /// Serializes the src batch into the serialized row batch 'dest' and updates
   /// various stat counters.
   /// 'compress' decides whether compression is attempted after serialization.
@@ -221,12 +241,6 @@ class KrpcDataStreamSender : public DataSink {
   /// Buffer used for compression after serialization. Swapped with the OutboundRowBatch's
   /// tuple_data_ if the compressed data is smaller.
   std::unique_ptr<TrackedString> compression_scratch_;
-
-  /// Pointer to OutboundRowBatch referenced by the in-flight RPC(s). Used only
-  /// when the partitioning strategy is UNPARTITIONED. In the broadcasting case
-  /// multiple channels use it at the same time to hold the buffers backing the RPC
-  /// sidecars.
-  std::unique_ptr<OutboundRowBatch> in_flight_batch_;
 
   /// If true, this sender has called FlushFinal() successfully.
   /// Not valid to call Send() anymore.
@@ -304,6 +318,8 @@ class KrpcDataStreamSender : public DataSink {
   /// A mapping between host addresses to channels. Used for DIRECTED distribution mode
   /// where only one channel is associated with each host address.
   std::unordered_map<NetworkAddressPB, Channel*> host_to_channel_;
+
+  std::unique_ptr<OutboundQueue> broadcast_queue_;
 };
 
 } // namespace impala

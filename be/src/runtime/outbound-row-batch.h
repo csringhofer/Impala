@@ -64,6 +64,9 @@ class OutboundRowBatch {
          header_.has_compression_type();
   }
 
+  // Used by broadcast sender.
+  int ref_counter_ = 0;
+
  private:
   friend class RowBatch;
   friend class RowBatchSerializeBaseline;
