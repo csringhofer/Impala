@@ -236,6 +236,9 @@ class Tuple {
       const SlotOffsets* string_slot_offsets, int num_string_slots, MemPool* pool,
       Status* status) noexcept;
 
+  bool TryDeepCopy(uint8_t** dst_start, const uint8_t* dst_end, int* offset,
+      const TupleDescriptor& desc, bool convert_ptrs) const;
+
   /// Symbols (or substrings of the symbols) of MaterializeExprs(). These can be passed to
   /// LlvmCodeGen::ReplaceCallSites().
   static const char* MATERIALIZE_EXPRS_SYMBOL;
@@ -261,6 +264,9 @@ class Tuple {
   /// experiements. On success, 'fn' is set to point to the generated function.
   static Status CodegenCopyStrings(LlvmCodeGen* codegen,
       const TupleDescriptor& desc, llvm::Function** materialize_strings_fn);
+
+  //static Status CodegenVarlenByteSize(LlvmCodeGen* codegen,
+  //    const TupleDescriptor& desc, llvm::Function** varlen_byte_size_fn);
 
   /// Turn null indicator bit on. For non-nullable slots, the mask will be 0 and
   /// this is a no-op (but we don't have to branch to check is slots are nullable).
@@ -353,6 +359,14 @@ class Tuple {
   /// Also smallifies the copied strings when possible.
   void DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* offset,
       bool convert_ptrs);
+
+  int64_t IR_NO_INLINE StringsByteSize(const TupleDescriptor& desc, bool assume_smallify) const;
+  int64_t IR_NO_INLINE CollectionsByteSize(const TupleDescriptor& desc, bool assume_smallify) const;
+
+  bool TryCopyStrings(uint8_t** dst, const uint8_t* dst_end, int* offset,
+      const TupleDescriptor& desc, bool convert_ptrs);
+  bool TryCopyCollections(uint8_t** dst, const uint8_t* dst_end, int* offset,
+      const TupleDescriptor& desc, bool convert_ptrs);
 
   /// During the construction of hand-crafted codegen'd functions, types cannot generally
   /// be looked up by name. In our own types we use the static 'LLVM_CLASS_NAME' member to

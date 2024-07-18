@@ -17,6 +17,7 @@
 
 #include "exprs/scalar-expr-evaluator.h"
 #include "runtime/krpc-data-stream-sender.h"
+#include "runtime/outbound-row-batch.inline.h"
 #include "runtime/raw-value.h"
 #include "runtime/row-batch.h"
 
@@ -39,11 +40,28 @@ Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
     }
     row_count = 0;
     FOREACH_ROW_LIMIT(batch, row_idx, RowBatch::HASH_BATCH_SIZE, row_batch_iter) {
-      RETURN_IF_ERROR(AddRowToChannel(channel_ids[row_count++], row_batch_iter.Get()));
+      RETURN_IF_ERROR(AddRowToChannelDirect(channel_ids[row_count++], row_batch_iter.Get()));
     }
     row_idx += row_count;
   }
   return Status::OK();
+}
+
+Status KrpcDataStreamSender::PartitionRowCollector::FlushSingleRow(const TupleRow* row, const RowDescriptor* row_desc) {
+  DCHECK_LT(num_rows_, row_batch_capacity_);
+  num_rows_ ++;
+  RETURN_IF_ERROR(collector_batch_->AppendRow(row, row_desc));
+  DCHECK_GT(row_batch_capacity_, 0);
+  if (num_rows_ == row_batch_capacity_) {
+     // This swaps collector_batch_ with an empty batch.
+    RETURN_IF_ERROR(SendCurrentBatch());
+  }
+  return Status::OK();
+}
+
+Status KrpcDataStreamSender::AddRowToChannelDirect(const int channel_id, TupleRow* row) {
+  PartitionRowCollector& collector = partition_row_collectors_[channel_id];
+  return collector.FlushSingleRow(row, row_desc_);
 }
 
 }

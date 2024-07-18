@@ -57,7 +57,7 @@ int64_t Tuple::TotalByteSize(const TupleDescriptor& desc, bool assume_smallify) 
   return result;
 }
 
-int64_t Tuple::VarlenByteSize(const TupleDescriptor& desc, bool assume_smallify) const {
+int64_t Tuple::StringsByteSize(const TupleDescriptor& desc, bool assume_smallify) const {
   int64_t result = 0;
   vector<SlotDescriptor*>::const_iterator slot = desc.string_slots().begin();
   for (; slot != desc.string_slots().end(); ++slot) {
@@ -66,8 +66,12 @@ int64_t Tuple::VarlenByteSize(const TupleDescriptor& desc, bool assume_smallify)
     const StringValue* string_val = GetStringSlot((*slot)->tuple_offset());
     result += string_val->ExternalLen(assume_smallify);
   }
+  return result;
+}
 
-  slot = desc.collection_slots().begin();
+int64_t Tuple::CollectionsByteSize(const TupleDescriptor& desc, bool assume_smallify) const {
+  int64_t result = 0;
+  vector<SlotDescriptor*>::const_iterator slot = desc.collection_slots().begin();
   for (; slot != desc.collection_slots().end(); ++slot) {
     DCHECK((*slot)->type().IsCollectionType());
     if (IsNull((*slot)->null_indicator_offset())) continue;
@@ -558,7 +562,53 @@ Status Tuple::CodegenCopyStrings(
   }
   return Status::OK();
 }
+/*
+Status Tuple::CodegenVarlenByteSize(LlvmCodeGen* codegen,
+      const TupleDescriptor& desc, llvm::Function** varlen_byte_size_fn) {
+  llvm::PointerType* opaque_tuple_type = codegen->GetStructPtrType<Tuple>();
+  llvm::PointerType* desc_type = codegen->GetStructPtrType<TupleDescriptor>();
+  LlvmCodeGen::FnPrototype prototype(
+      codegen, "VarlenByteSizeWrapper", codegen->i64_type());
+  prototype.AddArgument("opaque_tuple", opaque_tuple_type);
+  prototype.AddArgument("desc", desc_type);
+  prototype.AddArgument("assume_smallify", codegen->bool_type()); // I8 type?
 
+  LlvmBuilder builder(codegen->context());
+  llvm::Value* args[3];
+  *varlen_byte_size_fn = prototype.GeneratePrototype(&builder, args);
+  llvm::Value* opaque_tuple_arg = args[0];
+  llvm::Value* desc_arg = args[1];
+  llvm::Value* assume_smallify_arg = args[2];
+
+  llvm::Function* cross_compiled_fn =
+      codegen->GetFunction(IRFunction::TUPLE_COPY_STRINGS, false);
+  DCHECK(cross_compiled_fn != nullptr);
+
+  // Convert the offsets of the string slots into a constant IR array 'slot_offsets'.
+  vector<llvm::Constant*> slot_offset_ir_constants;
+  for (SlotDescriptor* slot_desc : desc.string_slots()) {
+    SlotOffsets offsets = {slot_desc->null_indicator_offset(), slot_desc->tuple_offset()};
+    slot_offset_ir_constants.push_back(offsets.ToIR(codegen));
+  }
+  llvm::Constant* constant_slot_offsets = codegen->ConstantsToGVArrayPtr(
+      slot_offsets_type, slot_offset_ir_constants, "slot_offsets");
+  llvm::Constant* num_string_slots = codegen->GetI32Constant(desc.string_slots().size());
+  // Get SlotOffsets* pointer to the first element of the constant array.
+  llvm::Value* constant_slot_offsets_first_element_ptr =
+      builder.CreateConstGEP2_64(constant_slot_offsets, 0, 0);
+
+  llvm::Value* result_val = builder.CreateCall(cross_compiled_fn,
+      {opaque_tuple_arg, err_ctx_arg, state_arg, constant_slot_offsets_first_element_ptr,
+          num_string_slots, pool_arg, status_arg});
+  builder.CreateRet(result_val);
+
+  *copy_strings_fn = codegen->FinalizeFunction(*copy_strings_fn);
+  if (*copy_strings_fn == nullptr) {
+    return Status("Tuple::CodegenCopyStrings(): failed to finalize function");
+  }
+  return Status::OK();
+}
+*/
 llvm::Constant* SlotOffsets::ToIR(LlvmCodeGen* codegen) const {
   return llvm::ConstantStruct::get(
       codegen->GetStructType<SlotOffsets>(),

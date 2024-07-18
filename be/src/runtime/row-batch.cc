@@ -252,6 +252,7 @@ Status RowBatch::Serialize(
     return Status(TErrorCode::ROW_BATCH_TOO_LARGE, size, numeric_limits<int32_t>::max());
   }
   output_batch->tuple_data_.resize(size);
+  output_batch->tuple_data_offset_ = size; // To satisfy DCHECK in outbound row batch.
   RETURN_IF_ERROR(Serialize(full_dedup ? &distinct_tuples : nullptr,
       output_batch, &is_compressed, size, compression_scratch));
   return Status::OK();

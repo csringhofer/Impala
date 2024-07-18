@@ -70,7 +70,26 @@ class TupleRow {
     }
   }
 
-  /// TODO: make a macro for doing thisf
+  /// Calculates the total size needed for deepcopy.
+  /// If 'assume_smallify' is true, calculates with smallified string sizes even for not
+  /// (yet) smallified strings.
+  int TotalByteSize(const RowDescriptor* row_desc, bool assume_smallify) const {
+    vector<TupleDescriptor*>::const_iterator desc =
+        row_desc->tuple_descriptors().begin();
+    int size = 0;
+    for (int j = 0; desc != row_desc->tuple_descriptors().end(); ++desc, ++j) {
+      Tuple* tuple = GetTuple(j);
+      if (UNLIKELY(tuple == nullptr)) {
+        continue;
+      }
+      int tuple_size = tuple->TotalByteSize(**desc, assume_smallify);
+      DCHECK_GE(tuple_size, 0);
+      size += tuple_size;
+    }
+    return size;
+  }
+
+  /// TODO: make a macro for doing this
   /// For C++/IR interop, we need to be able to look up types by name.
   static const char* LLVM_CLASS_NAME;
 

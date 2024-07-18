@@ -165,6 +165,19 @@ class KrpcDataStreamSender : public DataSink {
   class Channel;
   class IcebergPositionDeleteChannel;
 
+  struct PartitionRowCollector {
+    std::unique_ptr<OutboundRowBatch> collector_batch_;
+    Channel* channel_ = nullptr;
+    int num_rows_ = 0;
+    int row_batch_capacity_ = 0;
+  
+
+    Status IR_ALWAYS_INLINE FlushSingleRow(const TupleRow* row, const RowDescriptor* row_desc);
+    bool AtCapacity() { return num_rows_ == row_batch_capacity_; }
+    Status SendCurrentBatch();
+  };
+  std::vector<PartitionRowCollector> partition_row_collectors_;
+
   /// Serializes the src batch into the serialized row batch 'dest' and updates
   /// various stat counters.
   /// 'compress' decides whether compression is attempted after serialization.
@@ -172,6 +185,10 @@ class KrpcDataStreamSender : public DataSink {
   /// updating the stat counters.
   Status SerializeBatch(
       RowBatch* src, OutboundRowBatch* dest, bool compress, int num_receivers = 1);
+
+  // Like SerializeBatch, but the batch is already serialized and only compression is
+  // needed.
+  Status PrepareBatchForSend(OutboundRowBatch* batch, bool compress);
 
   /// Returns 'partition_expr_evals_[i]'. Used by the codegen'd HashRow() IR function.
   ScalarExprEvaluator* GetPartitionExprEvaluator(int i);
@@ -192,6 +209,7 @@ class KrpcDataStreamSender : public DataSink {
 
   /// Adds the given row to 'channels_[channel_id]'.
   Status AddRowToChannel(const int channel_id, TupleRow* row);
+  Status IR_ALWAYS_INLINE AddRowToChannelDirect(const int channel_id, TupleRow* row);
 
   /// Functions to dump the content of the "filename to hosts" related mappings into logs.
   void DumpFilenameToHostsMapping() const;
@@ -243,6 +261,12 @@ class KrpcDataStreamSender : public DataSink {
 
   /// Time for serializing row batches.
   RuntimeProfile::Counter* serialize_batch_timer_ = nullptr;
+  RuntimeProfile::Counter* send_batch_timer_ = nullptr;
+  RuntimeProfile::Counter* deepcopy_timer_ = nullptr;
+  RuntimeProfile::Counter* do_transmit_data_timer_ = nullptr;
+  RuntimeProfile::Counter* transmit_data_async_timer_ = nullptr;
+  //RuntimeProfile::Counter* partition_rows_timer_ = nullptr;
+  //RuntimeProfile::Counter* deepcopy_rows_timer_ = nullptr;
 
   /// Number of TransmitData() RPC retries due to remote service being busy.
   RuntimeProfile::Counter* rpc_retry_counter_ = nullptr;
@@ -264,6 +288,11 @@ class KrpcDataStreamSender : public DataSink {
 
   /// Total number of rows sent.
   RuntimeProfile::Counter* total_sent_rows_counter_ = nullptr;
+
+  /// Total number of rows sent.
+  RuntimeProfile::Counter* row_batches_counter_ = nullptr;
+  RuntimeProfile::Counter* row_batches_with_buffers_ = nullptr;
+  RuntimeProfile::Counter* row_batches_sent_ = nullptr;
 
   /// Summary of network throughput for sending row batches. Network time also includes
   /// queuing time in KRPC transfer queue for transmitting the RPC requests and receiving

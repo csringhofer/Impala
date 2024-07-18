@@ -193,6 +193,8 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // can be reused.
   Status TransmitData(std::unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch);
 
+  Status FinelizeAndSendBatch(std::unique_ptr<OutboundRowBatch>* outbound_batch);
+
   // Copies a single row into this channel's row batch and flushes the row batch once
   // it reaches capacity. This call may block if the row batch's capacity is reached
   // and the preceding RPC is still in progress. Returns error status if serialization
@@ -209,7 +211,7 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // Flushes any buffered row batches. Return error status if the TransmitData() RPC
   // fails. The RPC is sent asynchrononously. WaitForRpc() must be called to wait
   // for the RPC. This should be only called from a fragment executor thread.
-  Status FlushBatches();
+  //Status FlushBatches();
 
   // Sends the EOS RPC to close the channel. Return error status if sending the EOS RPC
   // failed. The RPC is sent asynchrononously. WaitForRpc() must be called to wait for
@@ -221,12 +223,21 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // Returns OK otherwise. This should be only called from a fragment executor thread.
   Status WaitForRpc();
 
-  int RowBatchCapacity() const;
+  int RowBatchCapacity() const { return row_batch_capacity_; }
+  int CalculateRowBatchCapacity() const;
 
   // The type for a RPC worker function.
   typedef boost::function<Status()> DoRpcFn;
 
   bool IsLocal() const { return is_local_; }
+
+  // Used only in hash partitioning
+  typedef vector<const TupleRow*>  RowCollector;
+  RowCollector row_collector_;
+  RowCollector::iterator row_collector_pos_, row_collector_end_;
+
+  //Status FlushRowCollector(bool final_flush);
+  Status FlushSingleRow(const TupleRow* row);
 
  private:
   friend KrpcDataStreamSender::IcebergPositionDeleteChannel;
@@ -246,9 +257,16 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // True if the target fragment instance runs within the same process.
   const bool is_local_;
 
+
+  int row_batch_capacity_ = -1;
   // The row batch for accumulating rows copied from AddRow().
-  // Only used if the partitioning scheme is "KUDU" or "HASH_PARTITIONED".
-  scoped_ptr<RowBatch> batch_;
+  // Only used if the partitioning scheme is "KUDU".
+  //scoped_ptr<RowBatch> batch_;
+
+  // The row batch for accumulating rows copied from AddRow().
+  // Only used if the partitioning scheme is "HASH_PARTITIONED".
+  std::unique_ptr<OutboundRowBatch> collector_batch_;
+  int rows_in_collector_batch_ = 0;
 
   // Owns an outbound row batch that can be referenced by the in-flight RPC. Contains
   // a RowBatchHeaderPB and the buffers for the serialized tuple offsets and data.
@@ -391,7 +409,13 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
 
 Status KrpcDataStreamSender::Channel::Init(
     RuntimeState* state, std::shared_ptr<CharMemTrackerAllocator> allocator) {
-  batch_.reset(new RowBatch(row_desc_, RowBatchCapacity(), parent_->mem_tracker()));
+  //batch_.reset(new RowBatch(row_desc_, RowBatchCapacity(), parent_->mem_tracker()));
+    // TODO: this is only needed in Kudu and Partitioned case
+  row_batch_capacity_ = CalculateRowBatchCapacity();
+  row_collector_.resize(row_batch_capacity_);
+  row_collector_pos_ = row_collector_.begin();
+  row_collector_end_ = row_collector_.end();
+  collector_batch_.reset(new OutboundRowBatch(allocator));
 
   // Create a DataStreamService proxy to the destination.
   RETURN_IF_ERROR(DataStreamService::GetProxy(address_, hostname_, &proxy_));
@@ -399,10 +423,11 @@ Status KrpcDataStreamSender::Channel::Init(
   // Init outbound_batch_.
   outbound_batch_.reset(new OutboundRowBatch(allocator));
 
+
   return Status::OK();
 }
 
-int KrpcDataStreamSender::Channel::RowBatchCapacity() const {
+int KrpcDataStreamSender::Channel::CalculateRowBatchCapacity() const {
   // TODO: take into account of var-len data at runtime.
   return
       max(1, parent_->per_channel_buffer_size_ / max(row_desc_->GetRowSize(), 1));
@@ -567,6 +592,7 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
   DCHECK(rpc_in_flight_batch_ != nullptr);
   DCHECK(rpc_in_flight_batch_->IsInitialized());
 
+  SCOPED_TIMER(parent_->do_transmit_data_timer_);
   // Initialize some constant fields in the request protobuf.
   TransmitDataRequestPB req;
   *req.mutable_dest_fragment_instance_id() = fragment_instance_id_;
@@ -593,6 +619,7 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
   req.set_tuple_data_sidecar_idx(sidecar_idx);
 
   resp_.Clear();
+  SCOPED_TIMER(parent_->transmit_data_async_timer_);
   proxy_->TransmitDataAsync(req, &resp_, &rpc_controller_,
       boost::bind(&KrpcDataStreamSender::Channel::TransmitDataCompleteCb, this));
   // 'req' took ownership of 'header'. Need to release its ownership or 'header' will be
@@ -641,12 +668,26 @@ unique_ptr<OutboundRowBatch>* KrpcDataStreamSender::Channel::GetSerializationBat
   return serialization_batch;
 }
 
-Status KrpcDataStreamSender::Channel::SendCurrentBatch() {
-  RETURN_IF_ERROR(SerializeAndSendBatch(batch_.get()));
-  batch_->Reset();
+Status  KrpcDataStreamSender::Channel::FinelizeAndSendBatch(std::unique_ptr<OutboundRowBatch>* outbound_batch) {
+  RETURN_IF_ERROR(parent_->PrepareBatchForSend(outbound_batch->get(), !is_local_));
+  COUNTER_ADD(parent_->row_batches_sent_, 1);
+  SCOPED_TIMER(parent_->send_batch_timer_);
+  return TransmitData(outbound_batch, true /*swap_batch*/);
+}
+
+Status KrpcDataStreamSender::PartitionRowCollector::SendCurrentBatch() {
+  if (collector_batch_->IsEmpty()) {
+    DCHECK_EQ(num_rows_, 0);
+    return Status::OK();
+  }
+  //LOG(INFO) << "PartitionRowCollector::SendCurrentBatch() num_rows: " << num_rows_ << "row batch capacity" << row_batch_capacity_;
+  num_rows_ = 0;
+  RETURN_IF_ERROR(channel_->FinelizeAndSendBatch(&collector_batch_));
+  collector_batch_->Reset();
   return Status::OK();
 }
 
+/*
 inline Status KrpcDataStreamSender::Channel::AddRow(TupleRow* row) {
   if (batch_->AtCapacity()) {
     // batch_ is full, let's send it.
@@ -664,6 +705,7 @@ inline Status KrpcDataStreamSender::Channel::AddRow(TupleRow* row) {
   batch_->CommitLastRow();
   return Status::OK();
 }
+*/
 
 void KrpcDataStreamSender::Channel::EndDataStreamCompleteCb() {
   std::unique_lock<SpinLock> l(lock_);
@@ -712,23 +754,29 @@ Status KrpcDataStreamSender::Channel::DoEndDataStreamRpc() {
   return Status::OK();
 }
 
-Status KrpcDataStreamSender::Channel::FlushBatches() {
-  VLOG_RPC << "Channel::FlushBatches() fragment_instance_id="
-           << PrintId(fragment_instance_id_) << " dest_node=" << dest_node_id_
-           << " #rows= " << batch_->num_rows();
+//Status KrpcDataStreamSender::Channel::FlushBatches() {
+  //VLOG_RPC << "Channel::FlushBatches() fragment_instance_id="
+  //         << PrintId(fragment_instance_id_) << " dest_node=" << dest_node_id_
+  //         << " #rows= " << batch_->num_rows();
 
   // We can return an error here and not go on to send the EOS RPC because the error that
   // we returned will be sent to the coordinator who will then cancel all the remote
   // fragments including the one that this sender is sending to.
-  if (batch_->num_rows() > 0) RETURN_IF_ERROR(SendCurrentBatch());
-  return Status::OK();
-}
+  //RETURN_IF_ERROR(FlushRowCollector(true));
+  //if (!collector_batch_->IsEmpty()) {
+  //  RETURN_IF_ERROR(parent_->PrepareBatchForSend(collector_batch_.get(), !is_local_));
+  //  RETURN_IF_ERROR(SendCurrentBatch());
+  //}
+
+  //return Status::OK();
+//}
 
 Status KrpcDataStreamSender::Channel::SendEosAsync() {
-  VLOG_RPC << "Channel::SendEosAsync() fragment_instance_id="
-           << PrintId(fragment_instance_id_) << " dest_node=" << dest_node_id_
-           << " #rows= " << batch_->num_rows();
-  DCHECK_EQ(0, batch_->num_rows()) << "Batches must be flushed";
+  //VLOG_RPC << "Channel::SendEosAsync() fragment_instance_id="
+  //         << PrintId(fragment_instance_id_) << " dest_node=" << dest_node_id_
+  //         << " #rows= " << batch_->num_rows();
+  //DCHECK_EQ(row_collector_pos_, row_collector_.begin());
+  DCHECK(collector_batch_->IsEmpty()) << "Batches must be flushed";
   {
     std::unique_lock<SpinLock> l(lock_);
     DCHECK(!rpc_in_flight_);
@@ -743,6 +791,38 @@ Status KrpcDataStreamSender::Channel::SendEosAsync() {
   return Status::OK();
 }
 
+/*
+Status KrpcDataStreamSender::Channel::FlushRowCollector(bool final_flush) {
+  if (row_collector_pos_ == row_collector_.begin()) return Status::OK();
+  int rows_to_append = row_collector_pos_ - row_collector_.begin();
+  int remaining_capacity = row_batch_capacity_ - rows_in_collector_batch_;
+  const TupleRow** src = row_collector_.data();
+  if (rows_to_append >= remaining_capacity) {
+    // Fill the current collector_batch_ and send it.
+    RETURN_IF_ERROR(collector_batch_->AppendRows(src,
+        remaining_capacity, parent_->row_desc_));
+    src += remaining_capacity;
+    rows_to_append -= remaining_capacity;
+    rows_in_collector_batch_ = 0;
+    RETURN_IF_ERROR(parent_->PrepareBatchForSend(collector_batch_.get(), !is_local_));
+     // This swaps collector_batch_ with an empty batch.
+    RETURN_IF_ERROR(SendCurrentBatch());
+    collector_batch_->Reset();
+  }
+  DCHECK_GE(rows_to_append, 0);
+  if (rows_to_append > 0) {
+    RETURN_IF_ERROR(collector_batch_->AppendRows(src,
+      rows_to_append, parent_->row_desc_));
+  }
+  rows_in_collector_batch_ += rows_to_append;
+  DCHECK_LT(rows_in_collector_batch_, row_batch_capacity_);
+  row_collector_pos_ = row_collector_.begin();
+  return Status::OK();
+}
+*/
+
+
+
 void KrpcDataStreamSender::Channel::Teardown(RuntimeState* state) {
   // Normally, the channel should have been flushed before calling Teardown(), which means
   // that all the data should already be drained. If the fragment was was closed or
@@ -755,8 +835,9 @@ void KrpcDataStreamSender::Channel::Teardown(RuntimeState* state) {
     rpc_controller_.Cancel();
     while (rpc_in_flight_) rpc_done_cv_.wait(l);
   }
-  batch_.reset();
+  //batch_.reset();
   outbound_batch_.reset(nullptr);
+  collector_batch_.reset(nullptr);
 }
 
 /// Channel's AddRow() and the generic serialization methods are inefficient for
@@ -848,6 +929,11 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
         destination.krpc_backend(), destination.fragment_instance_id(), sink.dest_node_id,
         per_channel_buffer_size, is_local));
 
+    if (partition_type_  == TPartitionType::HASH_PARTITIONED) {
+      partition_row_collectors_.emplace_back();
+      partition_row_collectors_.back().channel_ = channels_.back().get();
+    }
+
     if (IsDirectedMode()) {
       DCHECK(host_to_channel_.find(destination.address()) == host_to_channel_.end());
       host_to_channel_[destination.address()] = channels_.back().get();
@@ -885,6 +971,15 @@ Status KrpcDataStreamSender::Prepare(
   RETURN_IF_ERROR(ScalarExprEvaluator::Create(partition_exprs_, state, state->obj_pool(),
       expr_perm_pool_.get(), expr_results_pool_.get(), &partition_expr_evals_));
   serialize_batch_timer_ = ADD_TIMER(profile(), "SerializeBatchTime");
+  send_batch_timer_ = ADD_TIMER(profile(), "SendBatchTime");
+  deepcopy_timer_ = ADD_TIMER(profile(), "DeepCopyTime");
+  do_transmit_data_timer_ = ADD_TIMER(profile(), "DoTransmitDataTime");
+  transmit_data_async_timer_ = ADD_TIMER(profile(), "TransmitDataAsyncTime");;
+  if (partition_type_ == TPartitionType::HASH_PARTITIONED
+      || partition_type_ == TPartitionType::KUDU) {
+    //partition_rows_timer_ = ADD_TIMER(profile(), "PartitionRowsTime");
+    //deepcopy_rows_timer_ =  ADD_TIMER(profile(), "DeepCopyRowsTime");
+  }
   rpc_retry_counter_ = ADD_COUNTER(profile(), "RpcRetry", TUnit::UNIT);
   rpc_failure_counter_ = ADD_COUNTER(profile(), "RpcFailure", TUnit::UNIT);
   bytes_sent_counter_ = ADD_COUNTER(profile(), "TotalBytesSent", TUnit::BYTES);
@@ -901,6 +996,10 @@ Status KrpcDataStreamSender::Prepare(
   uncompressed_bytes_counter_ =
       ADD_COUNTER(profile(), "UncompressedRowBatchSize", TUnit::BYTES);
   total_sent_rows_counter_ = ADD_COUNTER(profile(), "RowsSent", TUnit::UNIT);
+
+  row_batches_counter_ =  ADD_COUNTER(profile(), "RowBatches", TUnit::UNIT);
+  row_batches_with_buffers_ =  ADD_COUNTER(profile(), "RowBatchesWithBuffers", TUnit::UNIT);
+  row_batches_sent_ =  ADD_COUNTER(profile(), "RowBatcheSent", TUnit::UNIT);;
 
   outbound_rb_mem_tracker_.reset(
       new MemTracker(-1, "RowBatchSerialization", mem_tracker_.get()));
@@ -919,6 +1018,10 @@ Status KrpcDataStreamSender::Prepare(
 
   for (int i = 0; i < channels_.size(); ++i) {
     RETURN_IF_ERROR(channels_[i]->Init(state, char_mem_tracker_allocator_));
+  }
+  for (PartitionRowCollector& collector: partition_row_collectors_) {
+    collector.collector_batch_.reset(new OutboundRowBatch(char_mem_tracker_allocator_));
+    collector.row_batch_capacity_ = collector.channel_->RowBatchCapacity();
   }
   for (auto& [ch, ice_ch] : channel_to_ice_channel_) {
     ice_ch->Prepare(mem_tracker_.get());
@@ -1098,6 +1201,11 @@ void KrpcDataStreamSenderConfig::Codegen(FragmentState* state) {
         codegen->GetI32Constant(num_channels_), "GetNumChannels");
     DCHECK_EQ(num_replaced, 1);
 
+    num_replaced = codegen->ReplaceCallSitesWithValue(hash_and_add_rows_fn,
+        codegen->GetI32Constant(input_row_desc_->num_tuples_no_inline()), "num_tuples_no_inline");
+    DCHECK_EQ(num_replaced, 1);
+    LOG(INFO) << "num_tuples_no_inline replaced" << num_replaced;
+
     // Replace HashRow() with the handcrafted IR function.
     num_replaced = codegen->ReplaceCallSites(hash_and_add_rows_fn,
         hash_row_fn, KrpcDataStreamSender::HASH_ROW_SYMBOL);
@@ -1115,7 +1223,14 @@ void KrpcDataStreamSenderConfig::Codegen(FragmentState* state) {
 }
 
 Status KrpcDataStreamSender::AddRowToChannel(const int channel_id, TupleRow* row) {
-  return channels_[channel_id]->AddRow(row);
+  Channel& channel = *channels_[channel_id];
+  DCHECK(channel.row_collector_pos_ < channel.row_collector_end_);
+  //*channel.row_collector_pos_ = row;
+  //if (++channel.row_collector_pos_ == channel.row_collector_end_) {
+  //  RETURN_IF_ERROR(channel.FlushRowCollector(false));
+  //  DCHECK(channel.row_collector_pos_ == channel.row_collector_.begin());
+  //}
+  return Status::OK();
 }
 
 uint64_t KrpcDataStreamSender::HashRow(TupleRow* row, uint64_t seed) {
@@ -1136,7 +1251,14 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
   DCHECK(!closed_);
   DCHECK(!flushed_);
 
+
   if (batch->num_rows() == 0) return Status::OK();
+
+  COUNTER_ADD(row_batches_counter_, 1);
+  if (batch->num_buffers() > 0 || batch->flush_mode() != RowBatch::FlushMode::NO_FLUSH_RESOURCES || batch->needs_deep_copy() || batch->tuple_data_pool()->total_reserved_bytes() >0) {
+    COUNTER_ADD(row_batches_with_buffers_, 1);
+  }
+
   if (partition_type_ == TPartitionType::UNPARTITIONED) {
     // Only skip compression if there is a single channel and destination is in the same
     // process. TODO: could be optimized to send the uncompressed buffer to the local
@@ -1161,12 +1283,12 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
     RETURN_IF_ERROR(current_channel->SerializeAndSendBatch(batch));
     current_channel_idx_ = (current_channel_idx_ + 1) % channels_.size();
   } else if (partition_type_ == TPartitionType::KUDU) {
+    //SCOPED_TIMER(partition_rows_timer_);
     DCHECK_EQ(partition_expr_evals_.size(), 1);
     int num_channels = channels_.size();
     const int num_rows = batch->num_rows();
     const int hash_batch_size = RowBatch::HASH_BATCH_SIZE;
     int channel_ids[hash_batch_size];
-
     for (int batch_start = 0; batch_start < num_rows; batch_start += hash_batch_size) {
       int batch_window_size = min(num_rows - batch_start, hash_batch_size);
       for (int i = 0; i < batch_window_size; ++i) {
@@ -1184,9 +1306,16 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
 
       for (int i = 0; i < batch_window_size; ++i) {
         TupleRow* row = batch->GetRow(i + batch_start);
-        RETURN_IF_ERROR(channels_[channel_ids[i]]->AddRow(row));
+        RETURN_IF_ERROR(AddRowToChannel(channel_ids[i], row));
       }
     }
+    //if (batch->flush_mode() != RowBatch::FlushMode::NO_FLUSH_RESOURCES) {
+      //SCOPED_TIMER(deepcopy_rows_timer_);
+      // Flush rows.
+      /*for (auto& ch: channels_) {
+        RETURN_IF_ERROR(ch->FlushRowCollector(false));
+      }*/
+    //}
   } else if (partition_type_ == TPartitionType::DIRECTED) {
     const int num_rows = batch->num_rows();
     char* prev_filename_ptr = nullptr;
@@ -1254,13 +1383,23 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
     }
   } else {
     DCHECK_EQ(partition_type_, TPartitionType::HASH_PARTITIONED);
-    const KrpcDataStreamSenderConfig::HashAndAddRowsFn hash_and_add_rows_fn =
-        hash_and_add_rows_fn_.load();
-    if (hash_and_add_rows_fn != nullptr) {
-      RETURN_IF_ERROR(hash_and_add_rows_fn(this, batch));
-    } else {
-      RETURN_IF_ERROR(HashAndAddRows(batch));
+    {
+      //SCOPED_TIMER(partition_rows_timer_);
+      const KrpcDataStreamSenderConfig::HashAndAddRowsFn hash_and_add_rows_fn =
+          hash_and_add_rows_fn_.load();
+      if (hash_and_add_rows_fn != nullptr) {
+        RETURN_IF_ERROR(hash_and_add_rows_fn(this, batch));
+      } else {
+        RETURN_IF_ERROR(HashAndAddRows(batch));
+      }
     }
+    //if (batch->flush_mode() != RowBatch::FlushMode::NO_FLUSH_RESOURCES) {
+      //SCOPED_TIMER(deepcopy_rows_timer_);
+      // Flush rows.
+      /*for (auto& ch: channels_) {
+        RETURN_IF_ERROR(ch->FlushRowCollector(false));
+      }*/
+    //}
   }
   COUNTER_ADD(total_sent_rows_counter_, batch->num_rows());
   expr_results_pool_->Clear();
@@ -1301,9 +1440,12 @@ Status KrpcDataStreamSender::FlushFinal(RuntimeState* state) {
   for (auto& [ch, ice_ch] : channel_to_ice_channel_) {
     RETURN_IF_ERROR(ice_ch->Flush());
   }
-  for (unique_ptr<Channel>& channel : channels_) {
-    RETURN_IF_ERROR(channel->FlushBatches());
+  for (PartitionRowCollector& collector: partition_row_collectors_) {
+    RETURN_IF_ERROR(collector.SendCurrentBatch());
   }
+  //for (unique_ptr<Channel>& channel : channels_) {
+  //  RETURN_IF_ERROR(channel->FlushBatches());
+  // }
   for (unique_ptr<Channel>& channel : channels_) {
     RETURN_IF_ERROR(channel->WaitForRpc());
   }
@@ -1323,6 +1465,8 @@ void KrpcDataStreamSender::Close(RuntimeState* state) {
   for (auto& [ch, ice_ch] : channel_to_ice_channel_) {
     ice_ch->Teardown();
   }
+
+  partition_row_collectors_.clear();
 
   for (int i = 0; i < channels_.size(); ++i) {
     channels_[i]->Teardown(state);
@@ -1346,6 +1490,7 @@ Status KrpcDataStreamSender::SerializeBatch(
   VLOG_ROW << "serializing " << src->num_rows() << " rows";
   {
     SCOPED_TIMER(serialize_batch_timer_);
+    //compress=false;
     RETURN_IF_ERROR(
         src->Serialize(dest, compress ? compression_scratch_.get() : nullptr));
     int64_t uncompressed_bytes = RowBatch::GetDeserializedSize(*dest);
@@ -1353,6 +1498,19 @@ Status KrpcDataStreamSender::SerializeBatch(
   }
   return Status::OK();
 }
+
+Status KrpcDataStreamSender::PrepareBatchForSend(OutboundRowBatch* batch, bool compress) {
+  {
+    SCOPED_TIMER(serialize_batch_timer_);
+    RETURN_IF_ERROR(
+        batch->PrepareForSend(row_desc_->tuple_descriptors().size(), 
+        compress ? compression_scratch_.get() : nullptr));
+    int64_t uncompressed_bytes = RowBatch::GetDeserializedSize(*batch);
+    COUNTER_ADD(uncompressed_bytes_counter_, uncompressed_bytes);
+  }
+  return Status::OK();
+}
+
 
 int64_t KrpcDataStreamSender::GetNumDataBytesSent() const {
   return bytes_sent_counter_->value();

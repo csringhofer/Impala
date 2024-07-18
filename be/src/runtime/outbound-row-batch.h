@@ -20,6 +20,7 @@
 #include <cstring>
 #include <vector>
 
+#include "codegen/impala-ir.h"
 #include "gen-cpp/row_batch.pb.h"
 #include "kudu/util/slice.h"
 #include "runtime/mem-tracker.h"
@@ -29,7 +30,11 @@ namespace impala {
 template <typename K, typename V> class FixedSizeHashTable;
 class MemTracker;
 class RowBatchSerializeTest;
+class RowDescriptor;
 class RuntimeState;
+class Tuple;
+class TupleDescriptor;
+class TupleRow;
 
 /// A KRPC outbound row batch which contains the serialized row batch header and buffers
 /// for holding the tuple offsets and tuple data.
@@ -70,10 +75,23 @@ class OutboundRowBatch {
   // Also sets the header.
   Status PrepareForSend(int num_tuples_per_row, TrackedString* compression_scratch);
 
+  void Reset();
+
+  bool IsEmpty() { return tuple_offsets_.empty(); }
+
+  /*typedef vector<const TupleRow*>  RowCollector;
+  Status AppendRows(const TupleRow** begin, int rows_to_append,
+      const RowDescriptor* row_desc);
+*/
+
+  inline Status IR_ALWAYS_INLINE AppendRow(const TupleRow* row, const RowDescriptor* row_desc);
+
  private:
   friend class IcebergPositionDeleteCollector;
   friend class RowBatch;
   friend class RowBatchSerializeBaseline;
+
+  inline bool IR_ALWAYS_INLINE TryAppendTuple(const Tuple* tuple, const TupleDescriptor* desc);
 
   // Try compressing tuple_data to compression_scratch, swap if compressed data is
   // smaller.
@@ -93,6 +111,9 @@ class OutboundRowBatch {
 
   /// Contains the actual data of all the tuples. The data could be compressed.
   TrackedString tuple_data_;
+
+  int tuple_data_offset_ = 0;
+  int64_t tuple_data_size_ = 0;
 };
 
 }

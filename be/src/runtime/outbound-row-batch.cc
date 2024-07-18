@@ -16,6 +16,7 @@
 // under the License.
 
 #include "runtime/outbound-row-batch.h"
+#include "runtime/outbound-row-batch.inline.h"
 #include "util/compress.h"
 #include "util/scope-exit-trigger.h"
 
@@ -24,6 +25,8 @@ namespace impala {
 Status OutboundRowBatch::PrepareForSend(int num_tuples_per_row,
     TrackedString* compression_scratch) {
   bool is_compressed = false;
+  DCHECK_GE(tuple_data_.size(), tuple_data_offset_);
+  tuple_data_.resize(tuple_data_offset_);
   int64_t uncompressed_size = tuple_data_.size();
   if (uncompressed_size > 0 && compression_scratch != nullptr) {
     RETURN_IF_ERROR(TryCompress(compression_scratch, &is_compressed));
@@ -31,6 +34,7 @@ Status OutboundRowBatch::PrepareForSend(int num_tuples_per_row,
   int num_tuples = tuple_offsets_.size();
   DCHECK_EQ(num_tuples % num_tuples_per_row, 0);
   int num_rows = num_tuples / num_tuples_per_row;
+  //LOG(INFO) << "num_rows " << num_rows << " uncompressed_size " << uncompressed_size;
   SetHeader(num_rows, num_tuples_per_row, uncompressed_size, is_compressed);
   return Status::OK();
 }
@@ -44,7 +48,7 @@ Status OutboundRowBatch::TryCompress(TrackedString* compression_scratch,
       MakeScopeExitTrigger([&compressor]() { compressor.Close(); });
 
   *is_compressed = false;
-  int64_t uncompressed_size = tuple_data_.size();
+  int64_t uncompressed_size = tuple_data_offset_;
   // If the input size is too large for LZ4 to compress, MaxOutputLen() will return 0.
   int64_t compressed_size = compressor.MaxOutputLen(uncompressed_size);
   if (compressed_size == 0) {
@@ -81,5 +85,40 @@ void OutboundRowBatch::SetHeader(int num_rows, int num_tuples_per_row,
   header_.set_compression_type(
       is_compressed ? CompressionTypePB::LZ4 : CompressionTypePB::NONE);
 }
+
+void OutboundRowBatch::Reset() {
+  header_.Clear();
+  tuple_offsets_.clear();
+  tuple_data_offset_ = 0;
+  tuple_data_size_ = 0;
+  // Do not clear tuple_data_ to avoid unnecessary delete + allocate.
+}
+
+/*
+Status OutboundRowBatch::AppendRows(const TupleRow** begin,
+    int rows_to_append, const RowDescriptor* row_desc) {
+  const TupleRow** end = begin + rows_to_append;
+  int64_t size = 0;
+  if (row_desc->HasVarlenSlots() || row_desc->IsAnyTupleNullable()) {
+    for (const TupleRow** it = begin; it != end; it++) {
+      size += (*it)->TotalByteSize(row_desc, true);
+    }
+  } else { 
+    size = rows_to_append * row_desc->GetRowSize();
+  }
+  tuple_data_size_ += size;
+  if (tuple_data_size_ > tuple_data_.size()) {
+    if (tuple_data_size_ > numeric_limits<int32_t>::max()) {
+      return Status(
+          TErrorCode::ROW_BATCH_TOO_LARGE, size, numeric_limits<int32_t>::max());
+    }
+    tuple_data_.resize(tuple_data_size_);
+  }
+  for (const TupleRow** it = begin; it != end; it++) {
+    AppendRowInner(*it, row_desc);
+  }
+  return Status::OK();
+}
+*/
 
 }
