@@ -173,6 +173,10 @@ class KrpcDataStreamSender : public DataSink {
   Status SerializeBatch(
       RowBatch* src, OutboundRowBatch* dest, bool compress, int num_receivers = 1);
 
+  // Like SerializeBatch, but the batch is already serialized and only compression is
+  // needed.
+  Status PrepareBatchForSend(OutboundRowBatch* batch, bool compress);
+
   /// Returns 'partition_expr_evals_[i]'. Used by the codegen'd HashRow() IR function.
   ScalarExprEvaluator* GetPartitionExprEvaluator(int i);
 
@@ -243,6 +247,8 @@ class KrpcDataStreamSender : public DataSink {
 
   /// Time for serializing row batches.
   RuntimeProfile::Counter* serialize_batch_timer_ = nullptr;
+  //RuntimeProfile::Counter* partition_rows_timer_ = nullptr;
+  //RuntimeProfile::Counter* deepcopy_rows_timer_ = nullptr;
 
   /// Number of TransmitData() RPC retries due to remote service being busy.
   RuntimeProfile::Counter* rpc_retry_counter_ = nullptr;
@@ -264,6 +270,11 @@ class KrpcDataStreamSender : public DataSink {
 
   /// Total number of rows sent.
   RuntimeProfile::Counter* total_sent_rows_counter_ = nullptr;
+
+  /// Total number of rows sent.
+  RuntimeProfile::Counter* row_batches_counter_ = nullptr;
+  RuntimeProfile::Counter* row_batches_with_buffers_ = nullptr;
+
 
   /// Summary of network throughput for sending row batches. Network time also includes
   /// queuing time in KRPC transfer queue for transmitting the RPC requests and receiving

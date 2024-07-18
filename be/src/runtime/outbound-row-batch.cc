@@ -16,6 +16,7 @@
 // under the License.
 
 #include "runtime/outbound-row-batch.h"
+#include "runtime/outbound-row-batch.inline.h"
 #include "util/compress.h"
 #include "util/scope-exit-trigger.h"
 
@@ -80,6 +81,47 @@ void OutboundRowBatch::SetHeader(int num_rows, int num_tuples_per_row,
   header_.set_uncompressed_size(uncompressed_size);
   header_.set_compression_type(
       is_compressed ? CompressionTypePB::LZ4 : CompressionTypePB::NONE);
+}
+
+void OutboundRowBatch::Reset() {
+  header_.Clear();
+  tuple_offsets_.clear();
+  tuple_data_offset_ = 0;
+  tuple_data_size_ = 0;
+  // Do not clear tuple_data_ to avoid unnecessary delete + allocate.
+}
+
+Status OutboundRowBatch::AppendRows(RowCollector::iterator begin,
+    int rows_to_append, const RowDescriptor* row_desc) {
+  RowCollector::iterator end = begin + rows_to_append;
+  int64_t size = 0;
+  if (row_desc->HasVarlenSlots() || row_desc->IsAnyTupleNullable()) {
+    for (RowCollector::iterator it = begin; it != end; it++) {
+      /* TODO: why is it not smallified? */
+      size += (*it)->TotalByteSize(row_desc, true /*assume_smallify*/);
+    }
+  } else { 
+    size = rows_to_append * row_desc->GetRowSize();
+  }
+  /*if (tuple_data_size_ == 0) {
+    // Guess how much space will be needed.
+    float byte_per_row = (float) size / rows_to_append;
+    int tuples_per_row = row_desc->tuple_descriptors().size();
+    int capacity = tuple_offsets_.size() / tuples_per_row;
+    int estimated_size = byte_per_row * 
+  }*/
+  tuple_data_size_ += size;
+  if (tuple_data_size_ > tuple_data_.size()) {
+    if (tuple_data_size_ > numeric_limits<int32_t>::max()) {
+      return Status(
+          TErrorCode::ROW_BATCH_TOO_LARGE, size, numeric_limits<int32_t>::max());
+    }
+    tuple_data_.resize(tuple_data_size_);
+  }
+  for (RowCollector::iterator it = begin; it != end; it++) {
+    AppendRow(*it, row_desc);
+  }
+  return Status::OK();
 }
 
 }
