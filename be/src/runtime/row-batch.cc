@@ -264,7 +264,7 @@ Status RowBatch::Serialize(DedupMap* distinct_tuples, OutboundRowBatch* output_b
 
   RETURN_IF_ERROR(SerializeInternal(size, distinct_tuples, tuple_offsets, tuple_data));
   RETURN_IF_ERROR(output_batch->PrepareForSend(row_desc_->tuple_descriptors().size(),
-      compression_scratch));
+      compression_scratch, false));
   return Status::OK();
 }
 

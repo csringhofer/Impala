@@ -107,6 +107,7 @@ public:
       }
     }
     DCHECK_EQ(offset, tuple_data_size);
+    dest->tuple_data_offset_ = tuple_data_size;
     Reset();
     return Status::OK();
   }
