@@ -17,6 +17,7 @@
 
 #include "exprs/scalar-expr-evaluator.h"
 #include "runtime/krpc-data-stream-sender.h"
+#include "runtime/outbound-row-batch.inline.h"
 #include "runtime/raw-value.h"
 #include "runtime/row-batch.h"
 
@@ -39,9 +40,25 @@ Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
     }
     row_count = 0;
     FOREACH_ROW_LIMIT(batch, row_idx, RowBatch::HASH_BATCH_SIZE, row_batch_iter) {
-      RETURN_IF_ERROR(AddRowToChannel(channel_ids[row_count++], row_batch_iter.Get()));
+      int channel_id = channel_ids[row_count++];
+      PartitionRowCollector& collector = partition_row_collectors_[channel_id];
+      RETURN_IF_ERROR(collector.AppendRow(row_batch_iter.Get(), row_desc_));
     }
     row_idx += row_count;
+  }
+  return Status::OK();
+}
+
+Status KrpcDataStreamSender::PartitionRowCollector::AppendRow(
+    const TupleRow* row, const RowDescriptor* row_desc) {
+  DCHECK_LT(num_rows_, row_batch_capacity_);
+  num_rows_++;
+  RETURN_IF_ERROR(collector_batch_->AppendRow(row, row_desc));
+  DCHECK_GT(row_batch_capacity_, 0);
+  if (UNLIKELY(
+      num_rows_ == row_batch_capacity_ || collector_batch_->ReachedSizeLimit())) {
+     // This swaps collector_batch_ with an empty batch.
+    RETURN_IF_ERROR(SendCurrentBatch());
   }
   return Status::OK();
 }
