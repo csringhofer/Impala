@@ -94,12 +94,27 @@ Tuple* Tuple::DeepCopy(const TupleDescriptor& desc, MemPool* pool) const {
   return result;
 }
 
+inline void Tuple::SmallifyStrings(const TupleDescriptor& desc) {
+  for (const SlotDescriptor* slot : desc.string_slots()) {
+    DCHECK(slot->type().IsVarLenStringType());
+    if (IsNull(slot->null_indicator_offset())) continue;
+    StringValue* string_v = GetStringSlot(slot->tuple_offset());
+    // StringValues are only smallified on a on-demand basis. And we only smallify
+    // them in batches for whole tuples. I.e. if we encounter the first small string
+    // in a tuple we can assume that the rest of the strings are already smallified.
+    if (string_v->IsSmall()) return;
+    string_v->Smallify();
+  }
+}
+
 // TODO: the logic is very similar to the other DeepCopy implementation aside from how
 // memory is allocated - can we templatise it somehow to avoid redundancy without runtime
 // overhead.
 void Tuple::DeepCopy(Tuple* dst, const TupleDescriptor& desc, MemPool* pool) const {
   if (desc.HasVarlenSlots()) {
     memcpy(dst, this, desc.byte_size());
+    // 'dst' is a new tuple, so it is safe to smallify its string values.
+    dst->SmallifyStrings(desc);
     dst->DeepCopyVarlenData(desc, pool);
   } else {
     memcpy(dst, this, desc.byte_size());
@@ -113,9 +128,7 @@ void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, MemPool* pool) {
     DCHECK((*slot)->type().IsVarLenStringType());
     if (IsNull((*slot)->null_indicator_offset())) continue;
     StringValue* string_v = GetStringSlot((*slot)->tuple_offset());
-    // It is safe to smallify at this point as DeepCopyVarlenData is called on the new
-    // tuple which can be modified.
-    if (string_v->Smallify()) continue;
+    if (string_v->IsSmall()) continue;
     char* string_copy = reinterpret_cast<char*>(pool->Allocate(string_v->Len()));
     Ubsan::MemCpy(string_copy, string_v->Ptr(), string_v->Len());
     string_v->SetPtr(string_copy);
@@ -147,7 +160,11 @@ void Tuple::DeepCopy(const TupleDescriptor& desc, char** data, int* offset,
   memcpy(dst, this, desc.byte_size());
   *data += desc.byte_size();
   *offset += desc.byte_size();
-  if (desc.HasVarlenSlots()) dst->DeepCopyVarlenData(desc, data, offset, convert_ptrs);
+  if (desc.HasVarlenSlots()) {
+    // 'dst' is a new tuple, so it is safe to smallify its string values.
+    dst->SmallifyStrings(desc);
+    dst->DeepCopyVarlenData(desc, data, offset, convert_ptrs);
+  }
 }
 
 void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* offset,
@@ -158,9 +175,7 @@ void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* of
     if (IsNull((*slot)->null_indicator_offset())) continue;
 
     StringValue* string_v = GetStringSlot((*slot)->tuple_offset());
-    // It is safe to smallify at this point as DeepCopyVarlenData is called on the new
-    // tuple which can be modified.
-    if (string_v->Smallify()) continue;
+    if (string_v->IsSmall()) continue;
     unsigned int len = string_v->Len();
     Ubsan::MemCpy(*data, string_v->Ptr(), len);
     string_v->SetPtr(convert_ptrs ? reinterpret_cast<char*>(*offset) : *data);
