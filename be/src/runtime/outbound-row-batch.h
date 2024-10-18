@@ -28,11 +28,14 @@
 namespace impala {
 
 template <typename K, typename V> class FixedSizeHashTable;
+class DeepCopyHelper;
 class MemTracker;
 class RowBatchSerializeTest;
 class RowDescriptor;
 class RuntimeState;
+class SlotOffsets;
 class Tuple;
+class TupleDeepCopyInfo;
 class TupleDescriptor;
 class TupleRow;
 
@@ -84,14 +87,17 @@ class OutboundRowBatch {
       const RowDescriptor* row_desc);
 */
 
-  inline Status IR_ALWAYS_INLINE AppendRow(const TupleRow* row, const RowDescriptor* row_desc);
+  inline Status IR_ALWAYS_INLINE AppendRow(const TupleRow* row,
+      const RowDescriptor* row_desc, const DeepCopyHelper* deep_copy_helper);
 
  private:
   friend class IcebergPositionDeleteCollector;
   friend class RowBatch;
   friend class RowBatchSerializeBaseline;
 
-  inline bool IR_ALWAYS_INLINE TryAppendTuple(const Tuple* tuple, const TupleDescriptor* desc);
+  inline bool IR_ALWAYS_INLINE TryAppendTuple(
+      const Tuple* tuple, const TupleDescriptor* desc,
+      const TupleDeepCopyInfo& tuple_info, const DeepCopyHelper* deep_copy_helper/*const SlotOffsets* string_slot_offsets*/);
 
   // Try compressing tuple_data to compression_scratch, swap if compressed data is
   // smaller.

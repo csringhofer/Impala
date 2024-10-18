@@ -27,6 +27,7 @@
 #include "common/global-types.h"
 #include "common/object-pool.h"
 #include "common/status.h"
+#include "runtime/deep-copy-helper.h"
 #include "exec/data-sink.h"
 #include "exprs/scalar-expr.h"
 #include "runtime/mem-tracker.h"
@@ -38,6 +39,7 @@
 
 namespace impala {
 
+class DeepCopyHelper;
 class KrpcDataStreamSender;
 class MemTracker;
 class NetworkAddressPB;
@@ -69,6 +71,8 @@ class KrpcDataStreamSenderConfig : public DataSinkConfig {
 
   /// Hash seed used for exchanges. Query id will be used to seed the hash function.
   uint64_t exchange_hash_seed_;
+
+  std::unique_ptr<DeepCopyHelper> deep_copy_helper_;
 
   /// Type and pointer for the codegen'd KrpcDataStreamSender::HashAndAddRows()
   /// function. NULL if codegen is disabled or failed.
@@ -172,11 +176,13 @@ class KrpcDataStreamSender : public DataSink {
     int row_batch_capacity_ = 0;
   
 
-    Status IR_ALWAYS_INLINE FlushSingleRow(const TupleRow* row, const RowDescriptor* row_desc);
+    Status IR_ALWAYS_INLINE FlushSingleRow(const TupleRow* row,
+        const RowDescriptor* row_desc, const DeepCopyHelper* deep_copy_helper);
     bool AtCapacity() { return num_rows_ == row_batch_capacity_; }
     Status SendCurrentBatch();
   };
   std::vector<PartitionRowCollector> partition_row_collectors_;
+  const DeepCopyHelper* deep_copy_helper_;
 
   /// Serializes the src batch into the serialized row batch 'dest' and updates
   /// various stat counters.

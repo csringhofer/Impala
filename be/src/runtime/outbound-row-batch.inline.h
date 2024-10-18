@@ -19,27 +19,34 @@
 
 #include "runtime/outbound-row-batch.h"
 
+#include "runtime/deep-copy-helper.h"
 #include "runtime/descriptors.h"
 #include "runtime/tuple.h"
 #include "runtime/tuple-row.h"
 
 namespace impala {
 
-Status OutboundRowBatch::AppendRow(const TupleRow* row, const RowDescriptor* row_desc) {
+Status OutboundRowBatch::AppendRow(const TupleRow* row,
+    const RowDescriptor* row_desc, const DeepCopyHelper* deep_copy_helper) {
   DCHECK(row != nullptr);
-  int num_tuples = row_desc->num_tuples_no_inline();
+  int num_tuples = deep_copy_helper->num_tuples_no_inline();
+  DCHECK_GT(num_tuples, 0);
+  const TupleDeepCopyInfo* tuple_infos = deep_copy_helper->tuple_info_no_inline();
+  DCHECK(tuple_infos != nullptr);
+  //const SlotOffsets* string_slot_offsets = deep_copy_helper->string_slots_no_inline();
   vector<TupleDescriptor*>::const_iterator desc =
       row_desc->tuple_descriptors().begin();
   for (int j = 0; j < num_tuples; ++desc, ++j) {
     Tuple* tuple = row->GetTuple(j);
-    if (UNLIKELY(tuple == nullptr)) {
+    if (UNLIKELY(tuple_infos[j].nullable && tuple == nullptr)) {
       // NULLs are encoded as -1
       tuple_offsets_.push_back(-1);
       continue;
     } 
     // Record offset before creating copy (which increments offset and tuple_data)
     tuple_offsets_.push_back(tuple_data_offset_);
-    if (!TryAppendTuple(tuple, *desc)) {
+    //DCHECK(tuple_infos[j].num_string_slots == 0 || string_slot_offsets != nullptr);
+    if (!TryAppendTuple(tuple, *desc, tuple_infos[j], deep_copy_helper /*string_slot_offsets*/)) {
       int64_t tuple_size = tuple->TotalByteSize(**desc, true /*assume_smallify*/);
       int64_t new_size = tuple_data_offset_ + tuple_size;
       if (new_size > numeric_limits<int32_t>::max()) {
@@ -51,7 +58,7 @@ Status OutboundRowBatch::AppendRow(const TupleRow* row, const RowDescriptor* row
       tuple_data_.resize(tuple_data_.capacity()); // TODO: use a vector instead....
       //LOG(INFO) << "tuple size " << tuple_size << " size " << tuple_data_.size() << " capacity " << tuple_data_.capacity() << " tuple num " << tuple_offsets_.size();
       DCHECK_GT(tuple_data_.size(), 0);
-      bool retry_successful = TryAppendTuple(tuple, *desc);
+      bool retry_successful = TryAppendTuple(tuple, *desc, tuple_infos[j], deep_copy_helper /*string_slot_offsets*/);
       DCHECK(retry_successful);
     }
     DCHECK_LE(tuple_data_offset_, tuple_data_.size());
@@ -60,7 +67,8 @@ Status OutboundRowBatch::AppendRow(const TupleRow* row, const RowDescriptor* row
   return Status::OK();
 }
 
-bool OutboundRowBatch::TryAppendTuple(const Tuple* tuple, const TupleDescriptor* desc) {
+bool OutboundRowBatch::TryAppendTuple(const Tuple* tuple, const TupleDescriptor* desc,
+    const TupleDeepCopyInfo& tuple_info, const DeepCopyHelper* deep_copy_helper /*const SlotOffsets* string_slot_offsets*/) {
   DCHECK(tuple != nullptr);
   DCHECK(desc != nullptr);
   if (tuple_data_.size() == 0) return false;
@@ -69,7 +77,7 @@ bool OutboundRowBatch::TryAppendTuple(const Tuple* tuple, const TupleDescriptor*
   uint8_t* dst = reinterpret_cast<uint8_t*>(&tuple_data_[0]) + tuple_data_offset_;
   uint8_t* dst_end = reinterpret_cast<uint8_t*>(&tuple_data_[0]) + tuple_data_.size();
   return tuple->TryDeepCopy(
-      &dst, dst_end, &tuple_data_offset_, *desc, /* convert_ptrs */ true);
+      &dst, dst_end, &tuple_data_offset_, *desc, tuple_info, /*string_slot_offsets,*/ deep_copy_helper, /* convert_ptrs */ true);
 }
 
 }

@@ -35,26 +35,15 @@ class Constant;
 namespace impala {
 
 struct CollectionValue;
+class DeepCopyHelper;
 class RuntimeState;
 class StringValue;
 class ScalarExpr;
 class ScalarExprEvaluator;
+class SlotOffsets;
+class TupleDeepCopyInfo;
 class TupleDescriptor;
 class TupleRow;
-
-/// Minimal struct to hold slot offset information from a SlotDescriptor. Designed
-/// to simplify constant substitution in CodegenCopyStrings() and allow more efficient
-/// interpretation in CopyStrings().
-struct SlotOffsets {
-  NullIndicatorOffset null_indicator_offset;
-  int tuple_offset;
-
-  /// Generate an LLVM Constant containing the offset values of this SlotOffsets instance.
-  /// Needs to be updated if the layout of this struct changes.
-  llvm::Constant* ToIR(LlvmCodeGen* codegen) const;
-
-  static const char* LLVM_CLASS_NAME;
-};
 
 /// A tuple is stored as a contiguous sequence of bytes containing a fixed number
 /// of fixed-size slots along with a bit vector containing null indicators
@@ -236,8 +225,10 @@ class Tuple {
       const SlotOffsets* string_slot_offsets, int num_string_slots, MemPool* pool,
       Status* status) noexcept;
 
-  bool TryDeepCopy(uint8_t** dst_start, const uint8_t* dst_end, int* offset,
-      const TupleDescriptor& desc, bool convert_ptrs) const;
+  bool IR_ALWAYS_INLINE TryDeepCopy(uint8_t** dst_start, const uint8_t* dst_end, int* offset,
+      const TupleDescriptor& desc,  const TupleDeepCopyInfo& tuple_info, /*const SlotOffsets* string_slot_offsets,*/
+      const DeepCopyHelper* deep_copy_helper,
+       bool convert_ptrs) const;
 
   /// Symbols (or substrings of the symbols) of MaterializeExprs(). These can be passed to
   /// LlvmCodeGen::ReplaceCallSites().

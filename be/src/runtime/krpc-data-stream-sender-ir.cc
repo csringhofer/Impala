@@ -47,10 +47,11 @@ Status KrpcDataStreamSender::HashAndAddRows(RowBatch* batch) {
   return Status::OK();
 }
 
-Status KrpcDataStreamSender::PartitionRowCollector::FlushSingleRow(const TupleRow* row, const RowDescriptor* row_desc) {
+Status KrpcDataStreamSender::PartitionRowCollector::FlushSingleRow(
+    const TupleRow* row, const RowDescriptor* row_desc, const DeepCopyHelper* deep_copy_helper) {
   DCHECK_LT(num_rows_, row_batch_capacity_);
   num_rows_ ++;
-  RETURN_IF_ERROR(collector_batch_->AppendRow(row, row_desc));
+  RETURN_IF_ERROR(collector_batch_->AppendRow(row, row_desc, deep_copy_helper));
   DCHECK_GT(row_batch_capacity_, 0);
   if (num_rows_ == row_batch_capacity_) {
      // This swaps collector_batch_ with an empty batch.
@@ -61,7 +62,7 @@ Status KrpcDataStreamSender::PartitionRowCollector::FlushSingleRow(const TupleRo
 
 Status KrpcDataStreamSender::AddRowToChannelDirect(const int channel_id, TupleRow* row) {
   PartitionRowCollector& collector = partition_row_collectors_[channel_id];
-  return collector.FlushSingleRow(row, row_desc_);
+  return collector.FlushSingleRow(row, row_desc_, deep_copy_helper_);
 }
 
 }

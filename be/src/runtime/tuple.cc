@@ -26,6 +26,7 @@
 #include "exprs/scalar-expr.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/collection-value.h"
+#include "runtime/deep-copy-helper.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
@@ -43,7 +44,6 @@ namespace impala {
 
 const char* Tuple::LLVM_CLASS_NAME = "class.impala::Tuple";
 const char* Tuple::CodegenTypes::LLVM_CLASS_NAME = "struct.impala::Tuple::CodegenTypes";
-const char* SlotOffsets::LLVM_CLASS_NAME = "struct.impala::SlotOffsets";
 
 const char* Tuple::MATERIALIZE_EXPRS_SYMBOL = "MaterializeExprsILb0ELb0";
 const char* Tuple::MATERIALIZE_EXPRS_NULL_POOL_SYMBOL = "MaterializeExprsILb0ELb1";
@@ -609,12 +609,6 @@ Status Tuple::CodegenVarlenByteSize(LlvmCodeGen* codegen,
   return Status::OK();
 }
 */
-llvm::Constant* SlotOffsets::ToIR(LlvmCodeGen* codegen) const {
-  return llvm::ConstantStruct::get(
-      codegen->GetStructType<SlotOffsets>(),
-      {null_indicator_offset.ToIR(codegen),
-          codegen->GetI32Constant(tuple_offset)});
-}
 
 llvm::Type* Tuple::CodegenTypes::getStringValuePtrVecType(LlvmCodeGen* codegen) {
   llvm::StructType* codegenTypes = codegen->GetStructType<Tuple::CodegenTypes>();

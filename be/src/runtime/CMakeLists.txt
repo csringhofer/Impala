@@ -53,6 +53,7 @@ add_library(Runtime
   date-parse-util.cc
   date-value.cc
   debug-options.cc
+  deep-copy-helper.cc
   descriptors.cc
   dml-exec-state.cc
   exec-env.cc

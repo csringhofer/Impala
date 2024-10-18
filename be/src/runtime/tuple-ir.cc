@@ -17,6 +17,7 @@
 
 #include "runtime/tuple.h"
 
+#include "runtime/deep-copy-helper.h"
 #include "runtime/string-value.h"
 
 namespace impala {
@@ -52,22 +53,44 @@ bool Tuple::CopyStrings(const char* err_ctx, RuntimeState* state,
 template<class T>
 bool TryMemCopy(uint8_t* dst, const uint8_t* dst_end, int size, const T* src) {
   if (UNLIKELY(dst + size > dst_end)) return false;
-  memcpy(dst, src, size);
+  Ubsan::MemCpy(dst, src, size); //TODO: investigate llvm crash when using simple memcpy
   return true;
 }
 
 bool Tuple::TryDeepCopy(uint8_t** dst_start, const uint8_t* dst_end, int* offset_start,
-    const TupleDescriptor& desc, bool convert_ptrs) const {
+    const TupleDescriptor& desc, const TupleDeepCopyInfo& tuple_info, /*const SlotOffsets* string_slot_offsets,*/
+    const DeepCopyHelper* deep_copy_helper,
+    bool convert_ptrs) const {
   uint8_t* dst = *dst_start;
   int offset = *offset_start;
-  if (!TryMemCopy(dst, dst_end, desc.byte_size(), this)) return false;
+  int tuple_size = tuple_info.tuple_size;//desc.byte_size();
+  if (!TryMemCopy(dst, dst_end, tuple_size /*desc.byte_size()*/, this)) return false;
   Tuple* dst_tuple = reinterpret_cast<Tuple*>(dst);
-  dst += desc.byte_size();
-  offset += desc.byte_size();
-  if (!dst_tuple->TryCopyStrings(&dst, dst_end, &offset, desc, convert_ptrs)) {
+  dst += tuple_size;
+  offset += tuple_size;
+  /*if (!dst_tuple->TryCopyStrings(&dst, dst_end, &offset, desc, convert_ptrs)) {
     return false;
+  }*/
+  const SlotOffsets* string_slot_offsets = deep_copy_helper->string_slots_no_inline();
+  for (int i = tuple_info.first_string_slot; i != tuple_info.first_string_slot + tuple_info.num_string_slots; ++i) {
+    const SlotOffsets& slot_offsets = string_slot_offsets[i];
+    if (IsNull(slot_offsets.null_indicator_offset)) continue;
+
+    StringValue* string_v = dst_tuple->GetStringSlot(slot_offsets.tuple_offset);
+    // It is safe to smallify at this point as DeepCopyVarlenData is called on the new
+    // tuple which can be modified.
+    if (string_v->Smallify()) continue;
+    int len = string_v->Len();
+    DCHECK_GT(len, 0); // Size 0 should be handled by "smallify" case.
+    if (!TryMemCopy(dst, dst_end, len, string_v->Ptr())) return false;
+    char* new_ptr = convert_ptrs ? reinterpret_cast<char*>(offset) :
+                                   reinterpret_cast<char*>(dst);
+    string_v->SetPtr(new_ptr);
+    dst += len;
+    offset += len;
   }
-  if (!dst_tuple->TryCopyCollections(&dst, dst_end, &offset, desc, convert_ptrs)) {
+  if (tuple_info.has_collection_slots
+      && !dst_tuple->TryCopyCollections(&dst, dst_end, &offset, desc, convert_ptrs)) {
     return false;
   }
   *dst_start = dst;

@@ -97,6 +97,7 @@ Status KrpcDataStreamSenderConfig::Init(
         KrpcDataStreamSender::EXCHANGE_HASH_SEED_CONST ^ state->query_id().hi;
   }
   num_channels_ = state->fragment_ctx().destinations().size();
+  deep_copy_helper_.reset(new DeepCopyHelper(input_row_desc_));
   state->CheckAndAddCodegenDisabledMessage(codegen_status_msgs_);
   return Status::OK();
 }
@@ -912,6 +913,7 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
     next_unknown_partition_(0),
     exchange_hash_seed_(sink_config.exchange_hash_seed_),
     hash_and_add_rows_fn_(sink_config.hash_and_add_rows_fn_),
+    deep_copy_helper_(sink_config.deep_copy_helper_.get()),
     filepath_to_hosts_(sink_config.filepath_to_hosts_) {
   DCHECK_GT(destinations.size(), 0);
   DCHECK(sink.output_partition.type == TPartitionType::UNPARTITIONED
@@ -1202,9 +1204,24 @@ void KrpcDataStreamSenderConfig::Codegen(FragmentState* state) {
     DCHECK_EQ(num_replaced, 1);
 
     num_replaced = codegen->ReplaceCallSitesWithValue(hash_and_add_rows_fn,
-        codegen->GetI32Constant(input_row_desc_->num_tuples_no_inline()), "num_tuples_no_inline");
+        codegen->GetI32Constant(deep_copy_helper_->num_tuples_no_inline()), "num_tuples_no_inline");
     DCHECK_EQ(num_replaced, 1);
     LOG(INFO) << "num_tuples_no_inline replaced" << num_replaced;
+
+    //DeepCopyHelper
+    llvm::Constant* constant_tuple_info =
+        deep_copy_helper_->GetTuplesAsIrConstant(codegen, "tuple_info");
+    num_replaced = codegen->ReplaceCallSitesWithValue(hash_and_add_rows_fn,
+        constant_tuple_info, "tuple_info_no_inline");
+    DCHECK_EQ(num_replaced, 1);
+    LOG(INFO) << "tuple_info_no_inline replaced" << num_replaced;
+
+    llvm::Constant* constant_string_slot_offsets =
+        deep_copy_helper_->GetStringSlotsAsIrConstant(codegen, "string_slots");
+    num_replaced = codegen->ReplaceCallSitesWithValue(hash_and_add_rows_fn,
+        constant_string_slot_offsets, "string_slots_no_inline");
+    DCHECK_EQ(num_replaced, 2);
+    LOG(INFO) << "string_slots_no_inline replaced" << num_replaced;
 
     // Replace HashRow() with the handcrafted IR function.
     num_replaced = codegen->ReplaceCallSites(hash_and_add_rows_fn,
