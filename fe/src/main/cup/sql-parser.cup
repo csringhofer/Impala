@@ -403,7 +403,7 @@ nonterminal SelectList select_list;
 nonterminal SelectListItem select_list_item;
 nonterminal SelectListItem star_expr;
 nonterminal Expr expr, non_pred_expr, arithmetic_expr, timestamp_arithmetic_expr;
-nonterminal Expr string_expr;
+//nonterminal Expr string_expr;
 nonterminal List<Expr> expr_list;
 nonterminal String alias_clause;
 nonterminal List<String> ident_list;
@@ -3803,10 +3803,33 @@ exists_predicate ::=
   ;
 
 non_pred_expr ::=
-  KW_TRUNCATE LPAREN expr_list:exprs RPAREN
-  {: RESULT = new FunctionCallExpr("truncate", exprs); :}
-  | string_expr:e
+  sign_chain_expr:e
   {: RESULT = e; :}
+  | literal:l
+  {: RESULT = l; :}
+  | function_call_expr:e
+  {: RESULT = e; :}
+  | analytic_expr:e
+  {: RESULT = e; :}
+  | unnest_expr:e
+  {: RESULT = e; :}
+  /* Additional rules for function names that are also keywords */
+  | KW_IF LPAREN expr_list:exprs RPAREN
+  {: RESULT = new FunctionCallExpr("if", exprs); :}
+  | KW_REPLACE LPAREN expr_list:exprs RPAREN
+  {: RESULT = new FunctionCallExpr("replace", exprs); :}
+  | KW_TRUNCATE LPAREN expr_list:exprs RPAREN
+  {: RESULT = new FunctionCallExpr("truncate", exprs); :}
+  | KW_LEFT LPAREN expr_list:exprs RPAREN
+  {: RESULT = new FunctionCallExpr("left", exprs); :}
+  | KW_RIGHT LPAREN expr_list:exprs RPAREN
+  {: RESULT = new FunctionCallExpr("right", exprs); :}
+  | cast_expr:c
+  {: RESULT = c; :}
+  | case_expr:c
+  {: RESULT = c; :}
+  | slot_ref:c
+  {: RESULT = c; :}
   | timestamp_arithmetic_expr:e
   {: RESULT = e; :}
   | arithmetic_expr:e
@@ -3818,34 +3841,6 @@ non_pred_expr ::=
   :}
   | subquery:s
   {: RESULT = s; :}
-  ;
-
-string_expr ::=
-  unnest_expr:e
-  {: RESULT = e; :}
-  | sign_chain_expr:e
-  {: RESULT = e; :}
-  | literal:l
-  {: RESULT = l; :}
-  | function_call_expr:e
-  {: RESULT = e; :}
-  | analytic_expr:e
-  {: RESULT = e; :}
-  /* Additional rules for function names that are also keywords */
-  | KW_REPLACE LPAREN expr_list:exprs RPAREN
-  {: RESULT = new FunctionCallExpr("replace", exprs); :}
-  | KW_LEFT LPAREN expr_list:exprs RPAREN
-  {: RESULT = new FunctionCallExpr("left", exprs); :}
-  | KW_RIGHT LPAREN expr_list:exprs RPAREN
-  {: RESULT = new FunctionCallExpr("right", exprs); :}
-  | KW_IF LPAREN expr_list:exprs RPAREN
-  {: RESULT = new FunctionCallExpr("if", exprs); :}
-  | cast_expr:c
-  {: RESULT = c; :}
-  | case_expr:c
-  {: RESULT = c; :}
-  | slot_ref:c
-  {: RESULT = c; :}
   ;
 
 trim_option ::=
@@ -3879,13 +3874,13 @@ function_call_expr ::=
     }
   :}
   // "TRIM(where FROM string)":
-  | function_name:fn_name LPAREN trim_option:w KW_FROM string_expr:s RPAREN
+  | function_name:fn_name LPAREN trim_option:w KW_FROM expr:s RPAREN
   {: RESULT = new TrimFromExpr(fn_name, w, s); :}
   // Syntax: "TRIM(charset FROM string)":
-  | function_name:fn_name LPAREN string_expr:c KW_FROM string_expr:s RPAREN
+  | function_name:fn_name LPAREN expr:c KW_FROM expr:s RPAREN
   {: RESULT = new TrimFromExpr(fn_name, c, s); :}
   // Syntax: "TRIM(where charset FROM string)":
-  | function_name:fn_name LPAREN trim_option:w string_expr:c KW_FROM string_expr:s RPAREN
+  | function_name:fn_name LPAREN trim_option:w expr:c KW_FROM expr:s RPAREN
   {: RESULT = new TrimFromExpr(fn_name, w, c, s); :}
   ;
 
