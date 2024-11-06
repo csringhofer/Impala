@@ -134,7 +134,7 @@ class TestRPCTimeout(CustomClusterTestSuite):
     self.execute_runtime_filter_query()
 
   all_rpcs = ["EXEC_QUERY_FINSTANCES", "CANCEL_QUERY_FINSTANCES", "PUBLISH_FILTER",
-      "UPDATE_FILTER", "TRANSMIT_DATA", "END_DATA_STREAM", "REMOTE_SHUTDOWN"]
+      "UPDATE_FILTER", "TRANSMIT_DATA", "REMOTE_SHUTDOWN"]
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("--backend_client_rpc_timeout_ms=1000"

@@ -86,7 +86,7 @@ class OutboundRowBatch {
 
   void Reset();
 
-  bool IsEmpty() { return tuple_offsets_.empty(); }
+  bool IsEmpty() const { return tuple_offsets_.empty(); }
 
   inline Status IR_ALWAYS_INLINE AppendRow(
       const TupleRow* row, const RowDescriptor* row_desc);

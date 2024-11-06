@@ -50,7 +50,6 @@ class TestRPCException(CustomClusterTestSuite):
 
   # DataStreamService rpc names
   TRANSMIT_DATA_RPC = "TransmitData"
-  END_DATA_STREAM_RPC = "EndDataStream"
 
   # Error to specify for ImpalaServicePool to reject rpcs with a 'server too busy' error.
   REJECT_TOO_BUSY_MSG = "REJECT_TOO_BUSY"
@@ -111,23 +110,6 @@ class TestRPCException(CustomClusterTestSuite):
     """Run a query where TransmitData may fail with a "server too busy" or with a generic
     error. The query should either succeed or fail with the given error."""
     self.execute_test_query("Debug Action: IMPALA_SERVICE_POOL:FAIL@0.1")
-
-  @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args("--debug_actions=" +
-      _get_fail_action(rpc=END_DATA_STREAM_RPC, error=REJECT_TOO_BUSY_MSG, p=0.5))
-  def test_end_data_stream_retry(self):
-    """Run a query where EndDataStream may fail with a "server too busy" error. We should
-    always retry in this case, so the query should always eventually succeed."""
-    self.execute_test_query(None)
-
-  @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args("--debug_actions=" +
-      _get_fail_action(rpc=END_DATA_STREAM_RPC, error=REJECT_TOO_BUSY_MSG, p=0.5) +
-      "|" + _get_fail_action(rpc=END_DATA_STREAM_RPC, p=0.5))
-  def test_end_data_stream_error(self):
-    """Run a query where EndDataStream may fail with a "server too busy" or with a generic
-    error. The query should either succeed or fail with the given error."""
-    self.execute_test_query("Debug Action: IMPALA_SERVICE_POOL:FAIL@0.5")
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args("--debug_actions=" +

@@ -140,11 +140,6 @@ class ImpalaKRPCTestBackend : public DataStreamServiceIf {
     stream_mgr_->AddData(request, response, rpc_context);
   }
 
-  virtual void EndDataStream(const EndDataStreamRequestPB* request,
-      EndDataStreamResponsePB* response, RpcContext* rpc_context) {
-    stream_mgr_->CloseSender(request, response, rpc_context);
-  }
-
   virtual void UpdateFilter(
       const UpdateFilterParamsPB* req, UpdateFilterResultPB* resp, RpcContext* context) {}
 
@@ -164,6 +159,14 @@ class ImpalaKRPCTestBackend : public DataStreamServiceIf {
     rapidjson::Document doc(rapidjson::kObjectType);
     rpc_mgr_->ToJson(&doc);
     return doc["services"][0]["queue_size"].GetInt();
+  }
+
+  // Number of RPCs rejected with 'server too busy', e.g. because the service pool's
+  // memory limit was reached. Senders are expected to retry these.
+  int NumRpcsRejected() {
+    rapidjson::Document doc(rapidjson::kObjectType);
+    rpc_mgr_->ToJson(&doc);
+    return doc["services"][0]["rpcs_queue_overflow"].GetInt();
   }
 
  private:
@@ -690,7 +693,8 @@ class DataStreamTest : public testing::Test {
     for (int i = 0; i < num_batches; ++i) {
       GetNextBatch(batch.get(), &next_val);
       VLOG_QUERY << "sender " << sender_num << ": #rows=" << batch->num_rows();
-      info->status = sender->Send(&state, batch.get());
+      bool eos = i == num_batches - 1;
+      info->status = sender->Send(&state, batch.get(), eos);
       if (!info->status.ok()) break;
     }
     VLOG_QUERY << "closing sender" << sender_num;
@@ -731,19 +735,6 @@ class DataStreamTestShortDeserQueue : public DataStreamTest {
     FLAGS_datastream_sender_timeout_ms = 10000;
     FLAGS_datastream_service_num_deserialization_threads = 1;
     FLAGS_datastream_service_deserialization_queue_size = 1;
-    DataStreamTest::SetUp();
-  }
-
-  virtual void TearDown() {
-    DataStreamTest::TearDown();
-  }
-};
-
-// A separate test class which simulates that the service queue is slow processing RPCs.
-class DataStreamTestSlowServiceQueue : public DataStreamTest {
- protected:
-  virtual void SetUp() {
-    FLAGS_datastream_service_num_svc_threads = 1;
     DataStreamTest::SetUp();
   }
 
@@ -932,69 +923,20 @@ TEST_F(DataStreamTestShortDeserQueue, TestNoDeadlock) {
   CheckReceivers(TPartitionType::UNPARTITIONED, 4);
 }
 
-// Test that EndDataStream RPCs are prioritized over other RPCs in the ImpalaServicePool
-// queue. It starts a receiver with 1 service thread and a 3s delay on processing
-// TransmitData RPCs, and starts 2 senders each trying to send data. The 1st sender's RPC
-// starts processing, and the 2nd sender's RPC is queued in the ImpalaServicePool. Then
-// starts a 3rd sender that sends no data, just EndDataStream, and asserts it completes
-// before the 2nd block that's already queued i.e. before the 2nd 3s delay has passed.
-TEST_F(DataStreamTestSlowServiceQueue, TestPrioritizeEos) {
-  FLAGS_debug_actions="TRANSMIT_DATA_DELAY:SLEEP@3000";
-  TPartitionType::type stream_type = TPartitionType::UNPARTITIONED;
-  constexpr int buffer_size = 1024;
-  constexpr int num_batches = 1;
-  Reset();
-
-  TUniqueId instance_id;
-  RuntimeProfile* profile;
-  StartReceiver(stream_type, 3, 0, buffer_size, false, &instance_id, &profile);
-
-  int64_t start = MonotonicNanos();
-  // Start sender; TRANSMIT_DATA_DELAY:SLEEP will block up the queue.
-  StartSender(stream_type, buffer_size, false, num_batches);
-  StartSender(stream_type, buffer_size, false, num_batches);
-  // Wait for 1st sender batch to be received and 2nd sender batch queued.
-  while (test_service_->NumTransmitsReceived() == 0) SleepForMs(1);
-  while (test_service_->QueueSize() == 0) SleepForMs(1);
-
-  // Start last sender with no batches so it just sends EndDataStream.
-  StartSender(stream_type, buffer_size, false, 0);
-
-  // Wait for last sender to complete.
-  sender_info_.back()->thread_handle->join();
-  sender_info_.pop_back();
-  // Verify receiver got EOS.
-  vector<RuntimeProfileBase::Counter*> counters;
-  profile->GetCounters("TotalEosReceived", &counters);
-  ASSERT_EQ(1, counters.size());
-  EXPECT_EQ(1, counters.front()->value());
-  // Assert 2nd TRANSMIT_DATA_DELAY sleep is not finished.
-  int64_t duration = MonotonicNanos() - start;
-  EXPECT_GE(duration, 3 * NANOS_PER_SEC);
-  EXPECT_LT(duration, 6 * NANOS_PER_SEC);
-
-  // Clean up.
-  JoinSenders();
-  JoinReceivers();
-  EXPECT_GE(MonotonicNanos() - start, 6 * NANOS_PER_SEC);
-  EXPECT_EQ(2 * num_batches * BATCH_CAPACITY, receiver_info_[0]->data_values.size());
-  EXPECT_EQ(3, counters.front()->value());
-}
-
 // Test that payloads larger than the service queue's soft mem limit can be transmitted.
 TEST_F(DataStreamTestShortServiceQueue, TestLargePayload) {
   TestStream(
       TPartitionType::UNPARTITIONED, 4, 1, SHORT_SERVICE_QUEUE_MEM_LIMIT * 2, false);
 }
 
-// Test that EndDataStream messages are admitted to the ImpalaServicePool queue when the
-// pool memory limit has been reached. Starts a receiver with a very low memory limit on
-// the pool so only one message is admitted to the queue at a time; others will be
-// rejected and must be retried by the sender. Starts a sender that sends a batch, with
-// processing of TransmitData delayed for 3s; then starts another sender with no blocks
-// that just sends EndDataStream and verifies the EndDataStream message is processed
-// before the 3s delay finishes, so it must have been admitted while memory was still
-// held for the TransmitData message.
+// Test that a stream still completes when the ImpalaServicePool's memory limit is
+// reached and RPCs are rejected. Starts a receiver with a very low memory limit on the
+// pool, so only one message is admitted to the queue at a time and others are rejected
+// and must be retried by the sender. Starts a sender that sends a batch, with processing
+// of TransmitData delayed for 3s so its payload keeps the pool over its limit; then
+// starts another sender with no batches, which therefore sends only an end-of-stream
+// TransmitData(). That RPC is rejected while the first payload is still held, so it is
+// only delivered once the sender has retried it.
 TEST_F(DataStreamTestShortServiceQueue, TestFullQueue) {
   FLAGS_debug_actions="TRANSMIT_DATA_DELAY:SLEEP@3000";
   TPartitionType::type stream_type = TPartitionType::UNPARTITIONED;
@@ -1007,31 +949,29 @@ TEST_F(DataStreamTestShortServiceQueue, TestFullQueue) {
   StartReceiver(stream_type, 2, 0, buffer_size, false, &instance_id, &profile);
 
   int64_t start = MonotonicNanos();
+  const int rejected_before = test_service_->NumRpcsRejected();
   // Start sender; TRANSMIT_DATA_DELAY:SLEEP will block up the queue.
   StartSender(stream_type, buffer_size, false, num_batches);
   // Wait for 1st batch to be received.
   while (test_service_->NumTransmitsReceived() == 0) SleepForMs(1);
 
-  // Start last sender with no batches so it just sends EndDataStream.
+  // Start last sender with no batches, so it only sends end-of-stream.
   StartSender(stream_type, buffer_size, false, 0);
 
-  // Wait for last sender to complete.
-  sender_info_.back()->thread_handle->join();
-  sender_info_.pop_back();
-  // Verify receiver got EOS.
+  JoinSenders();
+  JoinReceivers();
+  for (const auto& sender : sender_info_) EXPECT_OK(sender->status);
+
+  // The end-of-stream RPC was rejected while the first sender's payload held the pool's
+  // memory, so it only got through after being retried.
+  EXPECT_GT(test_service_->NumRpcsRejected(), rejected_before);
+  EXPECT_GE(MonotonicNanos() - start, 3 * NANOS_PER_SEC);
+  // Both senders reached end-of-stream and all rows arrived.
   vector<RuntimeProfileBase::Counter*> counters;
   profile->GetCounters("TotalEosReceived", &counters);
   ASSERT_EQ(1, counters.size());
-  EXPECT_EQ(1, counters.front()->value());
-  // Assert TRANSMIT_DATA_DELAY sleep is not finished.
-  EXPECT_LT(MonotonicNanos() - start, 3 * NANOS_PER_SEC);
-
-  // Clean up.
-  JoinSenders();
-  JoinReceivers();
-  EXPECT_GE(MonotonicNanos() - start, 3 * NANOS_PER_SEC);
-  EXPECT_EQ(num_batches * BATCH_CAPACITY, receiver_info_[0]->data_values.size());
   EXPECT_EQ(2, counters.front()->value());
+  EXPECT_EQ(num_batches * BATCH_CAPACITY, receiver_info_[0]->data_values.size());
 }
 
 // TODO: more tests:

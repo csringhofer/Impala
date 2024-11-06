@@ -47,31 +47,13 @@ message TransmitDataRequestPB {
   // The sidecar index of the tuple's data which is a (compressed) row batch.
   // The details of the row batch (e.g. # of rows) is in 'row_batch_header' above.
   optional int32 tuple_data_sidecar_idx = 6;
+
+  optional bool eos = 7;
 }
 
 // All fields are required in V1.
 message TransmitDataResponsePB {
   // Status::OK() on success; Error status on failure.
-  optional StatusPB status = 1;
-
-  // Latency for response in the receiving daemon in nanoseconds.
-  optional int64 receiver_latency_ns = 2;
-}
-
-// All fields are required in V1.
-message EndDataStreamRequestPB {
-  // The fragment instance id of the receiver.
-  optional UniqueIdPB dest_fragment_instance_id = 1;
-
-  // Sender instance id, unique within a fragment.
-  optional int32 sender_id = 2;
-
-  // PlanNodeId of the exchange node which owns the receiver.
-  optional int32 dest_node_id = 3;
-}
-
-// All fields are required in V1.
-message EndDataStreamResponsePB {
   optional StatusPB status = 1;
 
   // Latency for response in the receiving daemon in nanoseconds.
@@ -167,11 +149,8 @@ service DataStreamService {
 
   // Called by sender to transmit a single row batch. Returns error indication
   // if params.fragmentId or params.destNodeId are unknown or if data couldn't
-  // be read.
+  // be read. Can indicate EOS.
   rpc TransmitData(TransmitDataRequestPB) returns (TransmitDataResponsePB);
-
-  // Called by a sender to close the channel between fragment instances.
-  rpc EndDataStream(EndDataStreamRequestPB) returns (EndDataStreamResponsePB);
 
   // Called by fragment instances that produce local runtime filters to deliver them to
   // the coordinator for aggregation and broadcast.

@@ -161,13 +161,6 @@ shared_ptr<KrpcDataStreamRecvr> KrpcDataStreamMgr::CreateRecvr(
     early_rpcs_tracker_->Release(transfer_size);
     num_senders_waiting_->Increment(-1);
   }
-  for (const unique_ptr<EndDataStreamCtx>& ctx :
-      early_senders_for_recvr.closed_sender_ctxs) {
-    recvr->RemoveSender(ctx->request->sender_id());
-    DataStreamService::RespondAndReleaseRpc(Status::OK(), ctx->response, ctx->rpc_context,
-        early_rpcs_tracker_.get());
-    num_senders_waiting_->Increment(-1);
-  }
   return recvr;
 }
 
@@ -203,19 +196,6 @@ void KrpcDataStreamMgr::AddEarlySender(const TUniqueId& finst_id,
   RecvrId recvr_id = make_pair(finst_id, request->dest_node_id());
   auto payload = make_unique<TransmitDataCtx>(request, response, rpc_context);
   early_senders_map_[recvr_id].waiting_sender_ctxs.emplace_back(move(payload));
-  num_senders_waiting_->Increment(1);
-  total_senders_waited_->Increment(1);
-}
-
-void KrpcDataStreamMgr::AddEarlyClosedSender(const TUniqueId& finst_id,
-    const EndDataStreamRequestPB* request, EndDataStreamResponsePB* response,
-    kudu::rpc::RpcContext* rpc_context) {
-  const int64_t transfer_size = rpc_context->GetTransferSize();
-  early_rpcs_tracker_->Consume(transfer_size);
-  service_mem_tracker_->Release(transfer_size);
-  RecvrId recvr_id = make_pair(finst_id, request->dest_node_id());
-  auto payload = make_unique<EndDataStreamCtx>(request, response, rpc_context);
-  early_senders_map_[recvr_id].closed_sender_ctxs.emplace_back(move(payload));
   num_senders_waiting_->Increment(1);
   total_senders_waited_->Increment(1);
 }
@@ -286,42 +266,6 @@ void KrpcDataStreamMgr::DeserializeThreadFn(int thread_id, const DeserializeTask
     DCHECK(recvr != nullptr || already_unregistered);
   }
   if (recvr != nullptr) recvr->ProcessDeferredRpc(task.sender_id);
-}
-
-void KrpcDataStreamMgr::CloseSender(const EndDataStreamRequestPB* request,
-    EndDataStreamResponsePB* response, kudu::rpc::RpcContext* rpc_context) {
-  TUniqueId finst_id;
-  finst_id.__set_lo(request->dest_fragment_instance_id().lo());
-  finst_id.__set_hi(request->dest_fragment_instance_id().hi());
-  VLOG_ROW << "CloseSender(): fragment_instance_id=" << PrintId(finst_id)
-           << " node_id=" << request->dest_node_id()
-           << " sender_id=" << request->sender_id();
-  shared_ptr<KrpcDataStreamRecvr> recvr;
-  {
-    lock_guard<mutex> l(lock_);
-    bool already_unregistered;
-    recvr = FindRecvr(finst_id, request->dest_node_id(), &already_unregistered);
-    // If no receiver is found and it's not in the closed stream cache, we still need
-    // to make sure that the close operation is performed so add to per-recvr list of
-    // pending closes. It's possible for a sender to issue EOS RPC without sending any
-    // rows if no rows are materialized at all in the sender side.
-    if (!already_unregistered && recvr == nullptr) {
-      AddEarlyClosedSender(finst_id, request, response, rpc_context);
-      TRACE_TO(rpc_context->trace(), "Added early closed sender");
-      return;
-    }
-  }
-
-  // If we reach this point, either the receiver is found or it has been unregistered
-  // already. In either cases, it's safe to just return an OK status.
-  TRACE_TO(
-      rpc_context->trace(), "Found receiver? $0", recvr != nullptr ? "true" : "false");
-  if (LIKELY(recvr != nullptr)) {
-    recvr->RemoveSender(request->sender_id());
-    TRACE_TO(rpc_context->trace(), "Removed sender from receiver");
-  }
-  DataStreamService::RespondAndReleaseRpc(Status::OK(), response, rpc_context,
-      service_mem_tracker_);
 }
 
 Status KrpcDataStreamMgr::DeregisterRecvr(
@@ -442,9 +386,6 @@ void KrpcDataStreamMgr::Maintenance() {
     for (const EarlySendersList& senders_queue : timed_out_senders) {
       for (const unique_ptr<TransmitDataCtx>& ctx : senders_queue.waiting_sender_ctxs) {
         RespondToTimedOutSender<TransmitDataCtx, TransmitDataRequestPB>(ctx);
-      }
-      for (const unique_ptr<EndDataStreamCtx>& ctx : senders_queue.closed_sender_ctxs) {
-        RespondToTimedOutSender<EndDataStreamCtx, EndDataStreamRequestPB>(ctx);
       }
     }
 

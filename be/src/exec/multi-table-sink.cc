@@ -78,9 +78,9 @@ Status MultiTableSink::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status MultiTableSink::Send(RuntimeState* state, RowBatch* batch) {
+Status MultiTableSink::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   for (TableSinkBase* tsink : table_sinks_) {
-    RETURN_IF_ERROR(tsink->Send(state, batch));
+    RETURN_IF_ERROR(tsink->Send(state, batch, eos));
   }
   return Status::OK();
 }

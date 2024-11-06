@@ -43,7 +43,7 @@ Status BlockingPlanRootSink::Prepare(
   return PlanRootSink::Prepare(state, parent_mem_tracker);
 }
 
-Status BlockingPlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
+Status BlockingPlanRootSink::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile()->total_time_counter());
   RETURN_IF_ERROR(PlanRootSink::UpdateAndCheckRowsProducedLimit(state, batch));
   int current_batch_row = 0;

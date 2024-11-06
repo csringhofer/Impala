@@ -42,8 +42,6 @@ class MetricGroup;
 /// appropriate receivers. Metrics exposed by the service will be added to 'metric_group'.
 class DataStreamService : public DataStreamServiceIf {
  public:
-  static constexpr std::string_view END_DATA_STREAM = "EndDataStream";
-
   DataStreamService(MetricGroup* metric_group);
 
   /// Initializes the service by registering it with the singleton RPC manager.
@@ -55,11 +53,6 @@ class DataStreamService : public DataStreamServiceIf {
   /// Authorization is enforced only when Kerberos is enabled.
   virtual bool Authorize(const google::protobuf::Message* req,
       google::protobuf::Message* resp, kudu::rpc::RpcContext* context);
-
-  /// Notifies the receiver to close the data stream specified in 'request'.
-  /// The receiver replies to the client with a status serialized in 'response'.
-  virtual void EndDataStream(const EndDataStreamRequestPB* request,
-      EndDataStreamResponsePB* response, kudu::rpc::RpcContext* context);
 
   /// Sends a row batch to the receiver specified in 'request'.
   /// The receiver replies to the client with a status serialized in 'response'.

@@ -365,7 +365,7 @@ inline Status HdfsTableSink::GetOutputPartition(RuntimeState* state, const Tuple
   return Status::OK();
 }
 
-Status HdfsTableSink::Send(RuntimeState* state, RowBatch* batch) {
+Status HdfsTableSink::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile()->total_time_counter());
   expr_results_pool_->Clear();
   RETURN_IF_ERROR(state->CheckQueryState());

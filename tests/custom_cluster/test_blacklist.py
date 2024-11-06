@@ -167,7 +167,7 @@ class TestBlacklist(CustomClusterTestSuite):
       assert False, "Query was expected to fail"
     except Exception as e:
       # The query should fail due to an RPC error.
-      assert "TransmitData() to " in str(e) or "EndDataStream() to " in str(e)
+      assert "TransmitData() to " in str(e)
 
     # Run another query which should succeed and verify the impalad was blacklisted.
     self.client.clear_configuration()  # remove the debug actions

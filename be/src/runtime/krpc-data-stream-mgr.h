@@ -46,8 +46,6 @@ class RpcContext;
 namespace impala {
 
 class DescriptorTbl;
-class EndDataStreamRequestPB;
-class EndDataStreamResponsePB;
 class KrpcDataStreamRecvr;
 class RuntimeState;
 class TransmitDataRequestPB;
@@ -105,10 +103,13 @@ class TransmitDataResponsePB;
 /// Phase 3: End of stream
 /// ----------------------
 ///
-/// When the stream is terminated, clients will send EndDataStream() RPCs to the servers.
-/// This RPC will not be sent until after the final TransmitData() RPC has completed and
-/// the stream's contents has been delivered. After EndDataStream() is received, no more
-/// TransmitData() RPCs should be expected from this sender.
+/// The last TransmitData() RPC of a stream has its 'eos' flag set. Usually this is the
+/// RPC carrying the sender's final row batch, so terminating a stream costs no extra
+/// RPC. A sender with no trailing rows to send - because it produced no rows at all, or
+/// because its last batch was already sent - instead sends a TransmitData() RPC with no
+/// row batch and 'eos' set. Either way the receiver removes the sender once it has
+/// processed that RPC, after any row batch it carried has been added to the batch queue.
+/// After that, no more TransmitData() RPCs should be expected from this sender.
 ///
 /// Exceptional conditions: cancellation, timeouts, failure
 /// -------------------------------------------------------
@@ -184,32 +185,12 @@ struct TransmitDataCtx {
       kudu::rpc::RpcContext* rpc_context);
 };
 
-/// Context for an EndDataStream() RPC. This structure is constructed when the RPC is
-/// queued by the data stream manager for deferred processing when the receiver isn't
-/// prepared.
-struct EndDataStreamCtx {
-  /// Request data structure, memory owned by 'rpc_context'.
-  const EndDataStreamRequestPB* request;
-
-  /// Response data structure, will be serialized back to client after 'rpc_context' is
-  /// responded to. Memory owned by 'rpc_context'.
-  EndDataStreamResponsePB* response;
-
-  /// Must be responded to once this RPC is finished with. RpcContext will delete itself
-  /// once it has been responded to. Not owned.
-  kudu::rpc::RpcContext* rpc_context;
-
-  EndDataStreamCtx(const EndDataStreamRequestPB* request,
-      EndDataStreamResponsePB* response, kudu::rpc::RpcContext* rpc_context)
-    : request(request), response(response), rpc_context(rpc_context) { }
-};
-
 /// Singleton class which manages all incoming data streams at a backend node.
 /// It provides both producer and consumer functionality for each data stream.
 ///
 /// - RPC service threads use this to add incoming data to streams in response to
-///   TransmitData() RPCs (AddData()) or to signal end-of-stream conditions
-///   (CloseSender()).
+///   TransmitData() RPCs (AddData()). The last such RPC of a stream also signals the
+///   end-of-stream condition, via its 'eos' flag.
 /// - Exchange nodes extract data from an incoming stream via a KrpcDataStreamRecvr,
 ///   which is created with CreateRecvr().
 //
@@ -272,15 +253,6 @@ class KrpcDataStreamMgr : public CacheLineAligned {
   /// so that a single sender can't flood the buffer and stall everybody else.
   void AddData(const TransmitDataRequestPB* request, TransmitDataResponsePB* response,
       kudu::rpc::RpcContext* rpc_context);
-
-  /// Handler for EndDataStream() RPC.
-  ///
-  /// Notifies the receiver associated with the fragment/dest_node id that the specified
-  /// sender has closed. The RPC will be responded to if the receiver is found.
-  /// Otherwise, the request will be queued in the early senders list and responded
-  /// to either when the receiver is created when the request has timed out.
-  void CloseSender(const EndDataStreamRequestPB* request,
-      EndDataStreamResponsePB* response, kudu::rpc::RpcContext* context);
 
   /// Cancels all receivers registered for 'query_id' immediately. The receivers will not
   /// accept any row batches after being cancelled. Any buffered row batches will not be
@@ -404,10 +376,6 @@ class KrpcDataStreamMgr : public CacheLineAligned {
     /// set up.
     std::vector<std::unique_ptr<TransmitDataCtx>> waiting_sender_ctxs;
 
-    /// Queue of contexts for senders that called EndDataStream() before the receiver was
-    /// set up.
-    std::vector<std::unique_ptr<EndDataStreamCtx>> closed_sender_ctxs;
-
     /// Monotonic time of arrival of the first sender in ms. Used to notify senders when
     /// they have waited too long.
     int64_t arrival_time;
@@ -417,13 +385,11 @@ class KrpcDataStreamMgr : public CacheLineAligned {
     /// Defining the move constructor as vectors of unique_ptr are not copyable.
     EarlySendersList(EarlySendersList&& other)
       : waiting_sender_ctxs(std::move(other.waiting_sender_ctxs)),
-        closed_sender_ctxs(std::move(other.closed_sender_ctxs)),
         arrival_time(other.arrival_time) { }
 
     /// Defining the move operator= as vectors of unique_ptr are not copyable.
     EarlySendersList& operator=(EarlySendersList&& other) {
       waiting_sender_ctxs = std::move(other.waiting_sender_ctxs);
-      closed_sender_ctxs = std::move(other.closed_sender_ctxs);
       arrival_time = other.arrival_time;
       return *this;
     }
@@ -455,12 +421,6 @@ class KrpcDataStreamMgr : public CacheLineAligned {
   /// TransmitData() RPC requests which arrive before the receiver finishes preparing.
   void AddEarlySender(const TUniqueId& fragment_instance_id,
       const TransmitDataRequestPB* request, TransmitDataResponsePB* response,
-      kudu::rpc::RpcContext* context);
-
-  /// Adds a request of EndDataStream() RPC to the early senders list. Used for storing
-  /// EndDataStream() RPC requests which arrive before the receiver finishes preparing.
-  void AddEarlyClosedSender(const TUniqueId& fragment_instance_id,
-      const EndDataStreamRequestPB* request, EndDataStreamResponsePB* response,
       kudu::rpc::RpcContext* context);
 
   /// Enqueue 'num_requests' requests to the deserialization thread pool to drain the

@@ -63,9 +63,9 @@ DEFINE_int64(data_stream_sender_buffer_size, 16 * 1024,
     "(Advanced) Max size in bytes which a row batch in a data stream sender's channel "
     "can accumulate before the row batch is sent over the wire.");
 DEFINE_int64_hidden(data_stream_sender_eos_timeout_ms, 60*60*1000,
-    "Timeout for EndDataStream (EOS) RPCs. Setting a timeout prioritizes them over other "
-    "DataStreamService RPCs. Defaults to 1 hour. Set to 0 or negative value to disable "
-    "the timeout.");
+    "Timeout for end-of-stream (EOS) TransmitData() RPCs that carry no row batch. "
+    "Setting a timeout prioritizes them over other DataStreamService RPCs. Defaults to "
+    "1 hour. Set to 0 or negative value to disable the timeout.");
 
 using std::condition_variable_any;
 using std::placeholders::_1;
@@ -142,7 +142,7 @@ void KrpcDataStreamSenderConfig::Close() {
 // release resources. Teardown() will cancel any in-flight RPC and wait for the
 // completion callback to be called before returning. It's expected that the execution
 // thread to flush all buffered row batches and send the end-of-stream message (by
-// SendEosAsync() and WaitForRpc()) before closing the data stream sender.
+// SendEosIfNeededAsync() and WaitForRpc()) before closing the data stream sender.
 //
 // Note that the RPC payloads are owned solely by the channel and the KRPC layer will
 // relinquish references of them before the completion callback is invoked so it's
@@ -191,10 +191,11 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // If 'swap_batch' is true, 'outbound_batch' is swapped with the Channel's
   // 'outbound_batch_'. This happens after the previous RPC is finished so its buffers
   // can be reused.
-  Status TransmitData(std::unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch);
+  Status TransmitData(std::unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch,
+      bool eos=false);
 
   // Shutdowns the channel and frees the row batch allocation. Any in-flight RPC will
-  // be cancelled. It's expected that clients normally call SendEosAsync()
+  // be cancelled. It's expected that clients normally call SendEosIfNeededAsync()
   // and WaitForRpc() before calling Teardown() to flush all buffered row batches to
   // destinations. Teardown() may be called without flushing the channel in cases such
   // as cancellation or error.
@@ -203,7 +204,7 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // Sends the EOS RPC to close the channel. Return error status if sending the EOS RPC
   // failed. The RPC is sent asynchrononously. WaitForRpc() must be called to wait for
   // the RPC. This should be only called from a fragment executor thread.
-  Status SendEosAsync();
+  Status SendEosIfNeededAsync();
 
   // Waits for the preceding RPC to complete. Return error status if the preceding
   // RPC fails. Returns CANCELLED if the parent sender is cancelled or shut down.
@@ -265,9 +266,6 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // Protobuf response buffer for TransmitData() RPC.
   TransmitDataResponsePB resp_;
 
-  // Protobuf response buffer for EndDataStream() RPC.
-  EndDataStreamResponsePB eos_resp_;
-
   // Signaled when the in-flight RPC completes.
   condition_variable_any rpc_done_cv_;
 
@@ -291,6 +289,8 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // TODO: Fix IMPALA-3990
   bool remote_recvr_closed_ = false;
 
+  bool eos_ = false;
+
   // Returns the serialization batch from 'parent'.
   unique_ptr<OutboundRowBatch>* GetSerializationBatch();
 
@@ -302,7 +302,7 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // internal row batch before sending them to the destination. This may block if
   // the preceding RPC is still in progress. Returns error status if serialization
   // fails or if the preceding RPC fails.
-  Status SendCurrentBatch();
+  Status SendCurrentBatch(bool eos);
 
   // Called when an RPC failed. If it turns out that the RPC failed because the
   // remote server is too busy, this function will schedule RetryCb() to be called
@@ -343,17 +343,6 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // to the RpcController and store the sidecars' indices to TransmitDataRequestPB sent as
   // part of the RPC. Returns error status if adding sidecars to the RpcController failed.
   Status DoTransmitDataRpc();
-
-  // A callback function called from KRPC reactor threads upon completion of an in-flight
-  // EndDataStream() RPC. This is called when the remote server responds to the RPC or
-  // when the RPC ends prematurely due to various reasons (e.g. cancellation). Upon a
-  // successful KRPC call, MarkDone() is called to update 'rpc_status_' based on the
-  // response. HandleFailedRPC() is called to handle failed KRPC calls. The RPC may be
-  // rescheduled if it's due to remote server being too busy.
-  void EndDataStreamCompleteCb();
-
-  // Initializes the parameters for EndDataStream() RPC and invokes the async RPC call.
-  Status DoEndDataStreamRpc();
 
   // Marks the in-flight RPC as completed, updates 'rpc_status_' with the status of the
   // RPC (indicated in parameter 'status') and notifies any thread waiting for RPC
@@ -517,14 +506,18 @@ void KrpcDataStreamSender::Channel::TransmitDataCompleteCb() {
   int64_t total_time = MonotonicNanos() - rpc_start_time_ns_;
   const kudu::Status controller_status = rpc_controller_.status();
   if (LIKELY(controller_status.ok())) {
-    DCHECK(rpc_in_flight_batch_ != nullptr);
+    DCHECK(rpc_in_flight_batch_ != nullptr || eos_);
     // 'receiver_latency_ns' is calculated with MonoTime, so it must be non-negative.
     DCHECK_GE(resp_.receiver_latency_ns(), 0);
     DCHECK_GE(total_time, resp_.receiver_latency_ns());
-    int64_t row_batch_size = rpc_in_flight_batch_->GetSerializedSize();
+    // Only the sidecars are counted, not the request protobuf, so that this stays
+    // consistent with the receiver's 'bytes_received_counter_'. An EOS-only RPC carries
+    // no row batch and so contributes nothing.
+    int64_t row_batch_size =
+        rpc_in_flight_batch_ == nullptr ? 0 : rpc_in_flight_batch_->GetSerializedSize();
     int64_t network_time = total_time - resp_.receiver_latency_ns();
     COUNTER_ADD(parent_->bytes_sent_counter_, row_batch_size);
-    if (LIKELY(network_time > 0)) {
+    if (LIKELY(network_time > 0 && row_batch_size > 0)) {
       // 'row_batch_size' is bounded by FLAGS_rpc_max_message_size which shouldn't exceed
       // max 32-bit signed value so multiplication below should not overflow.
       DCHECK_LE(row_batch_size, numeric_limits<int32_t>::max());
@@ -555,35 +548,46 @@ void KrpcDataStreamSender::Channel::TransmitDataCompleteCb() {
 }
 
 Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
-  DCHECK(rpc_in_flight_batch_ != nullptr);
-  DCHECK(rpc_in_flight_batch_->IsInitialized());
+  DCHECK(rpc_in_flight_batch_ != nullptr || eos_);
+  TransmitDataRequestPB req;
+  rpc_controller_.Reset();
 
   // Initialize some constant fields in the request protobuf.
-  TransmitDataRequestPB req;
   *req.mutable_dest_fragment_instance_id() = fragment_instance_id_;
   req.set_sender_id(parent_->sender_id_);
   req.set_dest_node_id(dest_node_id_);
 
-  // Set the RowBatchHeader in the request.
-  req.set_allocated_row_batch_header(
-      const_cast<RowBatchHeaderPB*>(rpc_in_flight_batch_->header()));
+  if (rpc_in_flight_batch_ != nullptr) {
+    DCHECK(rpc_in_flight_batch_->IsInitialized());
+    // Set the RowBatchHeader in the request.
+    req.set_allocated_row_batch_header(
+        const_cast<RowBatchHeaderPB*>(rpc_in_flight_batch_->header()));
 
-  rpc_controller_.Reset();
-  int sidecar_idx;
-  // Add 'tuple_offsets_' as sidecar.
-  KUDU_RETURN_IF_ERROR(rpc_controller_.AddOutboundSidecar(RpcSidecar::FromSlice(
-      rpc_in_flight_batch_->TupleOffsetsAsSlice()), &sidecar_idx),
-      "Unable to add tuple offsets to sidecar");
-  req.set_tuple_offsets_sidecar_idx(sidecar_idx);
+    int sidecar_idx;
+    // Add 'tuple_offsets_' as sidecar.
+    KUDU_RETURN_IF_ERROR(rpc_controller_.AddOutboundSidecar(RpcSidecar::FromSlice(
+        rpc_in_flight_batch_->TupleOffsetsAsSlice()), &sidecar_idx),
+        "Unable to add tuple offsets to sidecar");
+    req.set_tuple_offsets_sidecar_idx(sidecar_idx);
 
-  // Add 'tuple_data_' as sidecar.
-  rpc_start_time_ns_ = MonotonicNanos();
-  KUDU_RETURN_IF_ERROR(rpc_controller_.AddOutboundSidecar(
-      RpcSidecar::FromSlice(rpc_in_flight_batch_->TupleDataAsSlice()), &sidecar_idx),
-      "Unable to add tuple data to sidecar");
-  req.set_tuple_data_sidecar_idx(sidecar_idx);
+    // Add 'tuple_data_' as sidecar.
+    KUDU_RETURN_IF_ERROR(rpc_controller_.AddOutboundSidecar(
+        RpcSidecar::FromSlice(rpc_in_flight_batch_->TupleDataAsSlice()), &sidecar_idx),
+        "Unable to add tuple data to sidecar");
+    req.set_tuple_data_sidecar_idx(sidecar_idx);
+  } else {
+    if (FLAGS_data_stream_sender_eos_timeout_ms > 0) {
+      // Provide a timeout so EOS RPCs are prioritized over others, as completing a stream
+      // can help free up resources.
+      rpc_controller_.set_timeout(
+          MonoDelta::FromMilliseconds(FLAGS_data_stream_sender_eos_timeout_ms));
+    }
+  }
+
+  if (eos_) req.set_eos(true);
 
   resp_.Clear();
+  rpc_start_time_ns_ = MonotonicNanos();
   proxy_->TransmitDataAsync(req, &resp_, &rpc_controller_,
       std::bind(&KrpcDataStreamSender::Channel::TransmitDataCompleteCb, this));
   // 'req' took ownership of 'header'. Need to release its ownership or 'header' will be
@@ -593,7 +597,7 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
 }
 
 Status KrpcDataStreamSender::Channel::TransmitData(
-    unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch) {
+    unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch, bool eos) {
   VLOG_ROW << "Channel::TransmitData() fragment_instance_id="
            << PrintId(fragment_instance_id_) << " dest_node=" << dest_node_id_
            << " #rows=" << outbound_batch->get()->header()->num_rows();
@@ -603,9 +607,11 @@ Status KrpcDataStreamSender::Channel::TransmitData(
   SCOPED_TIMER(parent_->transmit_data_timer_);
   DCHECK(!rpc_in_flight_);
   DCHECK(rpc_in_flight_batch_ == nullptr);
+  if (eos) eos_ = true;
   // If the remote receiver is closed already, there is no point in sending anything.
   // TODO: Needs better solution for IMPALA-3990 in the long run.
   if (UNLIKELY(remote_recvr_closed_)) return Status::OK();
+  if (eos) COUNTER_ADD(parent_->eos_sent_counter_, 1);
   rpc_in_flight_ = true;
   rpc_in_flight_batch_ = outbound_batch->get();
   RETURN_IF_ERROR(DoTransmitDataRpc());
@@ -634,77 +640,34 @@ unique_ptr<OutboundRowBatch>* KrpcDataStreamSender::Channel::GetSerializationBat
   return serialization_batch;
 }
 
-Status KrpcDataStreamSender::PartitionRowCollector::SendCurrentBatch() {
+Status KrpcDataStreamSender::PartitionRowCollector::SendCurrentBatch(bool eos) {
   if (collector_batch_->IsEmpty()) {
     DCHECK_EQ(num_rows_, 0);
-    return Status::OK();
+    return Status::OK(); // EOS will be sent later with SendEosIfNeededAsync().
   }
   num_rows_ = 0;
   RETURN_IF_ERROR(channel_->GetParent()->PrepareBatchForSend(
       collector_batch_.get(), !channel_->IsLocal()));
-  RETURN_IF_ERROR(channel_->TransmitData(&collector_batch_, true /*swap_batch*/));
+  RETURN_IF_ERROR(channel_->TransmitData(&collector_batch_, true /*swap_batch*/, eos));
   collector_batch_->Reset();
   return Status::OK();
 }
 
-void KrpcDataStreamSender::Channel::EndDataStreamCompleteCb() {
-  std::unique_lock<SpinLock> l(lock_);
-  DCHECK(rpc_in_flight_);
-  DCHECK_NE(rpc_start_time_ns_, 0);
-  int64_t total_time_ns = MonotonicNanos() - rpc_start_time_ns_;
-  const kudu::Status controller_status = rpc_controller_.status();
-  if (LIKELY(controller_status.ok())) {
-    // 'receiver_latency_ns' is calculated with MonoTime, so it must be non-negative.
-    DCHECK_GE(eos_resp_.receiver_latency_ns(), 0);
-    DCHECK_GE(total_time_ns, eos_resp_.receiver_latency_ns());
-    int64_t network_time_ns = total_time_ns - eos_resp_.receiver_latency_ns();
-    parent_->network_time_stats_->UpdateCounter(network_time_ns);
-    parent_->recvr_time_stats_->UpdateCounter(eos_resp_.receiver_latency_ns());
-    if (IsSlowRpc(total_time_ns)) LogSlowRpc("EndDataStream", total_time_ns, eos_resp_);
-    MarkDone(StatusFromProto(eos_resp_.status()));
-  } else {
-    if (IsSlowRpc(total_time_ns)) {
-      LogSlowFailedRpc("EndDataStream", total_time_ns, controller_status);
-    }
-    DoRpcFn rpc_fn =
-        std::bind(&KrpcDataStreamSender::Channel::DoEndDataStreamRpc, this);
-    const string& prepend =
-        Substitute("EndDataStream() to $0 failed", NetworkAddressPBToString(address_));
-    HandleFailedRPC(rpc_fn, controller_status, prepend);
-  }
-}
-
-Status KrpcDataStreamSender::Channel::DoEndDataStreamRpc() {
-  DCHECK(rpc_in_flight_);
-  EndDataStreamRequestPB eos_req;
-  rpc_controller_.Reset();
-  if (FLAGS_data_stream_sender_eos_timeout_ms > 0) {
-    // Provide a timeout so EOS RPCs are prioritized over others, as completing a stream
-    // can help free up resources.
-    rpc_controller_.set_timeout(
-        MonoDelta::FromMilliseconds(FLAGS_data_stream_sender_eos_timeout_ms));
-  }
-  *eos_req.mutable_dest_fragment_instance_id() = fragment_instance_id_;
-  eos_req.set_sender_id(parent_->sender_id_);
-  eos_req.set_dest_node_id(dest_node_id_);
-  eos_resp_.Clear();
-  rpc_start_time_ns_ = MonotonicNanos();
-  proxy_->EndDataStreamAsync(eos_req, &eos_resp_, &rpc_controller_,
-      std::bind(&KrpcDataStreamSender::Channel::EndDataStreamCompleteCb, this));
-  return Status::OK();
-}
-
-Status KrpcDataStreamSender::Channel::SendEosAsync() {
+Status KrpcDataStreamSender::Channel::SendEosIfNeededAsync() {
   {
     std::unique_lock<SpinLock> l(lock_);
+    if (eos_) return Status::OK(); // EOS already sent with last TransmitData.
+    RETURN_IF_ERROR(WaitForRpcLocked(&l));
     DCHECK(!rpc_in_flight_);
     DCHECK(rpc_status_.ok());
     if (UNLIKELY(remote_recvr_closed_)) return Status::OK();
-    VLOG_RPC << "calling EndDataStream() to terminate channel. fragment_instance_id="
-             << PrintId(fragment_instance_id_);
-    rpc_in_flight_ = true;
+    VLOG_RPC << "calling TransmitData() without payload to terminate channel."
+             << " fragment_instance_id=" << PrintId(fragment_instance_id_);
     COUNTER_ADD(parent_->eos_sent_counter_, 1);
-    RETURN_IF_ERROR(DoEndDataStreamRpc());
+    rpc_in_flight_ = true;
+    eos_ = true;
+    DCHECK_EQ(rpc_in_flight_batch_, nullptr);
+    RETURN_IF_ERROR(DoTransmitDataRpc());
   }
   return Status::OK();
 }
@@ -748,16 +711,17 @@ class KrpcDataStreamSender::IcebergPositionDeleteChannel {
   Status AddRow(TupleRow* row) {
     RETURN_IF_ERROR(delete_collector_.AddRow(row));
     if (delete_collector_.RowCount() == capacity_) {
-      RETURN_IF_ERROR(Flush());
+      RETURN_IF_ERROR(Flush(false));
     }
     return Status::OK();
   }
 
-  Status Flush() {
+  Status Flush(bool eos) {
     if (delete_collector_.RowCount() == 0) return Status::OK();
     unique_ptr<OutboundRowBatch>* serialization_batch = channel_->GetSerializationBatch();
     RETURN_IF_ERROR(ToOutboundRowBatch(serialization_batch->get()));
-    RETURN_IF_ERROR(channel_->TransmitData(serialization_batch, /*swap_batch=*/true));
+    RETURN_IF_ERROR(
+        channel_->TransmitData(serialization_batch, /*swap_batch=*/true, eos));
     return Status::OK();
   }
 
@@ -1137,11 +1101,15 @@ uint64_t KrpcDataStreamSender::HashRow(TupleRow* row, uint64_t seed) {
   return hash_val;
 }
 
-Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
+Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile()->total_time_counter());
   DCHECK(!closed_);
   DCHECK(!flushed_);
 
+  // Nothing to send. 'eos' is deliberately ignored here: there is no payload to
+  // piggyback it on, and FlushFinal() -> Channel::SendEosIfNeededAsync() sends it as a
+  // request with no row batch header and no sidecars, which is cheaper on both sides
+  // than attaching it to an empty batch would be.
   if (batch->num_rows() == 0) return Status::OK();
   if (partition_type_ == TPartitionType::UNPARTITIONED) {
     // Only skip compression if there is a single channel and destination is in the same
@@ -1156,7 +1124,7 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
       // Do not swap serialization_batch_ with the channel's outbound_batch_ to allow
       // multiple channels to use the data backing serialization_batch_ in parallel.
       RETURN_IF_ERROR(
-          channels_[i]->TransmitData(&serialization_batch_, false /*swap_batch*/));
+          channels_[i]->TransmitData(&serialization_batch_, false /*swap_batch*/, eos));
     }
     // At this point no RPCs can still refer to the old in_flight_batch_.
     in_flight_batch_.swap(serialization_batch_);
@@ -1302,16 +1270,13 @@ Status KrpcDataStreamSender::FlushFinal(RuntimeState* state) {
   // the error is propagated back to the coordinator, which in turn cancels the query,
   // which will cause the remaining open channels to be closed.
   for (auto& [ch, ice_ch] : channel_to_ice_channel_) {
-    RETURN_IF_ERROR(ice_ch->Flush());
+    RETURN_IF_ERROR(ice_ch->Flush(true));
   }
   for (PartitionRowCollector& collector: partition_row_collectors_) {
-    RETURN_IF_ERROR(collector.SendCurrentBatch());
+    RETURN_IF_ERROR(collector.SendCurrentBatch(true));
   }
   for (unique_ptr<Channel>& channel : channels_) {
-    RETURN_IF_ERROR(channel->WaitForRpc());
-  }
-  for (unique_ptr<Channel>& channel : channels_) {
-    RETURN_IF_ERROR(channel->SendEosAsync());
+    RETURN_IF_ERROR(channel->SendEosIfNeededAsync());
   }
   for (unique_ptr<Channel>& channel : channels_) {
     RETURN_IF_ERROR(channel->WaitForRpc());

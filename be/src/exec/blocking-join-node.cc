@@ -358,7 +358,7 @@ Status BlockingJoinNode::SendBuildInputToSink(
           &built_probe_overlap_stop_watch_, ASYNC_BUILD);
       RETURN_IF_ERROR(child(1)->GetNext(state, build_batch_.get(), &eos));
     }
-    RETURN_IF_ERROR(build_sink->Send(state, build_batch_.get()));
+    RETURN_IF_ERROR(build_sink->Send(state, build_batch_.get(), eos));
     build_batch_->Reset();
   } while (!eos);
   RETURN_IF_ERROR(build_sink->FlushFinal(state));

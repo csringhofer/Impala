@@ -409,6 +409,7 @@ Status KrpcDataStreamRecvr::SenderQueue::UnpackRequest(
     const TransmitDataRequestPB* request, RpcContext* rpc_context,
     kudu::Slice* tuple_offsets, kudu::Slice* tuple_data,
     int64_t* serialized_size) {
+  DCHECK(request->has_row_batch_header());
 
   RETURN_IF_ERROR(DebugAction(recvr_->runtime_state_.query_options(),
       "RECVR_UNPACK_PAYLOAD"));
@@ -481,6 +482,14 @@ Status KrpcDataStreamRecvr::SenderQueue::AddBatchWork(int64_t batch_size,
 
 void KrpcDataStreamRecvr::SenderQueue::AddBatch(const TransmitDataRequestPB* request,
     TransmitDataResponsePB* response, RpcContext* rpc_context) {
+  if (!request->has_row_batch_header()) {
+    // In case of EOS with empty data return without trying to unpack.
+    DCHECK(request->eos());
+    recvr_->RemoveSender(request->sender_id());
+    DataStreamService::RespondRpc(Status::OK(), response, rpc_context);
+    return;
+  }
+
   // TODO: Add timers for time spent in this function and queue time in 'batch_queue_'.
   const RowBatchHeaderPB& header = request->row_batch_header();
   kudu::Slice tuple_offsets;
@@ -503,9 +512,9 @@ void KrpcDataStreamRecvr::SenderQueue::AddBatch(const TransmitDataRequestPB* req
   {
     unique_lock<SpinLock> l(lock_);
     // There should be one or more senders left when this function is called. The reason
-    // is that EndDataStream RPC is not sent until all outstanding TransmitData() RPC has
-    // been replied to. There is at least one TransmitData() RPC which hasn't yet been
-    // responded to if we reach here.
+    // is that a sender is only removed once its 'eos' TransmitData() RPC has been
+    // processed, which for the RPC carrying 'eos' happens below this point. There is at
+    // least one TransmitData() RPC which hasn't yet been responded to if we reach here.
     DCHECK_GT(num_remaining_senders_, 0);
     if (UNLIKELY(is_cancelled_)) {
       lock_.unlock();
@@ -532,6 +541,11 @@ void KrpcDataStreamRecvr::SenderQueue::AddBatch(const TransmitDataRequestPB* req
 
     // At this point, we are committed to inserting the row batch into 'batch_queue_'.
     status = AddBatchWork(batch_size, header, tuple_offsets, tuple_data, &l, rpc_context);
+  }
+
+  if (request->eos()) {
+    // Remove sender in case of EOS if it was not deferred.
+    recvr_->RemoveSender(request->sender_id());
   }
 
   // Respond to the sender to ack the insertion of the row batches.
@@ -587,6 +601,10 @@ void KrpcDataStreamRecvr::SenderQueue::ProcessDeferredRpc() {
     recvr_->deferred_rpc_tracker()->Release(ctx->rpc_context->GetTransferSize());
   }
 
+  if (ctx->request->eos()) {
+    recvr_->RemoveSender(ctx->request->sender_id());
+  }
+
   // Responds to the sender to ack the insertion of the row batches.
   // No need to hold lock when enqueuing the response.
   DataStreamService::RespondRpc(status, ctx->response, ctx->rpc_context);
@@ -608,6 +626,16 @@ void KrpcDataStreamRecvr::SenderQueue::TakeOverEarlySender(
   // 'recvr_->mgr_' shouldn't be NULL.
   DCHECK(TestInfo::is_test() || FragmentInstanceState::IsFragmentExecThread());
   DCHECK(!recvr_->closed_ && recvr_->mgr_ != nullptr);
+  int sender_id = ctx->request->sender_id();
+
+  if (!ctx->request->has_row_batch_header()) {
+    // In case of EOS with empty data return without trying to unpack.
+    DCHECK(ctx->request->eos());
+    recvr_->RemoveSender(sender_id);
+    DataStreamService::RespondRpc(Status::OK(), ctx->response, ctx->rpc_context);
+    return;
+  }
+
   COUNTER_ADD(recvr_->total_received_batches_counter_, 1);
   int64_t serialized_size;
   Status status = GetBatchSize(ctx->request, ctx->rpc_context, &serialized_size);
@@ -623,7 +651,6 @@ void KrpcDataStreamRecvr::SenderQueue::TakeOverEarlySender(
   }
   COUNTER_ADD(recvr_->bytes_received_counter_, serialized_size);
   DCHECK_GE(ctx->deserialized_size, 0);
-  int sender_id = ctx->request->sender_id();
   int num_to_dequeue = 0;
   {
     unique_lock<SpinLock> l(lock_);

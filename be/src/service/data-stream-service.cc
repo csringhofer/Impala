@@ -78,7 +78,6 @@ DataStreamService::DataStreamService(MetricGroup* metric_group)
   mem_tracker_.reset(new MemTracker(
       bytes_limit, "Data Stream Service Queue", process_mem_tracker));
   MemTrackerMetric::CreateMetrics(metric_group, mem_tracker_.get(), "DataStreamService");
-  DCHECK_EQ(methods_by_name_.count(string(END_DATA_STREAM)), 1);
 }
 
 Status DataStreamService::Init() {
@@ -107,13 +106,6 @@ bool DataStreamService::Authorize(const google::protobuf::Message* req,
     google::protobuf::Message* resp, RpcContext* context) {
   return ExecEnv::GetInstance()->rpc_mgr()->Authorize("DataStreamService", context,
       mem_tracker());
-}
-
-void DataStreamService::EndDataStream(const EndDataStreamRequestPB* request,
-    EndDataStreamResponsePB* response, RpcContext* rpc_context) {
-  DebugActionNoFail(FLAGS_debug_actions, "END_DATA_STREAM_DELAY");
-  // CloseSender() is guaranteed to eventually respond to this RPC so we don't do it here.
-  ExecEnv::GetInstance()->stream_mgr()->CloseSender(request, response, rpc_context);
 }
 
 void DataStreamService::TransmitData(const TransmitDataRequestPB* request,
@@ -229,15 +221,8 @@ void DataStreamService::RespondAndReleaseRpc(const Status& status,
 template void DataStreamService::RespondRpc(const Status& status,
     TransmitDataResponsePB* response, kudu::rpc::RpcContext* ctx);
 
-template void DataStreamService::RespondRpc(const Status& status,
-    EndDataStreamResponsePB* response, kudu::rpc::RpcContext* ctx);
-
 template void DataStreamService::RespondAndReleaseRpc(const Status& status,
     TransmitDataResponsePB* response, kudu::rpc::RpcContext* ctx,
-    MemTracker* mem_tracker);
-
-template void DataStreamService::RespondAndReleaseRpc(const Status& status,
-    EndDataStreamResponsePB* response, kudu::rpc::RpcContext* ctx,
     MemTracker* mem_tracker);
 
 }

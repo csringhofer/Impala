@@ -59,7 +59,7 @@ Status BufferedPlanRootSink::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status BufferedPlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
+Status BufferedPlanRootSink::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile()->total_time_counter());
   // If the batch is empty, we have nothing to do so just return Status::OK().
   if (batch->num_rows() == 0) return Status::OK();

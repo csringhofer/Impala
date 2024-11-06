@@ -36,7 +36,7 @@ class LocalMultiSink : public DataSink {
   LocalMultiSink(TDataSinkId sink_id, const LocalMultiSinkConfig& sink_config,
       const TDataSink& dsink, RuntimeState* state);
 
-  Status Send(RuntimeState* state, RowBatch* batch) override;
+  Status Send(RuntimeState* state, RowBatch* batch, bool eos) override;
 
   Status FlushFinal(RuntimeState* state) override;
 };

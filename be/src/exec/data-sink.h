@@ -135,9 +135,13 @@ class DataSink {
   /// associated memory. This is a hard requirement if the sink is being used as the
   /// output sink of the fragment, but can be relaxed in certain contexts, e.g. an
   /// embedded NljBuilder.
+  /// 'eos' is true if this is this is the last batch sent. This is redundant with
+  /// FlushFinal(), which will be also called after sending the last row. FlushFinal()
+  /// is called after the source node tree is closed, so it is recommended to do
+  /// finalization in FlushFinal() it needs significant amount of memory.
   /// TODO: IMPALA-5832: we could allow sinks to acquire resources of 'batch' if we
   /// make it possible to always acquire referenced memory.
-  virtual Status Send(RuntimeState* state, RowBatch* batch) = 0;
+  virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos) = 0;
 
   /// Flushes any remaining buffered state.
   /// Further Send() calls are illegal after FlushFinal(). This is to be called only

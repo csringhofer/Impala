@@ -32,7 +32,7 @@ LocalMultiSink::LocalMultiSink(TDataSinkId sink_id,
     RuntimeState* state) : DataSink(sink_id, sink_config, "LocalMultiSink", state) {
 }
 
-Status LocalMultiSink::Send(RuntimeState* state, RowBatch* batch) {
+Status LocalMultiSink::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   return Status::OK();
 }
 

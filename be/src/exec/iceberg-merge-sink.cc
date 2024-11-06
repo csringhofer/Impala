@@ -104,7 +104,7 @@ Status IcebergMergeSink::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status IcebergMergeSink::Send(RuntimeState* state, RowBatch* batch) {
+Status IcebergMergeSink::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   RowBatch delete_rows(this->row_desc_, batch->capacity(), mem_tracker());
   RowBatch insert_rows(this->row_desc_, batch->capacity(), mem_tracker());
   FOREACH_ROW(batch, 0, iter) {
@@ -118,8 +118,8 @@ Status IcebergMergeSink::Send(RuntimeState* state, RowBatch* batch) {
       AddRow(insert_rows, row);
     }
   }
-  RETURN_IF_ERROR(insert_sink_->Send(state, &insert_rows));
-  RETURN_IF_ERROR(delete_sink_->Send(state, &delete_rows));
+  RETURN_IF_ERROR(insert_sink_->Send(state, &insert_rows, eos));
+  RETURN_IF_ERROR(delete_sink_->Send(state, &delete_rows, eos));
   return Status::OK();
 }
 
