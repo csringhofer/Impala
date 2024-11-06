@@ -137,7 +137,7 @@ class DataSink {
   /// embedded NljBuilder.
   /// TODO: IMPALA-5832: we could allow sinks to acquire resources of 'batch' if we
   /// make it possible to always acquire referenced memory.
-  virtual Status Send(RuntimeState* state, RowBatch* batch) = 0;
+  virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos=0) = 0;
 
   /// Flushes any remaining buffered state.
   /// Further Send() calls are illegal after FlushFinal(). This is to be called only

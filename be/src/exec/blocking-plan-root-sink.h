@@ -58,7 +58,7 @@ class BlockingPlanRootSink : public PlanRootSink {
   virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) override;
 
   /// Blocks until the consumer has consumed 'batch' by calling GetNext().
-  virtual Status Send(RuntimeState* state, RowBatch* batch) override;
+  virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos=false) override;
 
   /// Notifies consumer thread of producer eos.
   virtual Status FlushFinal(RuntimeState* state) override;

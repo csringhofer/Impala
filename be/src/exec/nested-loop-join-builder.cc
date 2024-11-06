@@ -183,7 +183,7 @@ Status NljBuilder::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status NljBuilder::Send(RuntimeState* state, RowBatch* batch) {
+Status NljBuilder::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile()->total_time_counter());
   int num_input_rows = batch->num_rows();
   // Swap the contents of the batch into a batch owned by the builder.

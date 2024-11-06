@@ -67,7 +67,7 @@ class IcebergMergeSink : public DataSink {
   /// Sends the incoming rows to their respective sinks based on the content of the
   /// merge action tuple. The merge action tuple contains a TINYINT that hold
   /// a TIcebergMergeSinkAction value.
-  Status Send(RuntimeState* state, RowBatch* batch) override;
+  Status Send(RuntimeState* state, RowBatch* batch, bool eos=false) override;
   Status FlushFinal(RuntimeState* state) override;
   void Close(RuntimeState* state) override;
   void AddRow(RowBatch& output_batch, TupleRow* row);

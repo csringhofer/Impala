@@ -379,7 +379,7 @@ class PhjBuilder : public JoinBuilder {
   /// Implementations of DataSink interface methods.
   virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) override;
   virtual Status Open(RuntimeState* state) override;
-  virtual Status Send(RuntimeState* state, RowBatch* batch) override;
+  virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos) override;
   virtual Status FlushFinal(RuntimeState* state) override;
   virtual void Close(RuntimeState* state) override;
 

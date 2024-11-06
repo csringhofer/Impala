@@ -72,7 +72,7 @@ class KuduTableSink : public DataSink {
 
   /// Transforms 'batch' into Kudu writes and sends them to Kudu.
   /// The KuduSession is flushed on each row batch.
-  virtual Status Send(RuntimeState* state, RowBatch* batch);
+  virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos=false);
 
   /// Forces any remaining buffered operations to be flushed to Kudu.
   virtual Status FlushFinal(RuntimeState* state);

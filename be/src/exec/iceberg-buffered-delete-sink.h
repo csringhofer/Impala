@@ -47,7 +47,7 @@ class IcebergBufferedDeleteSink : public IcebergDeleteSinkBase {
   Status Open(RuntimeState* state) override;
 
   /// Buffers incoming row batches in 'current_partition_'.
-  Status Send(RuntimeState* state, RowBatch* batch) override;
+  Status Send(RuntimeState* state, RowBatch* batch, bool eos=false) override;
 
   /// Writes the buffered records to position delete files in the correct order.
   Status FlushFinal(RuntimeState* state) override;

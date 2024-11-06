@@ -58,7 +58,7 @@ Status KrpcDataStreamSender::PartitionRowCollector::AppendRow(
   if (UNLIKELY(
       num_rows_ == row_batch_capacity_ || collector_batch_->ReachedSizeLimit())) {
      // This swaps collector_batch_ with an empty batch.
-    RETURN_IF_ERROR(SendCurrentBatch());
+    RETURN_IF_ERROR(SendCurrentBatch(false));
   }
   return Status::OK();
 }

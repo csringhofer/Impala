@@ -137,7 +137,7 @@ class KrpcDataStreamSender : public DataSink {
   /// Blocks until all rows in batch are placed in their appropriate outgoing
   /// buffers (ie, blocks if there are still in-flight rpcs from the last
   /// Send() call).
-  virtual Status Send(RuntimeState* state, RowBatch* batch) override;
+  virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos=false) override;
 
   /// Shutdown all existing channels to destination hosts. Further FlushFinal() calls are
   /// illegal after calling Close().
@@ -185,7 +185,7 @@ class KrpcDataStreamSender : public DataSink {
     // in progress. Swaps collector_batch_ with the channel's outbound_batch_.
     // Returns error status if compression failed or if the preceding RPC failed.
     // Returns OK otherwise.
-    Status SendCurrentBatch();
+    Status SendCurrentBatch(bool eos);
   };
   std::vector<PartitionRowCollector> partition_row_collectors_;
 

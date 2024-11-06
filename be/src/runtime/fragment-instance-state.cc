@@ -449,7 +449,7 @@ Status FragmentInstanceState::ExecInternal() {
     UpdateState(StateEvent::BATCH_PRODUCED);
     if (VLOG_ROW_IS_ON) row_batch_->VLogRows("FragmentInstanceState::ExecInternal()");
     COUNTER_ADD(rows_produced_counter_, row_batch_->num_rows());
-    RETURN_IF_ERROR(sink_->Send(runtime_state_, row_batch_.get()));
+    RETURN_IF_ERROR(sink_->Send(runtime_state_, row_batch_.get(), exec_tree_complete));
     UpdateState(StateEvent::BATCH_SENT);
   } while (!exec_tree_complete);
   // Release resources from final row batch.

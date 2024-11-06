@@ -57,7 +57,7 @@ class BufferedPlanRootSink : public PlanRootSink {
 
   /// Creates a copy of the given RowBatch and adds it to the queue. The copy is
   /// necessary as the ownership of 'batch' remains with the sender.
-  virtual Status Send(RuntimeState* state, RowBatch* batch) override;
+  virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos=false) override;
 
   /// Notifies the consumer of producer eos and blocks until the consumer has read all
   /// batches from the queue, or until the sink is either closed or cancelled.

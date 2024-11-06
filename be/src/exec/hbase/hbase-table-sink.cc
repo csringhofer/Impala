@@ -63,7 +63,7 @@ Status HBaseTableSink::Prepare(RuntimeState* state, MemTracker* parent_mem_track
   return Status::OK();
 }
 
-Status HBaseTableSink::Send(RuntimeState* state, RowBatch* batch) {
+Status HBaseTableSink::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile()->total_time_counter());
   expr_results_pool_->Clear();
   RETURN_IF_ERROR(state->CheckQueryState());

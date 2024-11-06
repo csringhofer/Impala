@@ -61,7 +61,7 @@ class MultiTableSink : public DataSink {
 
   Status Open(RuntimeState* state) override;
 
-  Status Send(RuntimeState* state, RowBatch* batch) override;
+  Status Send(RuntimeState* state, RowBatch* batch, bool eos=false) override;
 
   Status FlushFinal(RuntimeState* state) override;
 

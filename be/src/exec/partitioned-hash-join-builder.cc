@@ -299,7 +299,7 @@ Status PhjBuilder::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status PhjBuilder::Send(RuntimeState* state, RowBatch* batch) {
+Status PhjBuilder::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile()->total_time_counter());
   SCOPED_TIMER(partition_build_rows_timer_);
   RETURN_IF_ERROR(AddBatch(batch));

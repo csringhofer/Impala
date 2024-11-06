@@ -189,7 +189,8 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // If 'swap_batch' is true, 'outbound_batch' is swapped with the Channel's
   // 'outbound_batch_'. This happens after the previous RPC is finished so its buffers
   // can be reused.
-  Status TransmitData(std::unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch);
+  Status TransmitData(std::unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch,
+      bool eos=false);
 
   // Shutdowns the channel and frees the row batch allocation. Any in-flight RPC will
   // be cancelled. It's expected that clients normally call SendEosAsync()
@@ -289,6 +290,8 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // TODO: Fix IMPALA-3990
   bool remote_recvr_closed_ = false;
 
+  bool eos_ = false;
+
   // Returns the serialization batch from 'parent'.
   unique_ptr<OutboundRowBatch>* GetSerializationBatch();
 
@@ -300,7 +303,7 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   // internal row batch before sending them to the destination. This may block if
   // the preceding RPC is still in progress. Returns error status if serialization
   // fails or if the preceding RPC fails.
-  Status SendCurrentBatch();
+  Status SendCurrentBatch(bool eos);
 
   // Called when an RPC failed. If it turns out that the RPC failed because the
   // remote server is too busy, this function will schedule RetryCb() to be called
@@ -583,6 +586,8 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
       "Unable to add tuple data to sidecar");
   req.set_tuple_data_sidecar_idx(sidecar_idx);
 
+  if (eos_) req.set_eos(true);
+
   resp_.Clear();
   proxy_->TransmitDataAsync(req, &resp_, &rpc_controller_,
       boost::bind(&KrpcDataStreamSender::Channel::TransmitDataCompleteCb, this));
@@ -593,7 +598,7 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
 }
 
 Status KrpcDataStreamSender::Channel::TransmitData(
-    unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch) {
+    unique_ptr<OutboundRowBatch>* outbound_batch, bool swap_batch, bool eos) {
   VLOG_ROW << "Channel::TransmitData() fragment_instance_id="
            << PrintId(fragment_instance_id_) << " dest_node=" << dest_node_id_
            << " #rows=" << outbound_batch->get()->header()->num_rows();
@@ -603,6 +608,7 @@ Status KrpcDataStreamSender::Channel::TransmitData(
   SCOPED_TIMER(parent_->transmit_data_timer_);
   DCHECK(!rpc_in_flight_);
   DCHECK(rpc_in_flight_batch_ == nullptr);
+  if (eos) eos_ = true;
   // If the remote receiver is closed already, there is no point in sending anything.
   // TODO: Needs better solution for IMPALA-3990 in the long run.
   if (UNLIKELY(remote_recvr_closed_)) return Status::OK();
@@ -634,7 +640,7 @@ unique_ptr<OutboundRowBatch>* KrpcDataStreamSender::Channel::GetSerializationBat
   return serialization_batch;
 }
 
-Status KrpcDataStreamSender::PartitionRowCollector::SendCurrentBatch() {
+Status KrpcDataStreamSender::PartitionRowCollector::SendCurrentBatch(bool eos) {
   if (collector_batch_->IsEmpty()) {
     DCHECK_EQ(num_rows_, 0);
     return Status::OK();
@@ -642,7 +648,7 @@ Status KrpcDataStreamSender::PartitionRowCollector::SendCurrentBatch() {
   num_rows_ = 0;
   RETURN_IF_ERROR(channel_->GetParent()->PrepareBatchForSend(
       collector_batch_.get(), !channel_->IsLocal()));
-  RETURN_IF_ERROR(channel_->TransmitData(&collector_batch_, true /*swap_batch*/));
+  RETURN_IF_ERROR(channel_->TransmitData(&collector_batch_, true /*swap_batch*/, eos));
   collector_batch_->Reset();
   return Status::OK();
 }
@@ -676,6 +682,7 @@ void KrpcDataStreamSender::Channel::EndDataStreamCompleteCb() {
 
 Status KrpcDataStreamSender::Channel::DoEndDataStreamRpc() {
   DCHECK(rpc_in_flight_);
+  eos_ = true;
   EndDataStreamRequestPB eos_req;
   rpc_controller_.Reset();
   if (FLAGS_data_stream_sender_eos_timeout_ms > 0) {
@@ -699,7 +706,7 @@ Status KrpcDataStreamSender::Channel::SendEosAsync() {
     std::unique_lock<SpinLock> l(lock_);
     DCHECK(!rpc_in_flight_);
     DCHECK(rpc_status_.ok());
-    if (UNLIKELY(remote_recvr_closed_)) return Status::OK();
+    if (UNLIKELY(remote_recvr_closed_ || eos_)) return Status::OK();
     VLOG_RPC << "calling EndDataStream() to terminate channel. fragment_instance_id="
              << PrintId(fragment_instance_id_);
     rpc_in_flight_ = true;
@@ -1109,7 +1116,7 @@ uint64_t KrpcDataStreamSender::HashRow(TupleRow* row, uint64_t seed) {
   return hash_val;
 }
 
-Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
+Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile()->total_time_counter());
   DCHECK(!closed_);
   DCHECK(!flushed_);
@@ -1128,7 +1135,7 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
       // Do not swap serialization_batch_ with the channel's outbound_batch_ to allow
       // multiple channels to use the data backing serialization_batch_ in parallel.
       RETURN_IF_ERROR(
-          channels_[i]->TransmitData(&serialization_batch_, false /*swap_batch*/));
+          channels_[i]->TransmitData(&serialization_batch_, false /*swap_batch*/, eos));
     }
     // At this point no RPCs can still refer to the old in_flight_batch_.
     in_flight_batch_.swap(serialization_batch_);
@@ -1281,7 +1288,7 @@ Status KrpcDataStreamSender::FlushFinal(RuntimeState* state) {
     RETURN_IF_ERROR(ice_ch->Flush());
   }
   for (PartitionRowCollector& collector: partition_row_collectors_) {
-    RETURN_IF_ERROR(collector.SendCurrentBatch());
+    RETURN_IF_ERROR(collector.SendCurrentBatch(true));
   }
   for (unique_ptr<Channel>& channel : channels_) {
     RETURN_IF_ERROR(channel->WaitForRpc());

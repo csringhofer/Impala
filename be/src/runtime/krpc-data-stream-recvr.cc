@@ -482,6 +482,9 @@ void KrpcDataStreamRecvr::SenderQueue::AddBatch(const TransmitDataRequestPB* req
     status = AddBatchWork(batch_size, header, tuple_offsets, tuple_data, &l, rpc_context);
   }
 
+  if (request->eos()) {
+    recvr_->RemoveSender(request->sender_id());
+  }
   // Respond to the sender to ack the insertion of the row batches.
   DataStreamService::RespondRpc(status, response, rpc_context);
 }
@@ -536,6 +539,10 @@ void KrpcDataStreamRecvr::SenderQueue::ProcessDeferredRpc() {
 
     // Release to MemTracker while still holding the lock to prevent race with Close().
     recvr_->deferred_rpc_tracker()->Release(ctx->rpc_context->GetTransferSize());
+  }
+
+  if (ctx->request->eos()) {
+    recvr_->RemoveSender(ctx->request->sender_id());
   }
 
   // Responds to the sender to ack the insertion of the row batches.

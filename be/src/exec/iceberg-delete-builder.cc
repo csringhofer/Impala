@@ -207,7 +207,7 @@ Status IcebergDeleteBuilder::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status IcebergDeleteBuilder::Send(RuntimeState* state, RowBatch* batch) {
+Status IcebergDeleteBuilder::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile()->total_time_counter());
   RETURN_IF_ERROR(AddBatch(state, batch));
   COUNTER_ADD(num_build_rows_, batch->num_rows());

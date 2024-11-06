@@ -71,7 +71,7 @@ class PlanRootSink : public DataSink {
       RuntimeState* state, MemTracker* parent_mem_tracker) override = 0;
 
   /// Sends a new batch. Ownership of 'batch' remains with the sender.
-  virtual Status Send(RuntimeState* state, RowBatch* batch) override = 0;
+  virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos=false) override = 0;
 
   /// Indicates eos to the producer. When this method is called, all rows have
   /// successfully been sent by the producer.

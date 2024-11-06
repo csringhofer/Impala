@@ -45,7 +45,7 @@ class HBaseTableSink : public DataSink {
   HBaseTableSink(
       TDataSinkId sink_id, const DataSinkConfig& sink_config, RuntimeState* state);
   virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker);
-  virtual Status Send(RuntimeState* state, RowBatch* batch);
+  virtual Status Send(RuntimeState* state, RowBatch* batch, bool eos=false);
   virtual Status FlushFinal(RuntimeState* state);
   virtual void Close(RuntimeState* state);
 

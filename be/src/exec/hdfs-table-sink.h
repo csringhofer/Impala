@@ -95,7 +95,7 @@ class HdfsTableSink : public TableSinkBase {
   Status Open(RuntimeState* state) override;
 
   /// Append all rows in batch to the temporary Hdfs files corresponding to partitions.
-  Status Send(RuntimeState* state, RowBatch* batch) override;
+  Status Send(RuntimeState* state, RowBatch* batch, bool eos=false) override;
 
   /// Finalize any open files.
   /// TODO: IMPALA-2988: Move calls to functions that can fail in Close() to FlushFinal()
