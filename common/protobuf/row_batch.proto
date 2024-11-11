@@ -38,4 +38,6 @@ message RowBatchHeaderPB {
 
   // The compression codec (if any) used for compressing the row batch.
   optional CompressionTypePB compression_type = 4;
+
+  optional bool has_tuple_offsets_sidecar = 5;
 }

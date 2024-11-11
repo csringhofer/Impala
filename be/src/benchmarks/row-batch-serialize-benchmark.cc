@@ -135,7 +135,7 @@ class RowBatchSerializeBaseline {
                << ", compressed size: " << compressed_size;
     }
 
-    return RowBatch::GetDeserializedSize(*output_batch);
+    return output_batch->GetDeserializedSize();
   }
 
   // Copy of baseline version without dedup logic
@@ -231,7 +231,8 @@ class RowBatchSerializeBaseline {
         if (!desc->HasVarlenSlots()) continue;
         Tuple* tuple = batch->GetRow(i)->GetTuple(j);
         if (tuple == NULL) continue;
-        tuple->ConvertOffsetsToPointers(*desc, tuple_data);
+        int offset = 0;
+        tuple->ConvertOffsetsToPointers(*desc, tuple_data, &offset);
       }
     }
   }

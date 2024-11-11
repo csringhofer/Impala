@@ -359,10 +359,12 @@ Status KrpcDataStreamRecvr::SenderQueue::UnpackRequest(
   RETURN_IF_ERROR(DebugAction(recvr_->runtime_state_.query_options(),
       "RECVR_UNPACK_PAYLOAD"));
 
-  // Unpack the tuple offsets.
-  KUDU_RETURN_IF_ERROR(rpc_context->GetInboundSidecar(
-      request->tuple_offsets_sidecar_idx(), tuple_offsets),
-      "Failed to get the tuple offsets sidecar");
+  if (request->row_batch_header().has_tuple_offsets_sidecar()) {
+    // Unpack the tuple offsets.
+    KUDU_RETURN_IF_ERROR(rpc_context->GetInboundSidecar(
+        request->tuple_offsets_sidecar_idx(), tuple_offsets),
+        "Failed to get the tuple offsets sidecar");
+  }
   // Unpack the tuple data.
   KUDU_RETURN_IF_ERROR(rpc_context->GetInboundSidecar(
       request->tuple_data_sidecar_idx(), tuple_data),

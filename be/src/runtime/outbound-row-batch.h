@@ -84,15 +84,30 @@ class OutboundRowBatch {
   inline Status IR_ALWAYS_INLINE AppendRow(
       const TupleRow* row, const RowDescriptor* row_desc);
 
+  typedef FixedSizeHashTable<Tuple*, int> DedupMap;
+  Status AppendRowWithDedup(
+      const TupleRow* row, const TupleRow* prev_row, DedupMap* distinct_tuples,
+      const RowDescriptor* row_desc);
+
   // Returns true if the size limit (also used by RowBatch) is reached.
   // Only used if the batch is serialized with AppendRow().
   inline bool ReachedSizeLimit();
 
+  int64_t GetDeserializedSize() const {
+    return header_.uncompressed_size() + tuple_offsets_.size() * sizeof(Tuple*);
+  }
+
+  int64_t GetSerializedSize() const {
+    return tuple_data_.size() + tuple_offsets_.size() * sizeof(int32_t);
+  }
+
  private:
   friend class IcebergPositionDeleteCollector;
-  friend class RowBatch;
+  //friend class RowBatch;
   friend class RowBatchSerializeBaseline;
 
+  inline Status IR_ALWAYS_INLINE AppendTuple(
+      const Tuple* tuple, const TupleDescriptor* desc);
   inline bool IR_ALWAYS_INLINE TryAppendTuple(
       const Tuple* tuple, const TupleDescriptor* desc);
 

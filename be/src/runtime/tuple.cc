@@ -191,16 +191,32 @@ void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* of
   }
 }
 
-void Tuple::ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple_data) {
+void Tuple::ConvertOffsetsToPointers(
+    const TupleDescriptor& desc, uint8_t* tuple_data, int* offset) {
   vector<SlotDescriptor*>::const_iterator slot = desc.string_slots().begin();
+  //*offset += desc.byte_size();
   for (; slot != desc.string_slots().end(); ++slot) {
     DCHECK((*slot)->type().IsVarLenStringType());
     if (IsNull((*slot)->null_indicator_offset())) continue;
 
     StringValue* string_val = GetStringSlot((*slot)->tuple_offset());
     if (string_val->IsSmall()) continue;
-    int offset = reinterpret_cast<intptr_t>(string_val->Ptr());
-    string_val->SetPtr(reinterpret_cast<char*>(tuple_data + offset));
+    if (string_val->Ptr() != nullptr) {
+      // Currently only used in Iceberg deletes where path strings are deduplicated.
+      // See IcebergPositionDeleteCollector::Serialize().
+      int string_offset = reinterpret_cast<intptr_t>(string_val->Ptr());
+      string_val->SetPtr(reinterpret_cast<char*>(tuple_data + string_offset));
+      DCHECK_LE(string_offset, *offset);
+      //LOG(INFO) << "string_offset " << string_offset << " offset " << *offset;
+      if (string_offset == *offset) {
+        //LOG(INFO) << "increase offset " << *offset << " with " << string_val->Len();
+        *offset += string_val->Len();
+      }
+    } else {
+      string_val->SetPtr(reinterpret_cast<char*>(tuple_data) + *offset);
+      //LOG(INFO) << "increase offset " << *offset << " with " << string_val->Len();
+      *offset += string_val->Len();
+    }
   }
 
   slot = desc.collection_slots().begin();
@@ -209,16 +225,17 @@ void Tuple::ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple
     if (IsNull((*slot)->null_indicator_offset())) continue;
 
     CollectionValue* coll_value = GetCollectionSlot((*slot)->tuple_offset());
-    int offset = reinterpret_cast<intptr_t>(coll_value->ptr);
-    coll_value->ptr = tuple_data + offset;
-
-    uint8_t* coll_data = coll_value->ptr;
+    coll_value->ptr = reinterpret_cast<uint8_t*>(tuple_data) + *offset;
     const TupleDescriptor& item_desc = *(*slot)->children_tuple_descriptor();
+    //LOG(INFO) << "increase offset " << *offset << " with " << coll_value->num_tuples * item_desc.byte_size();
+    *offset += coll_value->num_tuples * item_desc.byte_size();
+    uint8_t* coll_data = coll_value->ptr;
     for (int i = 0; i < coll_value->num_tuples; ++i) {
       reinterpret_cast<Tuple*>(coll_data)->ConvertOffsetsToPointers(
-          item_desc, tuple_data);
+          item_desc, tuple_data, offset);
       coll_data += item_desc.byte_size();
     }
+
   }
 }
 

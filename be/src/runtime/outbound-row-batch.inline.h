@@ -39,30 +39,37 @@ Status OutboundRowBatch::AppendRow(const TupleRow* row, const RowDescriptor* row
     }
     // Record offset before creating copy (which increments offset and tuple_data)
     tuple_offsets_.push_back(tuple_data_offset_);
-    // Try appending tuple to current tuple_data_. If it doesn't fit to the buffer,
-    // get the exact size needed for the tuple and allocate enough memory for it.
-    // This allows iterating through the varlen slots of most tuples only once.
-    if (UNLIKELY(!TryAppendTuple(tuple, *desc))) {
-      int64_t tuple_size = tuple->TotalByteSize(**desc, true /*assume_smallify*/);
-      int64_t new_size = tuple_data_offset_ + tuple_size;
-      if (new_size > numeric_limits<int32_t>::max()) {
-        return Status(
-            TErrorCode::ROW_BATCH_TOO_LARGE, new_size, numeric_limits<int32_t>::max());
-      }
-      // TODO: Based on experience the below logic doubles the buffer size instead of
-      // resizing to the exact size, similarly to vector. It would be clearer to use a
-      // vector instead of string for tuple_data_, but in the long term it would be
-      // better to use a fixed sized buffer (data_stream_sender_buffer_size) once var
-      // len data is properly accounted for (see IMPALA-12594 for details).
-      tuple_data_.resize(new_size);
-      tuple_data_.resize(tuple_data_.capacity());
-      DCHECK_GT(tuple_data_.size(), 0);
-      bool retry_successful = TryAppendTuple(tuple, *desc);
-      // As the buffer was resized based on the exact size of the tuple the second
-      // attempt must succeed.
-      DCHECK(retry_successful);
-    }
+    RETURN_IF_ERROR(AppendTuple(tuple, *desc));
+
     DCHECK_LE(tuple_data_offset_, tuple_data_.size());
+  }
+  return Status::OK();
+}
+
+Status OutboundRowBatch::AppendTuple(const Tuple* tuple, const TupleDescriptor* desc) {
+  DCHECK(tuple != nullptr);
+  // Try appending tuple to current tuple_data_. If it doesn't fit to the buffer,
+  // get the exact size needed for the tuple and allocate enough memory for it.
+  // This allows iterating through the varlen slots of most tuples only once.
+  if (UNLIKELY(!TryAppendTuple(tuple, desc))) {
+    int64_t tuple_size = tuple->TotalByteSize(*desc, true /*assume_smallify*/);
+    int64_t new_size = tuple_data_offset_ + tuple_size;
+    if (new_size > numeric_limits<int32_t>::max()) {
+      return Status(
+          TErrorCode::ROW_BATCH_TOO_LARGE, new_size, numeric_limits<int32_t>::max());
+    }
+    // TODO: Based on experience the below logic doubles the buffer size instead of
+    // resizing to the exact size, similarly to vector. It would be clearer to use a
+    // vector instead of string for tuple_data_, but in the long term it would be
+    // better to use a fixed sized buffer (data_stream_sender_buffer_size) once var
+    // len data is properly accounted for (see IMPALA-12594 for details).
+    tuple_data_.resize(new_size);
+    tuple_data_.resize(tuple_data_.capacity());
+    DCHECK_GT(tuple_data_.size(), 0);
+    bool retry_successful = TryAppendTuple(tuple, desc);
+    // As the buffer was resized based on the exact size of the tuple the second
+    // attempt must succeed.
+    DCHECK(retry_successful);
   }
   return Status::OK();
 }
@@ -70,12 +77,17 @@ Status OutboundRowBatch::AppendRow(const TupleRow* row, const RowDescriptor* row
 bool OutboundRowBatch::TryAppendTuple(const Tuple* tuple, const TupleDescriptor* desc) {
   DCHECK(tuple != nullptr);
   DCHECK(desc != nullptr);
+  //LOG(INFO) << "TryAppendTuple " << tuple_data_offset_;
   if (tuple_data_.size() == 0) return false;
   DCHECK_GT(tuple_data_.size(), 0);
   uint8_t* dst = reinterpret_cast<uint8_t*>(&tuple_data_[0]) + tuple_data_offset_;
+  uint8_t* dst_orig = dst;
   uint8_t* dst_end = reinterpret_cast<uint8_t*>(&tuple_data_.back()) + 1;
-  return tuple->TryDeepCopy(
-      &dst, dst_end, &tuple_data_offset_, *desc, /* convert_ptrs */ true);
+  bool res = tuple->TryDeepCopy(
+      &dst, dst_end, *desc, /* convert_ptrs */ true);
+  if (res) tuple_data_offset_ += dst - dst_orig;
+  //LOG(INFO) << "tuple_data_offset_ " << tuple_data_offset_ << " size " << (dst - dst_orig);
+  return res;
 }
 
 bool OutboundRowBatch::ReachedSizeLimit() {

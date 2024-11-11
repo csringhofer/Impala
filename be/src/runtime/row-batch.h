@@ -38,7 +38,6 @@ class Slice;
 
 namespace impala {
 
-template <typename K, typename V> class FixedSizeHashTable;
 class MemTracker;
 class OutboundRowBatch;
 class RowBatchHeaderPB;
@@ -355,8 +354,6 @@ class RowBatch {
   /// Utility function: returns total byte size of a batch in either serialized or
   /// deserialized form. If a row batch is compressed, its serialized size can be much
   /// less than the deserialized size.
-  static int64_t GetSerializedSize(const OutboundRowBatch& batch);
-  static int64_t GetDeserializedSize(const OutboundRowBatch& batch);
   static int64_t GetDeserializedSize(const RowBatchHeaderPB& header,
       const kudu::Slice& tuple_offsets);
 
@@ -433,8 +430,6 @@ class RowBatch {
   Status Serialize(OutboundRowBatch* output_batch, bool full_dedup,
       TrackedString* compression_scratch);
 
-  typedef FixedSizeHashTable<Tuple*, int> DedupMap;
-
   /// Implementation for protobuf to serialize this row batch.
   ///
   /// 'distinct_tuples': pointer to an empty DedupMap. Should not be null if full
@@ -454,8 +449,8 @@ class RowBatch {
   /// 'size': Expected size of serialized row batch data.
   ///
   /// Returns error status if serialization failed. Returns OK otherwise.
-  Status Serialize(DedupMap* distinct_tuples, OutboundRowBatch* output_batch,
-      bool* is_compressed, int64_t size, TrackedString* compression_scratch);
+//  Status Serialize(DedupMap* distinct_tuples, OutboundRowBatch* output_batch,
+//      bool* is_compressed, int64_t size, TrackedString* compression_scratch);
 
   /// Implementation for protobuf to deserialize a row batch.
   ///
@@ -479,10 +474,9 @@ class RowBatch {
   /// gaps in the auxiliary and deduplicated tuples (i.e. the smallest footprint for the
   /// row batch). If the distinct_tuples argument is non-null, full deduplication is
   /// enabled. The distinct_tuples map must be empty.
-  int64_t TotalByteSize(DedupMap* distinct_tuples);
+  // int64_t TotalByteSize(DedupMap* distinct_tuples);
 
-  Status SerializeInternal(int64_t size, DedupMap* distinct_tuples,
-      vector<int32_t>* tuple_offsets, char* tuple_data);
+  Status SerializeInternal(bool full_dedup, OutboundRowBatch* output_batch);
 
   /// All members below need to be handled in RowBatch::AcquireState()
 

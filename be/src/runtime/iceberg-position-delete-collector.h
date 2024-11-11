@@ -91,18 +91,16 @@ public:
     Ubsan::MemSet(tuple_data, 0, tuple_data_size);
     int offset = 0;
     for (const auto& [path, positions] : file_to_positions_) {
-      int path_start = offset;
+      // The path is written after the first tuple.
+      int path_start = offset + desc_->byte_size();
       int path_len = path.Len();
-      Ubsan::MemCpy(tuple_data + offset, path.Ptr(), path_len);
-      offset += path_len;
-      for (int64_t pos : positions) {
+      dest->tuple_offsets_.push_back(offset);
+      AppendTuple(positions[0], tuple_data, offset, path_start, path_len);
+      Ubsan::MemCpy(tuple_data + path_start, path.Ptr(), path_len);
+      offset = path_start + path_len;
+      for (int i = 1; i < positions.size(); i++) {
         dest->tuple_offsets_.push_back(offset);
-        Tuple* t = reinterpret_cast<Tuple*>(tuple_data + offset);
-        StringValue* sv = t->GetStringSlot(file_path_offset_);
-        sv->Assign(reinterpret_cast<char*>(path_start), path_len);
-        int64_t* pos_slot = t->GetBigIntSlot(pos_offset_);
-        DCHECK_GE(pos, 0);
-        *pos_slot = pos;
+        AppendTuple(positions[i], tuple_data, offset, path_start, path_len);
         offset += desc_->byte_size();
       }
     }
@@ -112,6 +110,15 @@ public:
   }
 
 private:
+  void AppendTuple(int pos, char* tuple_data, int offset, int path_start, int path_len) {
+    Tuple* t = reinterpret_cast<Tuple*>(tuple_data + offset);
+    StringValue* sv = t->GetStringSlot(file_path_offset_);
+    sv->Assign(reinterpret_cast<char*>(path_start), path_len);
+    int64_t* pos_slot = t->GetBigIntSlot(pos_offset_);
+    DCHECK_GE(pos, 0);
+    *pos_slot = pos;
+  }
+
   void Reset() {
     file_to_positions_.clear();
     insert_it_ = file_to_positions_.end();

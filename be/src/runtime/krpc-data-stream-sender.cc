@@ -521,7 +521,7 @@ void KrpcDataStreamSender::Channel::TransmitDataCompleteCb() {
     // 'receiver_latency_ns' is calculated with MonoTime, so it must be non-negative.
     DCHECK_GE(resp_.receiver_latency_ns(), 0);
     DCHECK_GE(total_time, resp_.receiver_latency_ns());
-    int64_t row_batch_size = RowBatch::GetSerializedSize(*rpc_in_flight_batch_);
+    int64_t row_batch_size = rpc_in_flight_batch_->GetDeserializedSize();
     int64_t network_time = total_time - resp_.receiver_latency_ns();
     COUNTER_ADD(parent_->bytes_sent_counter_, row_batch_size);
     if (LIKELY(network_time > 0)) {
@@ -570,20 +570,23 @@ Status KrpcDataStreamSender::Channel::DoTransmitDataRpc() {
 
   rpc_controller_.Reset();
   int sidecar_idx;
-  // Add 'tuple_offsets_' as sidecar.
-  KUDU_RETURN_IF_ERROR(rpc_controller_.AddOutboundSidecar(RpcSidecar::FromSlice(
-      rpc_in_flight_batch_->TupleOffsetsAsSlice()), &sidecar_idx),
-      "Unable to add tuple offsets to sidecar");
-  req.set_tuple_offsets_sidecar_idx(sidecar_idx);
+
+  if (rpc_in_flight_batch_->header()->has_tuple_offsets_sidecar()) {
+    // Add 'tuple_offsets_' as sidecar.
+    KUDU_RETURN_IF_ERROR(rpc_controller_.AddOutboundSidecar(RpcSidecar::FromSlice(
+        rpc_in_flight_batch_->TupleOffsetsAsSlice()), &sidecar_idx),
+        "Unable to add tuple offsets to sidecar");
+    req.set_tuple_offsets_sidecar_idx(sidecar_idx);
+  }
 
   // Add 'tuple_data_' as sidecar.
-  rpc_start_time_ns_ = MonotonicNanos();
   KUDU_RETURN_IF_ERROR(rpc_controller_.AddOutboundSidecar(
       RpcSidecar::FromSlice(rpc_in_flight_batch_->TupleDataAsSlice()), &sidecar_idx),
       "Unable to add tuple data to sidecar");
   req.set_tuple_data_sidecar_idx(sidecar_idx);
 
   resp_.Clear();
+  rpc_start_time_ns_ = MonotonicNanos();
   proxy_->TransmitDataAsync(req, &resp_, &rpc_controller_,
       boost::bind(&KrpcDataStreamSender::Channel::TransmitDataCompleteCb, this));
   // 'req' took ownership of 'header'. Need to release its ownership or 'header' will be
@@ -770,7 +773,7 @@ class KrpcDataStreamSender::IcebergPositionDeleteChannel {
       bool compress = !channel_->IsLocal();
       RETURN_IF_ERROR(dest->PrepareForSend(NUM_TUPLES_PER_ROW,
           compress ? parent_->compression_scratch_.get(): nullptr));
-      int64_t uncompressed_bytes = RowBatch::GetDeserializedSize(*dest);
+      int64_t uncompressed_bytes = dest->GetDeserializedSize();
       COUNTER_ADD(parent_->uncompressed_bytes_counter_, uncompressed_bytes);
     }
     return Status::OK();
@@ -1329,7 +1332,7 @@ Status KrpcDataStreamSender::SerializeBatch(
     SCOPED_TIMER(serialize_batch_timer_);
     RETURN_IF_ERROR(
         src->Serialize(dest, compress ? compression_scratch_.get() : nullptr));
-    int64_t uncompressed_bytes = RowBatch::GetDeserializedSize(*dest);
+    int64_t uncompressed_bytes = dest->GetDeserializedSize();
     COUNTER_ADD(uncompressed_bytes_counter_, uncompressed_bytes * num_receivers);
   }
   return Status::OK();
@@ -1342,7 +1345,7 @@ Status KrpcDataStreamSender::PrepareBatchForSend(
   SCOPED_TIMER(serialize_batch_timer_);
   RETURN_IF_ERROR(batch->PrepareForSend(row_desc_->tuple_descriptors().size(),
       compress ? compression_scratch_.get() : nullptr, true));
-  int64_t uncompressed_bytes = RowBatch::GetDeserializedSize(*batch);
+  int64_t uncompressed_bytes = batch->GetDeserializedSize();
   COUNTER_ADD(uncompressed_bytes_counter_, uncompressed_bytes);
   return Status::OK();
 }

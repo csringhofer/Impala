@@ -157,8 +157,8 @@ class Tuple {
   /// ('*data' would pass 'data_end') instead of assuming that the tuple fits to buffer.
   /// If it fails, 'data' will be the same as before the call, but the buffer
   /// can be modified (between before '*data' and 'data_end').
-  bool TryDeepCopy(uint8_t** data, const uint8_t* data_end, int* offset,
-      const TupleDescriptor& desc, bool convert_ptrs) const;
+  bool TryDeepCopy(uint8_t** data, const uint8_t* data_end,
+      const TupleDescriptor& desc, bool null_ptrs) const;
 
   /// This function should only be called on tuples created by DeepCopy() with
   /// 'convert_ptrs' = true. It takes all pointers contained in this tuple (i.e. in
@@ -167,7 +167,8 @@ class Tuple {
   /// 'tuple_data'. 'tuple_data' should be the serialized tuple buffer created by
   /// DeepCopy(). Note that 'tuple_data' should always be the beginning of this buffer,
   /// regardless of this tuple's offset in 'tuple_data'.
-  void ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple_data);
+  void ConvertOffsetsToPointers(
+      const TupleDescriptor& desc, uint8_t* tuple_data, int* offset);
 
   /// Materialize 'this' by evaluating the expressions in 'materialize_exprs_ctxs' over
   /// the specified 'row'.
@@ -361,9 +362,9 @@ class Tuple {
   void DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* offset,
       bool convert_ptrs);
 
-  bool TryDeepCopyStrings(uint8_t** data, const uint8_t* data_end, int* offset,
+  bool TryDeepCopyStrings(uint8_t** data, const uint8_t* data_end,
       const TupleDescriptor& desc, bool convert_ptrs);
-  bool TryDeepCopyCollections(uint8_t** data, const uint8_t* data_end, int* offset,
+  bool TryDeepCopyCollections(uint8_t** data, const uint8_t* data_end,
       const TupleDescriptor& desc, bool convert_ptrs);
 
   /// During the construction of hand-crafted codegen'd functions, types cannot generally
