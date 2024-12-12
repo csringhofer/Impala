@@ -57,9 +57,10 @@ const int32_t STREAM_EXPIRATION_TIME_MS = 300 * 1000;
 
 DEFINE_int32(datastream_sender_timeout_ms, 120000, "(Advanced) The time, in ms, that can "
     "elapse  before a plan fragment will time-out trying to send the initial row batch.");
-DEFINE_int32(datastream_service_num_deserialization_threads, 16,
+DEFINE_int32(datastream_service_num_deserialization_threads, 0,
     "Number of threads for deserializing RPC requests deferred due to the receiver "
-    "not ready or the soft limit of the receiver is reached.");
+    "not ready or the soft limit of the receiver is reached. If left at default value 0, "
+    "it will be set to number of CPU cores.");
 DEFINE_int32(datastream_service_deserialization_queue_size, 10000,
     "Number of deferred RPC requests that can be enqueued before being processed by a "
     "deserialization thread.");
@@ -68,10 +69,13 @@ using std::mutex;
 namespace impala {
 
 KrpcDataStreamMgr::KrpcDataStreamMgr(MetricGroup* metrics)
-  : deserialize_pool_("data-stream-mgr", "deserialize",
-      FLAGS_datastream_service_num_deserialization_threads,
-      FLAGS_datastream_service_deserialization_queue_size,
-      boost::bind(&KrpcDataStreamMgr::DeserializeThreadFn, this, _1, _2)) {
+  : num_deserialization_threads_(
+    FLAGS_datastream_service_num_deserialization_threads > 0
+        ? FLAGS_datastream_service_num_deserialization_threads : CpuInfo::num_cores()),
+    deserialize_pool_("data-stream-mgr", "deserialize",
+        num_deserialization_threads_,
+        FLAGS_datastream_service_deserialization_queue_size,
+        boost::bind(&KrpcDataStreamMgr::DeserializeThreadFn, this, _1, _2)) {
   MetricGroup* dsm_metrics = metrics->GetOrCreateChildGroup("datastream-manager");
   num_senders_waiting_ =
       dsm_metrics->AddGauge("senders-blocked-on-recvr-creation", 0L);
@@ -184,7 +188,7 @@ void KrpcDataStreamMgr::AddEarlySender(const TUniqueId& finst_id,
   early_rpcs_tracker_->Consume(transfer_size);
   service_mem_tracker_->Release(transfer_size);
   RecvrId recvr_id = make_pair(finst_id, request->dest_node_id());
-  auto payload = make_unique<TransmitDataCtx>(request, response, rpc_context);
+  auto payload = make_unique<TransmitDataCtx>(request, response, rpc_context, -1);
   early_senders_map_[recvr_id].waiting_sender_ctxs.emplace_back(move(payload));
   num_senders_waiting_->Increment(1);
   total_senders_waited_->Increment(1);
@@ -307,55 +311,71 @@ Status KrpcDataStreamMgr::DeregisterRecvr(
     const TUniqueId& finst_id, PlanNodeId dest_node_id) {
   VLOG_QUERY << "DeregisterRecvr(): fragment_instance_id=" << PrintId(finst_id)
              << ", node=" << dest_node_id;
+  shared_ptr<KrpcDataStreamRecvr> recvr_to_cancel;
   uint32_t hash_value = GetHashValue(finst_id, dest_node_id);
-  lock_guard<mutex> l(lock_);
-  pair<RecvrMap::iterator, RecvrMap::iterator> range =
-      receiver_map_.equal_range(hash_value);
-  while (range.first != range.second) {
-    const shared_ptr<KrpcDataStreamRecvr>& recvr = range.first->second;
-    if (recvr->fragment_instance_id() == finst_id &&
-        recvr->dest_node_id() == dest_node_id) {
-      // Notify concurrent AddData() requests that the stream has been terminated.
-      recvr->CancelStream();
-      RecvrId recvr_id =
-          make_pair(recvr->fragment_instance_id(), recvr->dest_node_id());
-      fragment_recvr_set_.erase(recvr_id);
-      receiver_map_.erase(range.first);
-      closed_stream_expirations_.insert(
-          make_pair(MonotonicMillis() + STREAM_EXPIRATION_TIME_MS, recvr_id));
-      closed_stream_cache_.insert(recvr_id);
-      return Status::OK();
+  {
+    lock_guard<mutex> l(lock_);
+    pair<RecvrMap::iterator, RecvrMap::iterator> range =
+        receiver_map_.equal_range(hash_value);
+    while (range.first != range.second) {
+      const shared_ptr<KrpcDataStreamRecvr>& recvr = range.first->second;
+      if (recvr->fragment_instance_id() == finst_id &&
+          recvr->dest_node_id() == dest_node_id) {
+        recvr_to_cancel = recvr;
+        // Notify concurrent AddData() requests that the stream has been terminated.
+        RecvrId recvr_id =
+            make_pair(recvr->fragment_instance_id(), recvr->dest_node_id());
+        fragment_recvr_set_.erase(recvr_id);
+        receiver_map_.erase(range.first);
+        closed_stream_expirations_.insert(
+            make_pair(MonotonicMillis() + STREAM_EXPIRATION_TIME_MS, recvr_id));
+        closed_stream_cache_.insert(recvr_id);
+        break;
+      }
+      ++range.first;
     }
-    ++range.first;
   }
-
-  const string msg = Substitute(
-      "Unknown row receiver id: fragment_instance_id=$0, dest_node_id=$1",
-      PrintId(finst_id), dest_node_id);
-  return Status(msg);
+  if (recvr_to_cancel == nullptr) {
+    const string msg = Substitute(
+        "Unknown row receiver id: fragment_instance_id=$0, dest_node_id=$1",
+        PrintId(finst_id), dest_node_id);
+    return Status(msg);
+  }
+  // Call CancelStream() after releasing lock_.
+  recvr_to_cancel->CancelStream();
+  return Status::OK();
 }
 
 void KrpcDataStreamMgr::Cancel(const TUniqueId& query_id) {
   VLOG_QUERY << "cancelling active streams for query_id=" << PrintId(query_id);
-  lock_guard<mutex> l(lock_);
-  // Fragment instance IDs are the query ID with the lower bits set to the instance
-  // index. Therefore all finstances for a query are clustered together, starting
-  // after the position in the map where the query_id would be.
-  FragmentRecvrSet::iterator iter =
-      fragment_recvr_set_.lower_bound(make_pair(query_id, 0));
-  while (iter != fragment_recvr_set_.end() &&
-         GetQueryId(iter->first) == query_id) {
-    bool unused;
-    shared_ptr<KrpcDataStreamRecvr> recvr = FindRecvr(iter->first, iter->second, &unused);
-    if (recvr != nullptr) {
-      recvr->CancelStream();
-    } else {
-      // keep going but at least log it
-      LOG(ERROR) << Substitute(
-          "Cancel(): missing in stream_map: fragment_instance_id=$0 node=$1",
-              PrintId(iter->first), iter->second);
+  vector<shared_ptr<KrpcDataStreamRecvr>> receivers_to_cancel;
+  {
+    lock_guard<mutex> l(lock_);
+    // Fragment instance IDs are the query ID with the lower bits set to the instance
+    // index. Therefore all finstances for a query are clustered together, starting
+    // after the position in the map where the query_id would be.
+    FragmentRecvrSet::iterator iter =
+        fragment_recvr_set_.lower_bound(make_pair(query_id, 0));
+    while (iter != fragment_recvr_set_.end() &&
+          GetQueryId(iter->first) == query_id) {
+      bool unused;
+      shared_ptr<KrpcDataStreamRecvr> recvr =
+          FindRecvr(iter->first, iter->second, &unused);
+      if (recvr != nullptr) {
+        receivers_to_cancel.push_back(recvr);
+      } else {
+        // keep going but at least log it
+        LOG(ERROR) << Substitute(
+            "Cancel(): missing in stream_map: fragment_instance_id=$0 node=$1",
+                PrintId(iter->first), iter->second);
+      }
+      ++iter;
     }
-    ++iter;
+  }
+  // Call CancelStream() after releasing lock_.
+  for (shared_ptr<KrpcDataStreamRecvr>& recvr: receivers_to_cancel) {
+    DCHECK(recvr != nullptr);
+    recvr->CancelStream();
   }
 }
 

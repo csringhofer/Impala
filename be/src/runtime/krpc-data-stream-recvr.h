@@ -161,12 +161,6 @@ class KrpcDataStreamRecvr {
   /// sender queue. Called from KrpcDataStreamMgr.
   void RemoveSender(int sender_id);
 
-  /// Return true if the addition of a new batch of size 'batch_size' would exceed the
-  /// total buffer limit.
-  bool ExceedsLimit(int64_t batch_size) {
-    return num_buffered_bytes_.Load() + batch_size > total_buffer_limit_;
-  }
-
   /// Return the current number of deferred RPCs.
   int64_t num_deferred_rpcs() const { return num_deferred_rpcs_.Load(); }
 
@@ -180,11 +174,6 @@ class KrpcDataStreamRecvr {
   TUniqueId fragment_instance_id_;
   PlanNodeId dest_node_id_;
 
-  /// Soft upper limit on the total amount of buffering in bytes allowed for this stream
-  /// across all sender queues. We defer processing of incoming RPCs once the amount of
-  /// buffered data exceeds this value.
-  const int64_t total_buffer_limit_;
-
   /// Row schema. Not owned.
   const RowDescriptor* row_desc_;
 
@@ -195,9 +184,6 @@ class KrpcDataStreamRecvr {
   /// True if Close() has been called on this receiver already. Should only be accessed
   /// from the fragment execution thread.
   bool closed_;
-
-  /// Current number of bytes held across all sender queues.
-  AtomicInt32 num_buffered_bytes_;
 
   /// Current number of outstanding deferred RPCs across all sender queues.
   AtomicInt64 num_deferred_rpcs_;
@@ -295,6 +281,9 @@ class KrpcDataStreamRecvr {
 
   /// Total wall-clock time in which the 'deferred_rpcs_' queues are not empty.
   RuntimeProfile::Counter* total_has_deferred_rpcs_timer_;
+
+  /// Total wall-clock time in which the 'pending_deferred_rpcs_' queues are not empty.
+  RuntimeProfile::Counter* total_has_pending_deferred_rpcs_timer_;
 
   /// Summary stats of time which RPCs spent in KRPC service queue before
   /// being dispatched to the RPC handlers.
