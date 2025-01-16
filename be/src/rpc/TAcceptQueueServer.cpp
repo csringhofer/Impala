@@ -108,13 +108,13 @@ class TAcceptQueueServer::Task : public Runnable {
     }
 
     try {
-      input_->getTransport()->close();
+      //input_->getTransport()->close();
     } catch (const TTransportException& ttx) {
       string errStr = string("TAcceptQueueServer input close failed: ") + ttx.what();
       GlobalOutput(errStr.c_str());
     }
     try {
-      output_->getTransport()->close();
+      //output_->getTransport()->close();
     } catch (const TTransportException& ttx) {
       string errStr = string("TAcceptQueueServer output close failed: ") + ttx.what();
       GlobalOutput(errStr.c_str());
