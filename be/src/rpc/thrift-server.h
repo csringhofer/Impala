@@ -59,6 +59,21 @@ class AuthProvider;
 /// TODO: shutdown is buggy (which only harms tests)
 class ThriftServer {
  public:
+
+   class BufferedTransport :
+      public apache::thrift::transport::TBufferedTransport {
+
+    public:
+      BufferedTransport(std::shared_ptr<apache::thrift::transport::TTransport> transport,
+          uint32_t sz, std::shared_ptr<apache::thrift::TConfiguration> config = nullptr)
+      : apache::thrift::transport::TBufferedTransport(transport, sz, config) {}
+
+      // Close() without flushing. Can be removed if THRIFT-5846 is solved.
+      virtual void close() override {
+        transport_->close();
+      }
+  };
+
   /// Transport factory that wraps transports in a buffered transport with a customisable
   /// buffer-size and optionally in another transport from a provided factory. A larger
   /// buffer is usually more efficient, as it allows the underlying transports to perform
@@ -73,7 +88,7 @@ class ThriftServer {
             new apache::thrift::transport::TTransportFactory())
       : buffer_size_(buffer_size), wrapped_factory_(wrapped_factory) {}
 
-    virtual std::shared_ptr<apache::thrift::transport::TTransport> getTransport(
+    std::shared_ptr<apache::thrift::transport::TTransport> getTransport(
         std::shared_ptr<apache::thrift::transport::TTransport> trans) {
       std::shared_ptr<apache::thrift::transport::TTransport> wrapped =
           wrapped_factory_->getTransport(trans);
@@ -81,7 +96,7 @@ class ThriftServer {
       VerifyMaxMessageSizeInheritance(trans.get(), wrapped.get());
       std::shared_ptr<apache::thrift::transport::TTransport> buffered_wrapped =
           std::shared_ptr<apache::thrift::transport::TTransport>(
-              new apache::thrift::transport::TBufferedTransport(
+              new BufferedTransport(
                   wrapped, buffer_size_, wrapped->getConfiguration()));
       VerifyMaxMessageSizeInheritance(wrapped.get(), buffered_wrapped.get());
       return buffered_wrapped;
