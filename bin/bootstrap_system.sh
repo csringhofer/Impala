@@ -219,6 +219,10 @@ function apt-get {
   return 1
 }
 
+echo "home folder permissions"
+stat ~
+chmod g+X ~
+
 echo ">>> Installing build tools"
 if [[ "$UBUNTU" == true ]]; then
   while sudo fuser /var/lib/dpkg/lock-frontend; do
