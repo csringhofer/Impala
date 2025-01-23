@@ -219,6 +219,9 @@ function apt-get {
   return 1
 }
 
+echo "root folder permissions"
+stat /
+
 echo "home folder permissions"
 stat ~
 chmod o+X ~
