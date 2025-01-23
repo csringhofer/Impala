@@ -221,7 +221,19 @@ function apt-get {
 
 echo "home folder permissions"
 stat ~
-chmod g+X ~
+chmod o+X ~
+
+echo "impala folder permissions"
+stat .
+chmod o+X .
+
+echo "home folder permissions"
+stat /home
+sudo chmod o+X /home
+
+echo "tmp folder permissions"
+stat /tmp
+sudo chmod o+X /tmp
 
 echo ">>> Installing build tools"
 if [[ "$UBUNTU" == true ]]; then
