@@ -20,7 +20,15 @@ package org.apache.impala.analysis;
 import java.io.IOException;
 import java.io.StringReader;
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CoderResult;
+import java.util.Arrays;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.stream.Collectors;
 
+import org.apache.commons.codec.binary.Hex;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.TypeCompatibility;
@@ -29,14 +37,20 @@ import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TStringLiteral;
+import org.apache.impala.util.StringUtils;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java_cup.runtime.Symbol;
 
 public class StringLiteral extends LiteralExpr {
-  private final String value_;
+  private final static Logger LOG = LoggerFactory.getLogger(StringLiteral.class);
+  private final String strValue_;
+  private byte[] binValue_;
   public static int MAX_STRING_LEN = Integer.MAX_VALUE;
 
   // Indicates whether this value needs to be unescaped in toThrift() or comparison.
@@ -50,17 +64,33 @@ public class StringLiteral extends LiteralExpr {
   }
 
   public StringLiteral(String value, Type type, boolean needsUnescaping) {
-    value_ = value;
+    strValue_ = value;
+    // encoding is expected to be successful
+    binValue_ = StringUtils.toUtf8Array(value);
     type_ = type;
     needsUnescaping_ = needsUnescaping;
+    //String redecoded = new String(binValue_, StandardCharsets.UTF_8);
+    //LOG.info("StringLiteral " + strValue_ + "->" + redecoded);
   }
+
+  public StringLiteral(byte[] value, Type type) {
+    // Is is ok the fail as StringLiteral can contain binary data. strValue_ is null in
+    // this case.
+    strValue_ = StringUtils.fromUtf8Buffer(ByteBuffer.wrap(value), true);
+    binValue_ = value;
+    type_ = type;
+    needsUnescaping_ = false;
+    //LOG.info("StringLiteral " + strValue_);
+  }
+
 
   /**
    * Copy c'tor used in clone().
    */
   protected StringLiteral(StringLiteral other) {
     super(other);
-    value_ = other.value_;
+    strValue_ = other.strValue_;
+    binValue_ = other.binValue_;
     needsUnescaping_ = other.needsUnescaping_;
   }
 
@@ -68,12 +98,14 @@ public class StringLiteral extends LiteralExpr {
   protected boolean localEquals(Expr that) {
     if (!super.localEquals(that)) return false;
     StringLiteral other = (StringLiteral) that;
+    // only check binValue_ as it must always exist
     return needsUnescaping_ == other.needsUnescaping_ && type_.equals(other.type_)
-        && value_.equals(other.value_);
+        && Arrays.equals(binValue_, other.binValue_);
   }
 
+  // TODO: shouldn't this also check needsUnescaping?
   @Override
-  public int hashCode() { return value_.hashCode(); }
+  public int hashCode() { return Arrays.hashCode(binValue_); }
 
   @Override
   public String toSqlImpl(ToSqlOptions options) {
@@ -83,17 +115,26 @@ public class StringLiteral extends LiteralExpr {
   @Override
   protected void toThrift(TExprNode msg) {
     msg.node_type = TExprNodeType.STRING_LITERAL;
-    String val = (needsUnescaping_) ? getUnescapedValue() : value_;
-    msg.string_literal = new TStringLiteral(val);
+    byte[] val = binValue_;
+    if (needsUnescaping_) {
+      val = StringUtils.toUtf8Array(getUnescapedValue());
+      // TODO: unescape binary during construction
+    }
+    msg.string_literal = new TStringLiteral(ByteBuffer.wrap(val));
   }
 
   /**
    * Returns the original value that the string literal was constructed with,
    * without escaping or unescaping it.
    */
-  public String getValueWithOriginalEscapes() { return value_; }
+  public String getValueWithOriginalEscapes() {
+    Preconditions.checkState(strValue_ != null);
+    return strValue_;
+  }
 
   public String getUnescapedValue() {
+    //Preconditions.checkState(needsUnescaping_);
+    Preconditions.checkState(strValue_ != null);
     // Unescape string exactly like Hive does. Hive's method assumes
     // quotes so we add them here to reuse Hive's code.
     return MetastoreShim.unescapeSQLString("'" + getNormalizedValue()
@@ -109,12 +150,17 @@ public class StringLiteral extends LiteralExpr {
    *          SQL as a single-quoted string literal.
    */
   private String getNormalizedValue() {
-    final int len = value_.length();
+    if (strValue_ == null) {
+      // express binary using unhex()
+      String hex = Hex.encodeHexString(binValue_);
+      return "unhex(\"" + hex.toUpperCase() +"\")";
+    }
+    final int len = strValue_.length();
     final StringBuilder sb = new StringBuilder(len);
     for (int i = 0; i < len; ++i) {
-      final char currentChar = value_.charAt(i);
+      final char currentChar = strValue_.charAt(i);
       if (currentChar == '\\' && (i + 1) < len) {
-        final char nextChar = value_.charAt(i + 1);
+        final char nextChar = strValue_.charAt(i + 1);
         // unescape an escaped double quote: remove back-slash in front of the quote.
         if (nextChar == '"' || nextChar == '\'' || nextChar == '\\') {
           if (nextChar != '"') {
@@ -144,7 +190,7 @@ public class StringLiteral extends LiteralExpr {
   @Override
   public String debugString() {
     return MoreObjects.toStringHelper(this)
-        .add("value", value_)
+        .add("strValue", strValue_) // TODO base64 encode binvalue?
         .toString();
   }
 
@@ -179,7 +225,8 @@ public class StringLiteral extends LiteralExpr {
    *           or if floating point value is NaN or infinite
    */
   public LiteralExpr convertToNumber(Type targetType) throws AnalysisException {
-    StringReader reader = new StringReader(value_);
+    Preconditions.checkState(strValue_ != null);
+    StringReader reader = new StringReader(strValue_);
     SqlScanner scanner = new SqlScanner(reader);
     // For distinguishing positive and negative numbers.
     boolean negative = false;
@@ -198,7 +245,7 @@ public class StringLiteral extends LiteralExpr {
       throw new AnalysisException("Failed to convert string literal to number.", e);
     }
     if (sym.sym == SqlParserSymbols.NUMERIC_OVERFLOW) {
-      throw new AnalysisException("Number too large: " + value_);
+      throw new AnalysisException("Number too large: " + strValue_);
     }
     if (sym.sym == SqlParserSymbols.INTEGER_LITERAL) {
       BigDecimal val = (BigDecimal) sym.value;
@@ -212,7 +259,7 @@ public class StringLiteral extends LiteralExpr {
     }
     // Symbol is not an integer or floating point literal.
     throw new AnalysisException("Failed to convert string literal '"
-        + value_ + "' to number.");
+        + strValue_ + "' to number.");
   }
 
   @Override
@@ -220,7 +267,17 @@ public class StringLiteral extends LiteralExpr {
     int ret = super.compareTo(o);
     if (ret != 0) return ret;
     StringLiteral other = (StringLiteral) o;
-    String thisValue = needsUnescaping_? getUnescapedValue() : value_;
+    if (strValue_ == null || other.strValue_ == null) {
+      //return Arrays.compare(binValue_, other.binValue_); // added in java 9 :(
+      for (int i = 0; i < binValue_.length && i < other.binValue_.length; i++) {
+        if (binValue_[i] < other.binValue_[i]) return -1;
+        if (binValue_[i] < other.binValue_[i]) return 1;
+      }
+      if (binValue_.length <  other.binValue_.length) return -1;
+      if (binValue_.length >  other.binValue_.length) return 1;
+      return 0;
+    }
+    String thisValue = needsUnescaping_? getUnescapedValue() : strValue_;
     String otherValue = other.needsUnescaping_?
         other.getUnescapedValue() : other.getStringValue();
     return thisValue.compareTo(otherValue);
@@ -228,4 +285,10 @@ public class StringLiteral extends LiteralExpr {
 
   @Override
   public Expr clone() { return new StringLiteral(this); }
+
+  public int length() { return binValue_.length; }
+
+  public boolean isValidUtf8() { return strValue_ != null; }
+
+  public byte[] binValue() { return binValue_; }
 }
