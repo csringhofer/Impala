@@ -836,9 +836,16 @@ public class FunctionCallExpr extends Expr {
 
   @Override
   protected float computeEvalCost() {
+    float callCost = isGeoSpatial() ? GEO_FUNCTION_CALL_COST : FUNCTION_CALL_COST;
     // TODO(tmarshall): Differentiate based on the specific function.
-    return hasChildCosts() ? getChildCosts() + FUNCTION_CALL_COST : UNKNOWN_COST;
+    return hasChildCosts() ? getChildCosts() + callCost : UNKNOWN_COST;
   }
+
+  boolean isGeoSpatial() {
+    if (!getFnName().isBuiltin()) return false;
+    return getFnName().getFunction().startsWith("st_");
+  }
+
 
   public FunctionCallExpr getMergeAggInputFn() { return mergeAggInputFn_; }
   public void setMergeAggInputFn(FunctionCallExpr fn) { mergeAggInputFn_ = fn; }
