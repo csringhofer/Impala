@@ -841,7 +841,7 @@ public class FunctionCallExpr extends Expr {
     return hasChildCosts() ? getChildCosts() + callCost : UNKNOWN_COST;
   }
 
-  boolean isGeoSpatial() {
+  public boolean isGeoSpatial() {
     if (!getFnName().isBuiltin()) return false;
     return getFnName().getFunction().startsWith("st_");
   }

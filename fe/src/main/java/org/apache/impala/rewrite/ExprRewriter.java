@@ -39,14 +39,26 @@ public class ExprRewriter {
   private final static Logger LOG = LoggerFactory.getLogger(ExprRewriter.class);
   private int numChanges_ = 0;
   private final List<ExprRewriteRule> rules_;
+  private final List<ExprRewriteRule> inferredPredicateRules_;
+
 
   public ExprRewriter(List<ExprRewriteRule> rules) {
     rules_ = rules;
+    inferredPredicateRules_ = Lists.newArrayList();
+  }
+
+  public ExprRewriter(List<ExprRewriteRule> rules,
+                      List<ExprRewriteRule> inferredPredicateRules) {
+    rules_ = rules;
+    inferredPredicateRules_ = inferredPredicateRules;
   }
 
   public ExprRewriter(ExprRewriteRule rule) {
     rules_ = Lists.newArrayList(rule);
+    inferredPredicateRules_ = Lists.newArrayList();
   }
+
+
 
   public Expr rewrite(Expr expr, Analyzer analyzer) throws AnalysisException {
     // Keep applying the rule list until no rule has made any changes.
@@ -58,6 +70,20 @@ public class ExprRewriter {
         rewrittenExpr = applyRuleRepeatedly(rewrittenExpr, rule, analyzer);
       }
     } while (oldNumChanges != numChanges_);
+
+    for (ExprRewriteRule rule: inferredPredicateRules_) {
+      rewrittenExpr = applyRuleBottomUp(rewrittenExpr, rule, analyzer);
+    }
+
+    if(oldNumChanges == numChanges_) return rewrittenExpr;
+
+    do {
+      oldNumChanges = numChanges_;
+      for (ExprRewriteRule rule: rules_) {
+        rewrittenExpr = applyRuleRepeatedly(rewrittenExpr, rule, analyzer);
+      }
+    } while (oldNumChanges != numChanges_);
+
     return rewrittenExpr;
   }
 

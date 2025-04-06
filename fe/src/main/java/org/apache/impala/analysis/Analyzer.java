@@ -102,6 +102,7 @@ import org.apache.impala.rewrite.ExprRewriter;
 import org.apache.impala.rewrite.ExtractCommonConjunctRule;
 import org.apache.impala.rewrite.ExtractCompoundVerticalBarExprRule;
 import org.apache.impala.rewrite.FoldConstantsRule;
+import org.apache.impala.rewrite.GeospatialBoundingRectRule;
 import org.apache.impala.rewrite.NormalizeBinaryPredicatesRule;
 import org.apache.impala.rewrite.NormalizeCountStarRule;
 import org.apache.impala.rewrite.NormalizeExprsRule;
@@ -656,6 +657,7 @@ public class Analyzer {
       this.authzFactory = authzFactory;
       this.lineageGraph = new ColumnLineageGraph();
       List<ExprRewriteRule> rules = new ArrayList<>();
+      List<ExprRewriteRule> inferredPredicateRules = new ArrayList<>();
       // BetweenPredicates must be rewritten to be executable. Other non-essential
       // expr rewrites can be disabled via a query option. When rewrites are enabled
       // BetweenPredicates should be rewritten first to help trigger other rules.
@@ -681,9 +683,10 @@ public class Analyzer {
         rules.add(CountDistinctToNdvRule.INSTANCE);
         rules.add(DefaultNdvScaleRule.INSTANCE);
         rules.add(SimplifyCastExprRule.INSTANCE);
+        inferredPredicateRules.add(GeospatialBoundingRectRule.INSTANCE);
       }
       rules.add(CountStarToConstRule.INSTANCE);
-      exprRewriter_ = new ExprRewriter(rules);
+      exprRewriter_ = new ExprRewriter(rules, inferredPredicateRules);
       nullSlotsCache =
           queryCtx.getClient_request().getQuery_options().use_null_slots_cache ?
           CacheBuilder.newBuilder().concurrencyLevel(1).recordStats().build() : null;
