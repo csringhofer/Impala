@@ -39,6 +39,7 @@ namespace impala {
 using BufferAllocator = BufferPool::BufferAllocator;
 using BufferHandle = BufferPool::BufferHandle;
 
+//TODO: consider tcmalloc_aggressive_memory_decommit
 class BufferAllocatorTest : public ::testing::Test {
  public:
   virtual void SetUp() {
