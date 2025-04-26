@@ -189,6 +189,8 @@ DEFINE_int32(metrics_webserver_port, 0,
 DEFINE_string(metrics_webserver_interface, "",
     "Interface to start metrics webserver on. If blank, webserver binds to 0.0.0.0");
 
+DEFINE_bool(tcmalloc_aggressive_memory_decommit, false, "  ");
+
 const static string DEFAULT_FS = "fs.defaultFS";
 
 // The max percentage that the codegen cache can take from the total process memory.
@@ -630,8 +632,9 @@ void ExecEnv::InitTcMallocAggressiveDecommit() {
   // Aggressive decommit is required so that unused pages in the TCMalloc page heap are
   // not backed by physical pages and do not contribute towards memory consumption.
   // Enable it in TCMalloc before InitBufferPool().
+  int val = FLAGS_tcmalloc_aggressive_memory_decommit ? 1 : 0;
   MallocExtension::instance()->SetNumericProperty(
-      "tcmalloc.aggressive_memory_decommit", 1);
+      "tcmalloc.aggressive_memory_decommit", val);
 #endif
 }
 
