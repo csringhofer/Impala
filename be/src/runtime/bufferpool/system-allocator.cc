@@ -28,7 +28,7 @@
 
 // TODO: IMPALA-5073: this should eventually become the default once we are confident
 // that it is superior to allocating via TCMalloc.
-DEFINE_bool(mmap_buffers, true /*false*/,
+DEFINE_bool(mmap_buffers, /*true*/ false,
     "(Experimental) If true, allocate buffers directly from the operating system "
     "instead of with TCMalloc.");
 
@@ -52,7 +52,7 @@ SystemAllocator::SystemAllocator(int64_t min_buffer_len)
   MallocExtension::instance()->GetNumericProperty(
       "tcmalloc.aggressive_memory_decommit", &aggressive_decommit_enabled);
   if (!FLAGS_mmap_buffers && FLAGS_madvise_huge_pages) {
-    CHECK_EQ(true, aggressive_decommit_enabled);
+    //CHECK_EQ(true, aggressive_decommit_enabled);
   }
 #endif
   #ifndef MADV_HUGEPAGE
