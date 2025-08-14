@@ -291,6 +291,9 @@ class BufferedTupleStream {
   /// returns an error, it should not be called again.
   bool AddRow(TupleRow* row, Status* status) noexcept;
 
+  bool IR_ALWAYS_INLINE AddRowInline(
+      TupleRow* row, bool has_var_len_data, Status* status) noexcept;
+
   /// Allocates space to store a row of 'size' bytes (including fixed and variable length
   /// data). If successful, returns a pointer to the allocated row. The caller then must
   /// writes valid data to the row and call AddRowCustomEnd().
@@ -691,7 +694,7 @@ class BufferedTupleStream {
 
   /// The slow path for AddRow() that is called if there is not sufficient space in
   /// the current page.
-  bool AddRowSlow(TupleRow* row, Status* status) noexcept;
+  bool IR_NO_INLINE AddRowSlow(TupleRow* row, Status* status) noexcept;
 
   /// The slow path for AddRowCustomBegin() that is called if there is not sufficient space in
   /// the current page.
@@ -703,11 +706,8 @@ class BufferedTupleStream {
   /// Copies 'row' into the buffer starting at *data and ending at the byte before
   /// 'data_end'. On success, returns true and updates *data to point after the last
   /// byte written. Returns false if there is not enough space in the buffer provided.
-  bool DeepCopy(TupleRow* row, uint8_t** data, const uint8_t* data_end) noexcept;
-
-  /// Templated implementation of DeepCopy().
-  template <bool HAS_NULLABLE_TUPLE>
-  bool DeepCopyInternal(TupleRow* row, uint8_t** data, const uint8_t* data_end) noexcept;
+  //bool DeepCopy(TupleRow* row, uint8_t** data, const uint8_t* data_end, bool has_var_len_data) noexcept;
+  bool IR_ALWAYS_INLINE DeepCopyInternal(TupleRow* row, uint8_t** data, const uint8_t* data_end, bool has_var_len_data) noexcept;
 
   /// Helper function to copy strings in string_slots from tuple into *data.
   /// Updates *data to the end of the string data added. Returns false if the data

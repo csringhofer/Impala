@@ -598,7 +598,11 @@ class PhjBuilder : public JoinBuilder {
   /// Reads the rows in build_batch and partitions them into hash_partitions_. If
   /// 'build_filters' is true, runtime filters are populated. 'is_null_aware' is
   /// set to true if the join type is a null aware join.
-  Status ProcessBuildBatch(
+  Status IR_NO_INLINE ProcessBuildBatch(
+      RowBatch* build_batch, HashTableCtx* ctx, bool build_filters, bool is_null_aware);
+
+  template <bool HAS_VAR_LEN_DATA>
+  Status IR_ALWAYS_INLINE ProcessBuildBatchInternal(
       RowBatch* build_batch, HashTableCtx* ctx, bool build_filters, bool is_null_aware);
 
   /// Helper method for Send() that that does the actual work apart from updating the
@@ -615,8 +619,9 @@ class PhjBuilder : public JoinBuilder {
   /// and sets 'status' if it was unable to append the row, even after spilling
   /// partitions. This odd return convention is used to avoid emitting unnecessary code
   /// for ~Status in perf-critical code.
-  bool AppendRow(
-      BufferedTupleStream* stream, TupleRow* row, Status* status) WARN_UNUSED_RESULT;
+  template <bool HAS_VAR_LEN_DATA>
+  bool IR_ALWAYS_INLINE AppendRow(BufferedTupleStream* stream, TupleRow* row,
+      Status* status) WARN_UNUSED_RESULT;
 
   /// Slow path for AppendRow() above. It is called when the stream has failed to append
   /// the row. We need to find more memory by either switching to IO-buffers, in case the

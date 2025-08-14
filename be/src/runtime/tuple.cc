@@ -191,7 +191,8 @@ void Tuple::DeepCopyVarlenData(const TupleDescriptor& desc, char** data, int* of
   }
 }
 
-void Tuple::ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple_data) {
+bool Tuple::ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple_data) {
+  bool has_varlen_data = false;
   vector<SlotDescriptor*>::const_iterator slot = desc.string_slots().begin();
   for (; slot != desc.string_slots().end(); ++slot) {
     DCHECK((*slot)->type().IsVarLenStringType());
@@ -199,10 +200,12 @@ void Tuple::ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple
 
     StringValue* string_val = GetStringSlot((*slot)->tuple_offset());
     if (string_val->IsSmall()) continue;
+    has_varlen_data = true;
     int offset = reinterpret_cast<intptr_t>(string_val->Ptr());
     string_val->SetPtr(reinterpret_cast<char*>(tuple_data + offset));
   }
-
+  // TODO: could check if all coll slots are NULL or empty
+  if (!desc.collection_slots().empty()) has_varlen_data = true;
   slot = desc.collection_slots().begin();
   for (; slot != desc.collection_slots().end(); ++slot) {
     DCHECK((*slot)->type().IsCollectionType());
@@ -220,6 +223,7 @@ void Tuple::ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple
       coll_data += item_desc.byte_size();
     }
   }
+  return has_varlen_data;
 }
 
 void Tuple::SetNullIndicators(NullIndicatorOffset offset, int64_t num_tuples,

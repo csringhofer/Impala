@@ -167,7 +167,8 @@ class Tuple {
   /// 'tuple_data'. 'tuple_data' should be the serialized tuple buffer created by
   /// DeepCopy(). Note that 'tuple_data' should always be the beginning of this buffer,
   /// regardless of this tuple's offset in 'tuple_data'.
-  void ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple_data);
+  /// Returns true if there is actually var len data in the tuple.
+  bool ConvertOffsetsToPointers(const TupleDescriptor& desc, uint8_t* tuple_data);
 
   /// Materialize 'this' by evaluating the expressions in 'materialize_exprs_ctxs' over
   /// the specified 'row'.

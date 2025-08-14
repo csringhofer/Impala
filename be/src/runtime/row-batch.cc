@@ -45,6 +45,7 @@ const int RowBatch::FIXED_LEN_BUFFER_LIMIT;
 RowBatch::RowBatch(const RowDescriptor* row_desc, int capacity, MemTracker* mem_tracker)
   : num_rows_(0),
     capacity_(capacity),
+    num_rows_without_varlen_data_(0),
     flush_mode_(FlushMode::NO_FLUSH_RESOURCES),
     needs_deep_copy_(false),
     num_tuples_per_row_(row_desc->tuple_descriptors().size()),
@@ -66,6 +67,7 @@ RowBatch::RowBatch(const RowDescriptor* row_desc, const OutboundRowBatch& input_
     MemTracker* mem_tracker)
   : num_rows_(input_batch.header()->num_rows()),
     capacity_(input_batch.header()->num_rows()),
+    num_rows_without_varlen_data_(0),
     flush_mode_(FlushMode::NO_FLUSH_RESOURCES),
     needs_deep_copy_(false),
     num_tuples_per_row_(input_batch.header()->num_tuples_per_row()),
@@ -99,6 +101,7 @@ RowBatch::RowBatch(const RowDescriptor* row_desc, const RowBatchHeaderPB& header
     MemTracker* mem_tracker)
   : num_rows_(0),
     capacity_(0),
+    num_rows_without_varlen_data_(0),
     flush_mode_(FlushMode::NO_FLUSH_RESOURCES),
     needs_deep_copy_(false),
     num_tuples_per_row_(header.num_tuples_per_row()),
@@ -153,12 +156,16 @@ void RowBatch::Deserialize(const kudu::Slice& input_tuple_offsets,
   }
 
   // Check whether we have slots that require offset-to-pointer conversion.
-  if (!row_desc_->HasVarlenSlots()) return;
+  if (!row_desc_->HasVarlenSlots()) {
+    num_rows_without_varlen_data_ = num_rows_;
+    return;
+  }
 
   // For every unique tuple, convert string offsets contained in tuple data into
   // pointers. Tuples were serialized in the order we are deserializing them in,
   // so the first occurrence of a tuple will always have a higher offset than any
   // tuple we already converted.
+  bool has_varlen_data = false;
   Tuple* last_converted = nullptr;
   for (int i = 0; i < num_rows_; ++i) {
     for (int j = 0; j < num_tuples_per_row_; ++j) {
@@ -168,9 +175,10 @@ void RowBatch::Deserialize(const kudu::Slice& input_tuple_offsets,
       // Handle NULL or already converted tuples with one check.
       if (tuple <= last_converted) continue;
       last_converted = tuple;
-      tuple->ConvertOffsetsToPointers(*desc, tuple_data);
+      has_varlen_data |= tuple->ConvertOffsetsToPointers(*desc, tuple_data);
     }
   }
+  if (!has_varlen_data) num_rows_without_varlen_data_ = num_rows_;
 }
 
 Status RowBatch::FromProtobuf(const RowDescriptor* row_desc,
@@ -364,6 +372,7 @@ void RowBatch::FreeBuffers() {
 
 void RowBatch::Reset() {
   num_rows_ = 0;
+  num_rows_without_varlen_data_ = 0;
   capacity_ = tuple_ptrs_size_ / (num_tuples_per_row_ * sizeof(Tuple*));
   tuple_data_pool_.FreeAll();
   FreeBuffers();
@@ -421,6 +430,7 @@ void RowBatch::AcquireState(RowBatch* src) {
 
   num_rows_ = src->num_rows_;
   capacity_ = src->capacity_;
+  num_rows_without_varlen_data_ = src->num_rows_without_varlen_data_;
   // tuple_ptrs_ were allocated with malloc so can be swapped between batches.
   DCHECK(tuple_ptrs_info_.get() == nullptr);
   std::swap(tuple_ptrs_, src->tuple_ptrs_);
@@ -511,6 +521,10 @@ void RowBatch::CopyRows(RowBatch* src, int num_rows, int src_offset, int dst_off
   DCHECK_GE(capacity_, num_rows + dst_offset);
   DCHECK_GE(src->num_rows_, num_rows + src_offset);
   bool same_layout = num_tuples_per_row_ == src->num_tuples_per_row_;
+  if (!src->MayHaveVarLenData()) {
+    num_rows_without_varlen_data_ += num_rows;
+    //LOG(INFO) << "bumping num_rows_without_varlen_data_ " << num_rows_without_varlen_data_ << " " << num_rows_;
+  }
   if (same_layout) {
     // Fast path, single copy.
     TupleRow* dst_row = GetRow(dst_offset);

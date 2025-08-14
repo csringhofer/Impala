@@ -27,6 +27,7 @@
 #include "exprs/scalar-expr-evaluator.h"
 #include "exprs/scalar-expr.h"
 #include "runtime/buffered-tuple-stream.h"
+#include "runtime/buffered-tuple-stream.inline.h"
 #include "runtime/exec-env.h"
 #include "runtime/fragment-state.h"
 #include "runtime/mem-tracker.h"
@@ -309,7 +310,7 @@ Status PhjBuilder::Send(RuntimeState* state, RowBatch* batch) {
 
 Status PhjBuilder::AddBatch(RowBatch* batch) {
   bool build_filters = ht_ctx_->level() == 0 && filter_ctxs_.size() > 0;
-
+  //LOG(INFO) << "may have varlen data" << batch->MayHaveVarLenData();
   PhjBuilderConfig::ProcessBuildBatchFn process_build_batch_fn;
   if (ht_ctx_->level() == 0) {
     process_build_batch_fn = process_build_batch_fn_level0_.load();
@@ -1398,11 +1399,11 @@ Status PhjBuilderConfig::CodegenProcessBuildBatch(LlvmCodeGen* codegen,
   // Replace call sites
   int replaced =
       codegen->ReplaceCallSites(process_build_batch_fn, eval_row_fn, "EvalBuildRow");
-  DCHECK_REPLACE_COUNT(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 2);
 
   replaced = codegen->ReplaceCallSites(
       process_build_batch_fn, insert_filters_fn, "InsertRuntimeFilters");
-  DCHECK_REPLACE_COUNT(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 2);
 
   HashTableCtx::HashTableReplacedConstants replaced_constants;
   const bool stores_duplicates = true;
@@ -1433,12 +1434,36 @@ Status PhjBuilderConfig::CodegenProcessBuildBatch(LlvmCodeGen* codegen,
   // process_build_batch_fn_level0 uses CRC hash if available,
   replaced =
       codegen->ReplaceCallSites(process_build_batch_fn_level0, hash_fn, "HashRow");
-  DCHECK_REPLACE_COUNT(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 2);
 
   // process_build_batch_fn uses murmur
   replaced =
       codegen->ReplaceCallSites(process_build_batch_fn, murmur_hash_fn, "HashRow");
+  DCHECK_REPLACE_COUNT(replaced, 2);
+
+  replaced = codegen->ReplaceCallSitesWithValue(process_build_batch_fn,
+      codegen->GetI32Constant(input_row_desc_->num_tuples_no_inline()),
+      "num_tuples_no_inline");
+  //DCHECK_REPLACE_COUNT(replaced, join_op_ == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN ? 8 : 4);
+  DCHECK_GE(replaced, 2);
+
+  replaced = codegen->ReplaceCallSitesWithBoolConst(process_build_batch_fn,
+      codegen->GetI32Constant(input_row_desc_->has_nullable_tuple_no_inline()),
+      "has_nullable_tuple_no_inline");
+  //LOG(INFO) << " replaced " << replaced;
+  DCHECK_GE(replaced, 2);
+
+  replaced = codegen->ReplaceCallSitesWithBoolConst(process_build_batch_fn,
+      codegen->GetI32Constant(input_row_desc_->has_var_len_slots_no_inline()),
+      "has_var_len_slots_no_inline");
   DCHECK_REPLACE_COUNT(replaced, 1);
+  //LOG(INFO) << " replaced2 " << replaced;
+
+  replaced = codegen->ReplaceCallSitesWithValue(process_build_batch_fn,
+      codegen->GetI32Constant(input_row_desc_->first_tuple_size_no_inline()),
+      "first_tuple_size_no_inline");
+  DCHECK_GE(replaced, 2);
+  //LOG(INFO) << " replaced3 " << replaced;
 
   // Never build filters after repartitioning, as all rows have already been added to the
   // filters during the level0 build. Note that the first argument of this function is the

@@ -144,6 +144,12 @@ class RowBatch {
   void set_num_rows(int num_rows) {
     DCHECK_LE(num_rows, num_rows_);
     DCHECK_GE(num_rows, 0);
+    // If all rows are without var len data, keep this property, reset otherwise.
+    if (num_rows_without_varlen_data_ == num_rows_) {
+      num_rows_without_varlen_data_ = num_rows;
+    } else {
+      num_rows_without_varlen_data_ = 0;
+    }
     num_rows_ = num_rows;
   }
 
@@ -295,6 +301,11 @@ class RowBatch {
   }
 
   bool needs_deep_copy() { return needs_deep_copy_; }
+
+  bool MayHaveVarLenData() {
+    DCHECK_LE(num_rows_without_varlen_data_, num_rows_);
+    return num_rows_without_varlen_data_ != num_rows_;
+  }
 
   /// Transfer ownership of resources to dest.  This includes tuple data in mem
   /// pool and buffers.
@@ -493,6 +504,7 @@ class RowBatch {
 
   int num_rows_;  // # of committed rows
   int capacity_;  // the value of num_rows_ at which batch is considered full.
+  int num_rows_without_varlen_data_ ;
 
   /// If FLUSH_RESOURCES, the resources attached to this batch should be freed or
   /// acquired by a new owner as soon as possible. See MarkFlushResources(). If

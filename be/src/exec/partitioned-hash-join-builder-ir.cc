@@ -35,14 +35,16 @@ class TupleRow;
 
 using namespace impala;
 
-inline bool PhjBuilder::AppendRow(
+template <bool HAS_VAR_LEN_DATA>
+inline bool IR_ALWAYS_INLINE PhjBuilder::AppendRow(
     BufferedTupleStream* stream, TupleRow* row, Status* status) {
-  if (LIKELY(stream->AddRow(row, status))) return true;
+  if (LIKELY(stream->AddRowInline(row, HAS_VAR_LEN_DATA, status))) return true;
   if (UNLIKELY(!status->ok())) return false;
   return AppendRowStreamFull(stream, row, status);
 }
 
-Status PhjBuilder::ProcessBuildBatch(
+template <bool HAS_VAR_LEN_DATA>
+Status IR_ALWAYS_INLINE PhjBuilder::ProcessBuildBatchInternal(
     RowBatch* build_batch, HashTableCtx* ctx, bool build_filters, bool is_null_aware) {
   Status status;
   HashTableCtx::ExprValuesCache* expr_vals_cache = ctx->expr_values_cache();
@@ -53,8 +55,8 @@ Status PhjBuilder::ProcessBuildBatch(
       if (is_null_aware) {
         // If we are NULL aware and this build row has NULL in the eq join slot,
         // append it to the null_aware partition. We will need it later.
-        if (UNLIKELY(
-                !AppendRow(null_aware_partition_->build_rows(), build_row, &status))) {
+        if (UNLIKELY(!AppendRow<HAS_VAR_LEN_DATA>(
+              null_aware_partition_->build_rows(), build_row, &status))) {
           return status;
         }
       }
@@ -68,9 +70,23 @@ Status PhjBuilder::ProcessBuildBatch(
     const uint32_t hash = expr_vals_cache->CurExprValuesHash();
     const uint32_t partition_idx = hash >> (32 - NUM_PARTITIONING_BITS);
     PhjBuilderPartition* partition = hash_partitions_[partition_idx].get();
-    if (UNLIKELY(!AppendRow(partition->build_rows(), build_row, &status))) {
+    if (UNLIKELY(!AppendRow<HAS_VAR_LEN_DATA>(
+          partition->build_rows(), build_row, &status))) {
       return status;
     }
+  }
+  return Status::OK();
+}
+
+Status PhjBuilder::ProcessBuildBatch(
+    RowBatch* build_batch, HashTableCtx* ctx, bool build_filters, bool is_null_aware) {
+  Status status;
+  if (sink_config_.input_row_desc_->has_var_len_slots_no_inline() && build_batch->MayHaveVarLenData()) {
+    RETURN_IF_ERROR(ProcessBuildBatchInternal<true>(
+        build_batch, ctx, build_filters, is_null_aware));
+  } else {
+    RETURN_IF_ERROR(ProcessBuildBatchInternal<false>(
+        build_batch, ctx, build_filters, is_null_aware));
   }
   for (const FilterContext& ctx : filter_ctxs_) ctx.MaterializeValues();
   return Status::OK();

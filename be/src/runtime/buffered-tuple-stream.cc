@@ -1000,7 +1000,7 @@ bool BufferedTupleStream::AddRowSlow(TupleRow* row, Status* status) noexcept {
   int64_t row_size = ComputeRowSize(row);
   uint8_t* data = AddRowCustomBeginSlow(row_size, status);
   if (data == nullptr) return false;
-  bool success = DeepCopy(row, &data, data + row_size);
+  bool success = DeepCopyInternal(row, &data, data + row_size, true);
   DCHECK(success);
   DCHECK_EQ(data, write_ptr_);
   AddRowCustomEnd(row_size);
@@ -1034,87 +1034,7 @@ void BufferedTupleStream::AddLargeRowCustomEnd(int64_t size) noexcept {
 }
 
 bool BufferedTupleStream::AddRow(TupleRow* row, Status* status) noexcept {
-  DCHECK(!closed_);
-  DCHECK(has_write_iterator());
-  if (UNLIKELY(write_page_ == nullptr || !DeepCopy(row, &write_ptr_, write_end_ptr_))) {
-    return AddRowSlow(row, status);
-  }
-  DCHECK_LT(num_rows_, INT64_MAX);
-  DCHECK_LT(write_page_->num_rows, INT64_MAX);
-  ++num_rows_;
-  ++write_page_->num_rows;
-  return true;
-}
-
-bool BufferedTupleStream::DeepCopy(
-    TupleRow* row, uint8_t** data, const uint8_t* data_end) noexcept {
-  return has_nullable_tuple_ ? DeepCopyInternal<true>(row, data, data_end) :
-                               DeepCopyInternal<false>(row, data, data_end);
-}
-
-// TODO: consider codegening this.
-// TODO: in case of duplicate tuples, this can redundantly serialize data.
-template <bool HAS_NULLABLE_TUPLE>
-bool BufferedTupleStream::DeepCopyInternal(
-    TupleRow* row, uint8_t** data, const uint8_t* data_end) noexcept {
-  uint8_t* pos = *data;
-  const uint64_t tuples_per_row = desc_->tuple_descriptors().size();
-  // Copy the not NULL fixed len tuples. For the NULL tuples just update the NULL tuple
-  // indicator.
-  if (HAS_NULLABLE_TUPLE) {
-    int null_indicator_bytes = NullIndicatorBytesPerRow();
-    if (UNLIKELY(pos + null_indicator_bytes > data_end)) return false;
-    uint8_t* null_indicators = pos;
-    pos += NullIndicatorBytesPerRow();
-    memset(null_indicators, 0, null_indicator_bytes);
-    for (int i = 0; i < tuples_per_row; ++i) {
-      uint8_t* null_word = null_indicators + (i >> 3);
-      const uint32_t null_pos = i & 7;
-      const int tuple_size = fixed_tuple_sizes_[i];
-      Tuple* t = row->GetTuple(i);
-      const uint8_t mask = 1 << (7 - null_pos);
-      if (t != nullptr) {
-        if (UNLIKELY(pos + tuple_size > data_end)) return false;
-        memcpy(pos, t, tuple_size);
-        pos += tuple_size;
-      } else {
-        *null_word |= mask;
-      }
-    }
-  } else {
-    // If we know that there are no nullable tuples no need to set the nullability flags.
-    for (int i = 0; i < tuples_per_row; ++i) {
-      const int tuple_size = fixed_tuple_sizes_[i];
-      if (UNLIKELY(pos + tuple_size > data_end)) return false;
-      Tuple* t = row->GetTuple(i);
-      // TODO: Once IMPALA-1306 (Avoid passing empty tuples of non-materialized slots)
-      // is delivered, the check below should become DCHECK(t != nullptr).
-      DCHECK(t != nullptr || tuple_size == 0);
-      memcpy(pos, t, tuple_size);
-      pos += tuple_size;
-    }
-  }
-
-  // Copy inlined string slots. Note: we do not need to convert the string ptrs to offsets
-  // on the write path, only on the read. The tuple data is immediately followed
-  // by the string data so only the len information is necessary.
-  for (int i = 0; i < inlined_string_slots_.size(); ++i) {
-    const Tuple* tuple = row->GetTuple(inlined_string_slots_[i].first);
-    if (HAS_NULLABLE_TUPLE && tuple == nullptr) continue;
-    if (UNLIKELY(!CopyStrings(tuple, inlined_string_slots_[i].second, &pos, data_end)))
-      return false;
-  }
-
-  // Copy inlined collection slots. We copy collection data in a well-defined order so
-  // we do not need to convert pointers to offsets on the write path.
-  for (int i = 0; i < inlined_coll_slots_.size(); ++i) {
-    const Tuple* tuple = row->GetTuple(inlined_coll_slots_[i].first);
-    if (HAS_NULLABLE_TUPLE && tuple == nullptr) continue;
-    if (UNLIKELY(!CopyCollections(tuple, inlined_coll_slots_[i].second, &pos, data_end)))
-      return false;
-  }
-  *data = pos;
-  return true;
+  return AddRowInline(row, true /*has_var_len_data*/, status);
 }
 
 bool BufferedTupleStream::CopyStrings(const Tuple* tuple,
