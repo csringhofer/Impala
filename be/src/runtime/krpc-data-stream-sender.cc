@@ -65,10 +65,10 @@ DEFINE_int64_hidden(data_stream_sender_eos_timeout_ms, 60*60*1000,
     "Timeout for EndDataStream (EOS) RPCs. Setting a timeout prioritizes them over other "
     "DataStreamService RPCs. Defaults to 1 hour. Set to 0 or negative value to disable "
     "the timeout.");
-DEFINE_int64_hidden(data_stream_sender_broadcast_queue_depth, 2,
+DEFINE_int64_hidden(data_stream_sender_broadcast_queue_depth, 4,
     "(Experimental) Number of batches that can be queued in the broadcast "
     "(UNPARTITIONED) data stream sender before the sender blocks.");
-DEFINE_int64_hidden(data_stream_sender_per_channel_queue_depth, 2,
+DEFINE_int64_hidden(data_stream_sender_per_channel_queue_depth, 3,
     "(Experimental) Number of batches that can be queued per channel in partitioned "
     "data stream senders (HASH_PARTITIONED, KUDU, RANDOM, DIRECTED).");
 
