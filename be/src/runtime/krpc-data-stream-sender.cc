@@ -149,7 +149,8 @@ void KrpcDataStreamSenderConfig::Close() {
 // right place, except that's currently called too early). RpcController::Cancel() ensures
 // that the callback is called only after the RPC layer no longer references the sidecar
 // buffers.
-class KrpcDataStreamSender::Channel : public CacheLineAligned {
+class KrpcDataStreamSender::Channel : public CacheLineAligned,
+    public boost::intrusive::list_base_hook<> {
  public:
   // Creates a channel to send data to particular ipaddress/port/fragment instance id/node
   // combination. Row batch capacity is derived from the parent's per_channel_buffer_size_
@@ -350,6 +351,9 @@ class KrpcDataStreamSender::Channel : public CacheLineAligned {
   void LogSlowFailedRpc(
       const char* rpc_name, int64_t total_time_ns, const kudu::Status& err);
 };
+
+struct KrpcDataStreamSender::OutboundQueue::IdleList
+    : public boost::intrusive::list<Channel> {};
 
 Status KrpcDataStreamSender::Channel::Init(
     RuntimeState* state, OutboundQueue* queue) {
@@ -597,15 +601,15 @@ Status KrpcDataStreamSender::PartitionRowCollector::EnqueueCurrentBatch() {
   }
   num_rows_ = 0;
   RETURN_IF_ERROR(channel_->GetParent()->PrepareBatchForSend(
-      collector_batch_.get(), !channel_->IsLocal()));
+      collector_batch_, !channel_->IsLocal()));
   // Obtain the next buffer from the pool before handing the current one to the queue,
   // so serialization of the next batch can overlap with the in-flight RPC.
   // Pass queue_ so WaitForCapacity() avoids allocating a new batch when the queue is
   // already at capacity (uses a pooled batch instead).
-  unique_ptr<OutboundRowBatch> next_batch;
+  OutboundRowBatch* next_batch = nullptr;
   RETURN_IF_ERROR(channel_->GetParent()->WaitForCapacity(&next_batch, queue_));
-  RETURN_IF_ERROR(queue_->Add(&collector_batch_));
-  collector_batch_ = std::move(next_batch);
+  RETURN_IF_ERROR(queue_->Add(collector_batch_));
+  collector_batch_ = next_batch;
   return Status::OK();
 }
 
@@ -733,10 +737,10 @@ class KrpcDataStreamSender::IcebergPositionDeleteChannel {
 
   Status Flush() {
     if (delete_collector_.RowCount() == 0) return Status::OK();
-    unique_ptr<OutboundRowBatch> batch;
+    OutboundRowBatch* batch = nullptr;
     RETURN_IF_ERROR(parent_->WaitForCapacity(&batch, queue_));
-    RETURN_IF_ERROR(ToOutboundRowBatch(batch.get()));
-    RETURN_IF_ERROR(queue_->Add(&batch));
+    RETURN_IF_ERROR(ToOutboundRowBatch(batch));
+    RETURN_IF_ERROR(queue_->Add(batch));
     return Status::OK();
   }
 
@@ -1133,21 +1137,21 @@ Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
     // decompression cost at the receiver. For all other cases (including single remote
     // channel) compression is attempted.
     bool is_local = channels_.size() == 1 && channels_[0]->IsLocal();
-    unique_ptr<OutboundRowBatch> serialization_batch;
+    OutboundRowBatch* serialization_batch = nullptr;
     RETURN_IF_ERROR(WaitForCapacity(&serialization_batch));
     RETURN_IF_ERROR(SerializeBatch(
-        batch, serialization_batch.get(), !is_local, channels_.size()));
-    // Add() dispatches the batch to all channels. The batch is now owned by the queue;
+        batch, serialization_batch, !is_local, channels_.size()));
+    // Add() dispatches the batch to all channels.
     DCHECK_EQ(queues_.size(), 1);
-    RETURN_IF_ERROR(queues_[0]->Add(&serialization_batch));
+    RETURN_IF_ERROR(queues_[0]->Add(serialization_batch));
   } else if (partition_type_ == TPartitionType::RANDOM) {
     // Round-robin batches among channels using per-channel queues.
     bool is_local = channels_.size() == 1 && channels_[current_channel_idx_]->IsLocal();
-    unique_ptr<OutboundRowBatch> serialization_batch;
+    OutboundRowBatch* serialization_batch = nullptr;
     RETURN_IF_ERROR(WaitForCapacity(&serialization_batch,
         queues_[current_channel_idx_].get()));
-    RETURN_IF_ERROR(SerializeBatch(batch, serialization_batch.get(), !is_local, 1));
-    RETURN_IF_ERROR(queues_[current_channel_idx_]->Add(&serialization_batch));
+    RETURN_IF_ERROR(SerializeBatch(batch, serialization_batch, !is_local, 1));
+    RETURN_IF_ERROR(queues_[current_channel_idx_]->Add(serialization_batch));
     current_channel_idx_ = (current_channel_idx_ + 1) % channels_.size();
   } else if (partition_type_ == TPartitionType::KUDU) {
     DCHECK_EQ(partition_expr_evals_.size(), 1);
@@ -1313,8 +1317,13 @@ void KrpcDataStreamSender::Close(RuntimeState* state) {
   }
 
   compression_scratch_.reset(nullptr);
+  // Destroy queues first — their destructors unlink any remaining batches from queue_
+  // lists (safe_link mode auto-clears on destruction).
   queues_.clear();
+  // Unlink any batches remaining in free_batch_pool_.
   free_batch_pool_.clear();
+  // Now all batches are unlinked — safe to destroy the objects.
+  all_batches_.clear();
 
   if (outbound_rb_mem_tracker_.get() != nullptr) {
     outbound_rb_mem_tracker_->Close();
@@ -1355,7 +1364,7 @@ int64_t KrpcDataStreamSender::GetNumDataBytesSent() const {
 }
 
 Status KrpcDataStreamSender::WaitForCapacity(
-    unique_ptr<OutboundRowBatch>* batch, OutboundQueue* queue) {
+    OutboundRowBatch** batch, OutboundQueue* queue) {
   ScopedTimer<MonotonicStopWatch> timer(profile()->inactive_timer(),
       state_->total_network_send_timer());
   // If the queue is already at capacity, force reuse of a pooled batch instead of
@@ -1375,20 +1384,22 @@ Status KrpcDataStreamSender::WaitForCapacity(
   if (!batch_pool_error_.ok()) return batch_pool_error_;
   if (state_->is_cancelled()) return Status::CANCELLED;
   if (!free_batch_pool_.empty()) {
-    *batch = std::move(free_batch_pool_.front());
+    *batch = &free_batch_pool_.front();
     free_batch_pool_.pop_front();
   } else {
     DCHECK_LT(batches_allocated_, batch_pool_max_size_);
-    batch->reset(new OutboundRowBatch(*char_mem_tracker_allocator_));
+    all_batches_.push_back(
+        std::make_unique<OutboundRowBatch>(*char_mem_tracker_allocator_));
+    *batch = all_batches_.back().get();
     ++batches_allocated_;
   }
   (*batch)->Reset();
   return Status::OK();
 }
 
-void KrpcDataStreamSender::ReleaseBatch(unique_ptr<OutboundRowBatch> batch) {
+void KrpcDataStreamSender::ReleaseBatch(OutboundRowBatch* batch) {
   std::unique_lock<SpinLock> l(batch_pool_lock_);
-  free_batch_pool_.push_back(std::move(batch));
+  free_batch_pool_.push_back(*batch);
   batch_pool_cv_.notify_one();
 }
 
@@ -1401,47 +1412,53 @@ void KrpcDataStreamSender::SetBatchPoolError(const Status& status) {
 KrpcDataStreamSender::OutboundQueue::OutboundQueue(
   const std::vector<std::unique_ptr<Channel>>& channels,
   KrpcDataStreamSender* parent)
-  : parent_(parent)
+  : parent_(parent),
+    idle_channels_(new IdleList())
 {
   channels_.reserve(channels.size());
-  idle_channels_.reserve(channels.size());
-  for (auto& ch: channels) {
+  for (auto& ch : channels) {
     channels_.push_back(ch.get());
-    idle_channels_.push_back(ch.get());
+    idle_channels_->push_back(*ch);
   }
 }
 
 KrpcDataStreamSender::OutboundQueue::OutboundQueue(
     Channel* channel, KrpcDataStreamSender* parent)
-  : parent_(parent) {
+  : parent_(parent),
+    idle_channels_(new IdleList()) {
   channels_.push_back(channel);
-  idle_channels_.push_back(channel);
+  idle_channels_->push_back(*channel);
 }
 
-Status KrpcDataStreamSender::OutboundQueue::Add(
-    unique_ptr<OutboundRowBatch>* batch) {
-  std::vector<Channel*> local_idle;
-  OutboundRowBatch* batch_ptr = batch->get();
+KrpcDataStreamSender::OutboundQueue::~OutboundQueue() = default;
+
+Status KrpcDataStreamSender::OutboundQueue::Add(OutboundRowBatch* batch) {
+  IdleList local_idle;
   bool all_closed;
   {
     std::unique_lock<SpinLock> l(lock_);
     DCHECK(!eos_);
-    local_idle.swap(idle_channels_);
+    local_idle.splice(local_idle.end(), *idle_channels_);
     all_closed = (closed_channel_count_ == (int)channels_.size());
     if (!all_closed) {
-      int consumers_left = channels_.size() - closed_channel_count_;
-      queue_.emplace_back(QueuedBatch{std::move(*batch), consumers_left});
+      batch->consumers_left_ = channels_.size() - closed_channel_count_;
+      queue_.push_back(*batch);
     }
   }
   if (all_closed) {
     // All channels are closed. Return the batch directly to the pool.
-    parent_->ReleaseBatch(std::move(*batch));
+    parent_->ReleaseBatch(batch);
     return Status::OK();
   }
   // Dispatch to idle channels outside the lock. Busy channels will pick up the batch
   // from the queue when their current RPC completes (via RpcFinished()).
-  for (Channel* ch : local_idle) {
-    Status s = ch->TransmitData(batch_ptr);
+  // Pop each channel before calling TransmitData: the async RPC may complete on a
+  // reactor thread and RpcFinished() may re-link the channel into idle_channels_
+  // before this loop advances. The channel must be unlinked at that point.
+  while (!local_idle.empty()) {
+    Channel& ch = local_idle.front();
+    local_idle.pop_front();
+    Status s = ch.TransmitData(batch);
     if (UNLIKELY(!s.ok())) {
       SetError(s);
       return s;
@@ -1451,18 +1468,18 @@ Status KrpcDataStreamSender::OutboundQueue::Add(
 }
 
 Status KrpcDataStreamSender::OutboundQueue::FlushFinal() {
-  std::vector<Channel*> local_idle;
+  IdleList local_idle;
   {
     std::unique_lock<SpinLock> l(lock_);
     eos_ = true;
-    local_idle.swap(idle_channels_);
+    local_idle.splice(local_idle.end(), *idle_channels_);
     // No notify here: WaitUntilEmpty() is called from the same thread after FlushFinal()
     // returns, so it cannot be waiting yet.
   }
   // Send EOS to idle channels outside the lock. In-flight channels will send EOS
   // directly from RpcFinished() once they deliver their last data batch (eos_ is true).
-  for (Channel* ch : local_idle) {
-    RETURN_IF_ERROR(ch->SendEosAsync());
+  for (Channel& ch : local_idle) {
+    RETURN_IF_ERROR(ch.SendEosAsync());
   }
   return Status::OK();
 }
@@ -1472,10 +1489,10 @@ OutboundRowBatch* KrpcDataStreamSender::OutboundQueue::RpcFinished(
   *send_eos = false;
   std::unique_lock<SpinLock> l(lock_);
   if (!status_.ok()) return nullptr;
-  DCHECK_GT(queue_.size(), 0);
+  DCHECK(!queue_.empty());
 
-  // Find 'batch' in the queue and decrement its consumers_left. If the channel is
-  // closing, also decrement consumers_left for all subsequent entries, since this
+  // Find 'batch' in the queue and decrement its consumers_left_. If the channel is
+  // closing, also decrement consumers_left_ for all subsequent entries, since this
   // channel will never send them. In broadcast (multiple channels), 'batch' may be
   // at any position in the queue as other channels may be in-flight on earlier batches.
   // For non-closing channels, also capture the next queued entry to send next.
@@ -1485,47 +1502,52 @@ OutboundRowBatch* KrpcDataStreamSender::OutboundQueue::RpcFinished(
   OutboundRowBatch* next_queued = nullptr;
   bool past_batch = false;
   for (auto& e : queue_) {
-    DCHECK_GT(e.consumers_left, 0);
+    DCHECK_GT(e.consumers_left_, 0);
     if (past_batch) {
       if (!closed) {
-        next_queued = e.batch.get();
+        next_queued = &e;
         break;
       }
-      // closed is true: decrement consumers_left for all subsequent entries,
+      // closed is true: decrement consumers_left_ for all subsequent entries,
       // since this channel will never send them.
-      --e.consumers_left;
-    } else if (e.batch.get() == batch) {
-      --e.consumers_left;
+      --e.consumers_left_;
+    } else if (&e == batch) {
+      --e.consumers_left_;
       past_batch = true;
     }
   }
   DCHECK(past_batch) << "batch not found in queue_";
   // Drain any newly-exhausted entries from the front. In the non-closed case only the
-  // front entry can reach consumers_left == 0 (non-front entries cannot be exhausted
+  // front entry can reach consumers_left_ == 0 (non-front entries cannot be exhausted
   // before the front because channels process batches in order). When a channel closes,
   // multiple front entries may become exhausted in one pass.
-  // Collect exhausted entries into a local vector and call ReleaseBatch() after
-  // dropping lock_ to shorten the critical section.
-  std::vector<std::unique_ptr<OutboundRowBatch>> to_release;
-  while (!queue_.empty() && queue_.front().consumers_left == 0) {
-    to_release.push_back(std::move(queue_.front().batch));
+  // Collect exhausted entries into a local intrusive list and call ReleaseBatch() after
+  // dropping lock_ to shorten the critical section. No heap allocation.
+  OutboundBatchList to_release;
+  while (!queue_.empty() && queue_.front().consumers_left_ == 0) {
+    OutboundRowBatch& b = queue_.front();
     queue_.pop_front();
+    to_release.push_back(b);
   }
   if (closed) {
     DCHECK(next_queued == nullptr);
     closed_channel_count_++;
-    DCHECK_LE(closed_channel_count_, channels_.size());
+    DCHECK_LE(closed_channel_count_, (int)channels_.size());
     NotifyIfAllChannelsDone();
   } else if (next_queued == nullptr) {
     // This channel sent all batches in queue. Can send EOS if FlushFinal() was called.
     if (eos_) {
       *send_eos = true;
     } else {
-      idle_channels_.push_back(channel);
+      idle_channels_->push_back(*channel);
     }
   }
   l.unlock();
-  for (auto& b : to_release) parent_->ReleaseBatch(std::move(b));
+  while (!to_release.empty()) {
+    OutboundRowBatch& b = to_release.front();
+    to_release.pop_front();
+    parent_->ReleaseBatch(&b);
+  }
   return next_queued;
 }
 
@@ -1537,7 +1559,7 @@ void KrpcDataStreamSender::OutboundQueue::EosFinished() {
 
 int KrpcDataStreamSender::OutboundQueue::Size() {
   std::unique_lock<SpinLock> l(lock_);
-  return queue_.size();
+  return (int)queue_.size();
 }
 
 void KrpcDataStreamSender::OutboundQueue::SetError(const Status& status) {
@@ -1556,12 +1578,13 @@ void KrpcDataStreamSender::OutboundQueue::NotifyIfAllChannelsDone() {
   }
 }
 
+
 Status KrpcDataStreamSender::OutboundQueue::WaitUntilEmpty() {
   ScopedTimer<MonotonicStopWatch> timer(parent_->profile()->inactive_timer(),
       parent_->state_->total_network_send_timer());
   std::unique_lock<SpinLock> l(lock_);
   bool cancelled = parent_->state_->is_cancelled();
-  int num_channels = channels_.size();
+  int num_channels = (int)channels_.size();
   while ((!queue_.empty()
       || eos_completed_count_ + closed_channel_count_ < num_channels)
       && !cancelled && status_.ok()) {

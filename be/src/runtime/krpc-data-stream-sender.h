@@ -24,6 +24,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <boost/intrusive/list.hpp>
+
 #include "codegen/impala-ir.h"
 #include "common/global-types.h"
 #include "common/object-pool.h"
@@ -205,10 +207,12 @@ class KrpcDataStreamSender : public DataSink {
   class IcebergPositionDeleteChannel;
   class OutboundQueue;
 
+  using OutboundBatchList = boost::intrusive::list<OutboundRowBatch>;
+
   // Per partition structure to collect rows before sending the OutboundRowBatch to
   // Channel. Only used in HASH/KUDU partitioning.
   struct PartitionRowCollector {
-    std::unique_ptr<OutboundRowBatch> collector_batch_;
+    OutboundRowBatch* collector_batch_ = nullptr;
     KrpcDataStreamSender* parent_ = nullptr;
     Channel* channel_ = nullptr;
     OutboundQueue* queue_ = nullptr;
@@ -245,11 +249,13 @@ class KrpcDataStreamSender : public DataSink {
     // DIRECTED).
     OutboundQueue(Channel* channel, KrpcDataStreamSender* parent);
 
+    ~OutboundQueue();
+
     // Enqueues 'batch' for delivery to all channels. Non-blocking. The caller must
     // have obtained 'batch' from the parent's batch pool (via WaitForCapacity()).
     // Dispatches the batch immediately to any currently idle channels and enqueues it
     // for busy ones.
-    Status Add(std::unique_ptr<OutboundRowBatch>* batch);
+    Status Add(OutboundRowBatch* batch);
 
     // Signals that no more batches will be added. Sets 'eos_' so that each in-flight
     // channel will send its EOS RPC immediately from the reactor thread once it delivers
@@ -298,25 +304,21 @@ class KrpcDataStreamSender : public DataSink {
     // All channels managed (but not owned) by this queue.
     std::vector<Channel*> channels_;
 
-    // Channels that are currently idle (not sending any batch). These are sent to
-    // immediately when Add() enqueues a new batch.
-    std::vector<Channel*> idle_channels_;
-
-    // Wrapper for a queued OutboundRowBatch with a per-entry ref counter tracking
-    // how many channels still need to send it.
-    struct QueuedBatch {
-      std::unique_ptr<OutboundRowBatch> batch;
-      // Number of non-closed channels that still need to send this batch.
-      int consumers_left = 0;
-    };
-
     // Batches currently in flight. The front of the queue is the oldest batch, sent
     // first. A batch is removed from the front only once all channels have finished
-    // sending it (QueuedBatch::consumers_left reaches 0).
-    std::list<QueuedBatch> queue_;
+    // sending it (OutboundRowBatch::consumers_left_ reaches 0).
+    // Intrusive list — no per-node heap allocation.
+    OutboundBatchList queue_;
 
     // Parent sender. Not owned.
     KrpcDataStreamSender* parent_;
+
+    // Channels that are currently idle (not sending any batch). These are sent to
+    // immediately when Add() enqueues a new batch.
+    // Intrusive list — no per-node heap allocation. Defined in .cc where Channel is
+    // complete; stored as opaque struct behind unique_ptr.
+    struct IdleList;
+    std::unique_ptr<IdleList> idle_channels_;
 
     // Number of channels that have reported DATASTREAM_RECVR_CLOSED and are therefore
     // permanently excluded from future sends.
@@ -503,7 +505,13 @@ class KrpcDataStreamSender : public DataSink {
   std::condition_variable_any batch_pool_cv_;
 
   // Pool of free OutboundRowBatch buffers available for serialization.
-  std::list<std::unique_ptr<OutboundRowBatch>> free_batch_pool_;
+  // Intrusive list — no per-node heap allocation.
+  OutboundBatchList free_batch_pool_;
+
+  // Owns all allocated OutboundRowBatch objects. Grows monotonically up to
+  // batch_pool_max_size_; destroyed in Close(). The intrusive lists (free_batch_pool_,
+  // OutboundQueue::queue_) merely organize these objects by state.
+  std::vector<std::unique_ptr<OutboundRowBatch>> all_batches_;
 
   // Maximum number of OutboundRowBatches that may be simultaneously in-flight
   // (i.e. queued or being sent).
@@ -522,19 +530,18 @@ class KrpcDataStreamSender : public DataSink {
   Status batch_pool_error_;
 
   // Blocks until a free OutboundRowBatch buffer is available in free_batch_pool_,
-  // then moves it into '*batch'. If 'queue' is non-null, checks queue->Size() upfront
-  // to avoid allocating a new batch when the channel's queue is already at capacity;
-  // in that case the call blocks until a pooled batch is available. Returns error status
-  // if a channel RPC failed or the query was cancelled. Must be called before
-  // SerializeBatch() each iteration.
+  // then sets '*batch' to point to it. If 'queue' is non-null, checks queue->Size()
+  // upfront to avoid allocating a new batch when the channel's queue is already at
+  // capacity; in that case the call blocks until a pooled batch is available. Returns
+  // error status if a channel RPC failed or the query was cancelled. Must be called
+  // before SerializeBatch() each iteration.
   // Called only from fragment instance thread.
-  Status WaitForCapacity(std::unique_ptr<OutboundRowBatch>* batch,
-      OutboundQueue* queue = nullptr);
+  Status WaitForCapacity(OutboundRowBatch** batch, OutboundQueue* queue = nullptr);
 
   // Returns 'batch' to free_batch_pool_ and signals WaitForCapacity(). Called from
   // OutboundQueue::RpcFinished() on the KRPC reactor thread.
   // Called only from KRPC reactor thread.
-  void ReleaseBatch(std::unique_ptr<OutboundRowBatch> batch);
+  void ReleaseBatch(OutboundRowBatch* batch);
 
   // Sets batch_pool_error_ and wakes WaitForCapacity(). Called from OutboundQueue
   // on the first RPC failure.

@@ -56,7 +56,7 @@ Status KrpcDataStreamSender::PartitionRowCollector::AppendRow(
     const TupleRow* row, const RowDescriptor* row_desc) {
   if (collector_batch_ == nullptr) {
     RETURN_IF_ERROR(parent_->WaitForCapacity(&collector_batch_));
-    DCHECK(collector_batch_ != nullptr);
+    DCHECK_NE(collector_batch_, nullptr);
   }
   DCHECK_LT(num_rows_, row_batch_capacity_);
   num_rows_++;
