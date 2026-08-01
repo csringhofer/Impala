@@ -375,3 +375,31 @@ row_regex:.*BROADCAST \(key-range filtered\).*
 ---- TYPES
 STRING
 ====
+---- QUERY
+# Cost gate -- replication ratio. tpch_iceberg.lineitem_overlap has THREE files that
+# each span (almost) the whole l_orderkey domain, so a build row's key is covered by
+# nearly every file: key-range routing would ship an almost-full broadcast while giving
+# up the shared-sidecar broadcast path -- a net loss. The estimated replication ratio
+# (~1.0) exceeds the 0.6 threshold, so the optimization is skipped. The result must
+# still be correct via plain broadcast (matches the full join, 6001215).
+select straight_join count(*)
+from tpch_iceberg.lineitem_overlap l
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+6001215
+---- TYPES
+BIGINT
+====
+---- QUERY
+# The overlapping (heavy-replication) probe must NOT engage key-range filtering: the
+# ratio gate rejects it and it falls back to a plain broadcast.
+set explain_level=3;
+explain
+select straight_join count(*)
+from tpch_iceberg.lineitem_overlap l
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS: VERIFY_IS_NOT_IN
+row_regex:.*key-range filtered.*
+---- TYPES
+STRING
+====

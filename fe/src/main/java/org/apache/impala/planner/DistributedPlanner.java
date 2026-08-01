@@ -20,6 +20,7 @@ package org.apache.impala.planner;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
@@ -59,6 +60,19 @@ import com.google.common.math.IntMath;
  */
 public class DistributedPlanner {
   private final static Logger LOG = LoggerFactory.getLogger(DistributedPlanner.class);
+
+  // FBCAST cost gates (prototype constants; TODO: expose as query options).
+  // Minimum estimated broadcast-build size to bother routing by key range: below
+  // this a plain broadcast is already cheap and FBCAST's per-channel copy (it loses
+  // the shared-sidecar broadcast path) plus any runtime-filter aggregation would
+  // dominate the savings.
+  private static final long FBCAST_MIN_BUILD_BYTES = 1024 * 1024; // 1 MB
+  // Maximum tolerated replication ratio: the estimated fraction of probe files that
+  // cover a uniformly-random key over the covered domain (an assignment-independent
+  // proxy for the average fraction of hosts each build row reaches). Above this the
+  // files overlap so heavily that FBCAST would ship nearly a full broadcast anyway
+  // while paying the per-channel-copy cost -- a net loss.
+  private static final double FBCAST_MAX_REPLICATION_RATIO = 0.6;
 
   private final PlannerContext ctx_;
 
@@ -699,7 +713,7 @@ public class DistributedPlanner {
       }
       if (fbCand != null) {
         Map<String, long[]> bounds = logFilteredBroadcastBounds(fbCand);
-        if (bounds != null) {
+        if (bounds != null && filteredBroadcastGatesPass(node, bounds)) {
           // FBCAST step 3 / backend steps A+B: mark the build-side stream so the
           // sender routes each row by key range instead of broadcasting to all
           // hosts. The build-side join key (rhs of the eq conjunct) is the routing
@@ -870,6 +884,93 @@ public class DistributedPlanner {
         cand.probeTable.getFullName(), cand.columnName, n, sb.toString());
     LOG.info("FBCAST: disjoint_pairs={}/{}", disjointPairs, totalPairs);
     return bounds;
+  }
+
+  /**
+   * FBCAST cost gates: returns true iff the filtered-broadcast optimization is worth
+   * engaging for this join, else false (fall back to plain broadcast -- always
+   * correct). Two guards, both efficiency-only:
+   *   1. Build size: only route a broadcast build by key range when its estimated size
+   *      is at least FBCAST_MIN_BUILD_BYTES. A small build is cheap to broadcast, and
+   *      FBCAST would give up the shared-sidecar broadcast path (paying a per-channel
+   *      deep copy) plus, for remote runtime-filter targets, filter aggregation -- more
+   *      than the savings. Unknown size (no stats) is treated as "pass" so the
+   *      optimization still engages when we cannot prove the build is small.
+   *   2. Replication ratio: estimate the fraction of probe files covering a uniformly
+   *      random key over the covered domain (see estimateReplicationRatio). This is the
+   *      average fraction of hosts each build row is sent to (exact under one file per
+   *      host); above FBCAST_MAX_REPLICATION_RATIO the files overlap so much that FBCAST
+   *      ships nearly a full broadcast while still paying the per-channel copy cost.
+   * A single-host probe also skips (broadcast already sends to one host -- no benefit).
+   */
+  private boolean filteredBroadcastGatesPass(
+      HashJoinNode node, Map<String, long[]> bounds) {
+    // Gate 1: build size. node.getChild(1) is the build input (its exchange); its
+    // cardinality * avg row size approximates the broadcast build volume.
+    long buildCard = node.getChild(1).getCardinality();
+    float buildAvgRow = node.getChild(1).getAvgRowSize();
+    if (buildCard >= 0 && buildAvgRow > 0.0f) {
+      double buildBytes = (double) buildCard * buildAvgRow;
+      if (buildBytes < FBCAST_MIN_BUILD_BYTES) {
+        LOG.info("FBCAST: build est {} bytes < {} min; skipping optimization",
+            (long) buildBytes, FBCAST_MIN_BUILD_BYTES);
+        return false;
+      }
+    }
+    // A probe scanned on a single host makes broadcast == FBCAST (one destination).
+    int numHosts = node.getChild(0).getNumNodes();
+    if (numHosts == 1) {
+      LOG.info("FBCAST: probe runs on a single host; skipping optimization");
+      return false;
+    }
+    // Gate 2: replication ratio.
+    double ratio = estimateReplicationRatio(new ArrayList<>(bounds.values()));
+    if (ratio > FBCAST_MAX_REPLICATION_RATIO) {
+      LOG.info("FBCAST: replication ratio {} > {}; files overlap too much, "
+          + "skipping optimization", ratio, FBCAST_MAX_REPLICATION_RATIO);
+      return false;
+    }
+    LOG.info("FBCAST: cost gates passed (replication ratio {})", ratio);
+    return true;
+  }
+
+  /**
+   * Estimates the average number of probe files covering a uniformly-random key over
+   * the covered key domain, normalized by the file count -- i.e. the expected fraction
+   * of files (≈ hosts, under one file per host) a random build row is routed to.
+   * Returns a value in [0,1]: ~1/n for perfectly disjoint files (each key in exactly
+   * one file) up to 1.0 when every file spans the whole domain. Assumes keys uniform
+   * over [min lo, max hi] (no histogram). Implemented as a width-weighted sweep-line
+   * over the inclusive [lo,hi] file ranges: the integral of coverage over the domain,
+   * which equals the summed file widths, divided by the domain width and by n.
+   */
+  private static double estimateReplicationRatio(List<long[]> ranges) {
+    int n = ranges.size();
+    if (n == 0) return 1.0;
+    long domainLo = Long.MAX_VALUE, domainHi = Long.MIN_VALUE;
+    // Coverage deltas keyed by boundary: +1 at lo (OPEN), -1 at hi+1 (CLOSE).
+    TreeMap<Long, Integer> delta = new TreeMap<>();
+    for (long[] r : ranges) {
+      long lo = r[0], hi = r[1];
+      domainLo = Math.min(domainLo, lo);
+      domainHi = Math.max(domainHi, hi);
+      delta.merge(lo, 1, Integer::sum);
+      if (hi != Long.MAX_VALUE) delta.merge(hi + 1, -1, Integer::sum);
+    }
+    double domainWidth = (double) domainHi - (double) domainLo + 1.0;
+    if (domainWidth <= 0.0) return 1.0;
+    double integral = 0.0; // Σ segment_width * coverage over the covered domain.
+    int coverage = 0;
+    Long prevKey = null;
+    for (Map.Entry<Long, Integer> e : delta.entrySet()) {
+      long key = e.getKey();
+      if (prevKey != null && coverage > 0) {
+        integral += ((double) key - (double) prevKey) * coverage;
+      }
+      coverage += e.getValue();
+      prevKey = key;
+    }
+    return (integral / domainWidth) / n;
   }
 
   /**
