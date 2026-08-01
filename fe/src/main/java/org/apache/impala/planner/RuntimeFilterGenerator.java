@@ -254,6 +254,18 @@ public final class RuntimeFilterGenerator {
     // Runtime filter level is defined as the height of build side subtree of the
     // join node that produce this filter.
     private int level_ = 1;
+    // FBCAST: if true, this filter is the "remote-aggregation sibling" of a
+    // filtered-broadcast join's filter. Under a filtered broadcast each host builds only
+    // its key-range slice of the broadcast build, so a host's filter is PARTIAL. The
+    // primary (broadcast) filter of the join therefore keeps only LOCAL targets (sound
+    // with the host's own partial). This sibling carries only REMOTE targets and is
+    // aggregated across all backends (is_broadcast_join=false, set in
+    // generateRuntimeFilters()) so the published filter is the union of every host's
+    // slice -- the complete filter a scan in another fragment requires. The two filters
+    // have distinct ids, hence distinct per-host consumed_filter objects, so the local
+    // short-circuit of the primary can never poison the remote target. See
+    // generateFiltersRecursive() and assignRuntimeFilters().
+    private boolean isFbcastRemoteAgg_ = false;
 
     /**
      * Internal representation of a runtime filter target.
@@ -693,6 +705,8 @@ public final class RuntimeFilterGenerator {
     public boolean isTimestampTruncation() { return isTimestampTruncation_; }
     public boolean isBroadcast() { return isBroadcastJoin_; }
     public JoinNode getSrc() { return src_; }
+    public boolean isFbcastRemoteAgg() { return isFbcastRemoteAgg_; }
+    public void setFbcastRemoteAgg(boolean b) { isFbcastRemoteAgg_ = b; }
 
     private long getBuildKeyNumRowStats() {
       long minNumRows = src_.getChild(1).getCardinality();
@@ -948,6 +962,12 @@ public final class RuntimeFilterGenerator {
       }
       DistributionMode distMode = filter.src_.getDistributionMode();
       filter.setIsBroadcast(distMode == DistributionMode.BROADCAST);
+      // FBCAST remote-aggregation sibling: although its source join is a broadcast join,
+      // aggregate this filter across all backends like a partitioned join so the
+      // published filter is the union of every host's partial key-range slice (the
+      // complete filter a remote scan needs), instead of one host's partial published
+      // via broadcast first-arrived-wins.
+      if (filter.isFbcastRemoteAgg()) filter.setIsBroadcast(false);
       if (filter.getType() == TRuntimeFilterType.IN_LIST
           && distMode == DistributionMode.PARTITIONED) {
         if (LOG.isTraceEnabled()) {
@@ -1133,6 +1153,23 @@ public final class RuntimeFilterGenerator {
           if (filter != null) {
             registerRuntimeFilter(ctx, filter);
             filters.add(filter);
+            // FBCAST: for a filtered-broadcast join the primary filter above keeps only
+            // LOCAL targets. Create a sibling BLOOM filter (distinct id) that carries
+            // only REMOTE targets and is aggregated across all backends so remote scans
+            // receive the complete filter instead of one host's partial key-range slice.
+            // Only BLOOM is handled: the partitioned-join merge path rejects IN_LIST, and
+            // MIN_MAX remote aggregation for FBCAST is left as a follow-up.
+            if (filterType == TRuntimeFilterType.BLOOM
+                && joinNode.isFilteredBroadcast()) {
+              RuntimeFilter remoteSibling = RuntimeFilter.create(filterIdGenerator,
+                  ctx.getRootAnalyzer(), conjunct, joinNode, filterType,
+                  filterSizeLimits_, /* isTimestampTruncation */ false, level);
+              if (remoteSibling != null) {
+                remoteSibling.setFbcastRemoteAgg(true);
+                registerRuntimeFilter(ctx, remoteSibling);
+                filters.add(remoteSibling);
+              }
+            }
           }
           // For timestamp bloom filters, we also generate a RuntimeFilter with the
           // src timestamp truncated for Kudu scan node targets.
@@ -1269,13 +1306,21 @@ public final class RuntimeFilterGenerator {
       boolean isLocalTarget = isLocalTarget(filter, scanNode);
       if (runtimeFilterMode == TRuntimeFilterMode.LOCAL && !isLocalTarget) continue;
       // FBCAST: a filtered-broadcast join produces only a PARTIAL filter on each host
-      // (each host builds from just its key-range slice of the broadcast build). The
-      // coordinator would publish one host's partial to remote targets as if it were
-      // the complete filter, dropping matching rows on other hosts. Only local targets
-      // (same fragment, same key range) are sound, so skip remote targets here. A
-      // filter left with no targets is dropped by finalizeRuntimeFilter, exactly as in
-      // LOCAL runtime-filter mode.
-      if (filter.getSrc().isFilteredBroadcast() && !isLocalTarget) continue;
+      // (each host builds from just its key-range slice of the broadcast build). Route
+      // targets by locality between the primary filter and its remote-aggregation
+      // sibling:
+      //  - Local targets (same fragment, same key range) are sound with the host's own
+      //    partial and stay on the primary (broadcast) filter.
+      //  - Remote targets (another fragment) need the COMPLETE filter, so they go only
+      //    to the sibling, which is aggregated across all backends (is_broadcast=false).
+      // A filter left with no targets is dropped by finalizeRuntimeFilter.
+      if (filter.getSrc().isFilteredBroadcast()) {
+        if (filter.isFbcastRemoteAgg()) {
+          if (isLocalTarget) continue; // sibling takes only remote targets
+        } else if (!isLocalTarget) {
+          continue; // primary takes only local targets
+        }
+      }
 
       // Check that the scan node supports applying filters of this type and targetExpr.
       if (scanNode instanceof HdfsScanNode) {

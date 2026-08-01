@@ -284,17 +284,21 @@ where l.l_orderkey between 1 and 500000
 BIGINT
 ====
 ---- QUERY
-# The FBCAST join's runtime filter (RF on o2.o_orderkey) must be applied only to the
-# LOCAL probe scan (l). Its REMOTE target -- the o1 scan in another fragment -- must
-# be dropped, so o1's scan carries no incoming runtime filter on o_orderkey from the
-# top join.
+# The FBCAST join builds a PARTIAL filter per host (each host holds only its key-range
+# slice of the broadcast build). The filter has a LOCAL target (the l probe, sound with
+# the host's own partial) and a REMOTE target (the o1 scan in another fragment). These
+# are split into two filters: the local target stays on the primary broadcast filter,
+# while the remote target is served by a sibling that is AGGREGATED across all backends
+# (is_broadcast_join=false), so o1 receives the complete filter -- not one host's
+# partial. Assert the remote filter on o1.o_orderkey is present (applied, not dropped);
+# the forced-wait correctness cases above prove the aggregated filter is sound.
 set explain_level=2;
 explain
 select straight_join count(*)
 from tpch_iceberg.lineitem_sorted l
 join /*+broadcast*/ tpch_parquet.orders o1 on l.l_orderkey = o1.o_orderkey
 join /*+broadcast*/ tpch_parquet.orders o2 on l.l_orderkey = o2.o_orderkey
----- RESULTS: VERIFY_IS_NOT_IN
+---- RESULTS: VERIFY_IS_SUBSET
 row_regex:.*-> o1.o_orderkey.*
 ---- TYPES
 STRING
