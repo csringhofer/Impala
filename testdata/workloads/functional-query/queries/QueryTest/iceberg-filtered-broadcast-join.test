@@ -303,3 +303,75 @@ row_regex:.*-> o1.o_orderkey.*
 ---- TYPES
 STRING
 ====
+---- QUERY
+# Interleaved / non-contiguous per-host routing. tpch_iceberg.lineitem_scattered has
+# SIX disjoint l_orderkey files (1M-key bands) spread over three hosts, so a host owns
+# TWO files whose ranges are NOT contiguous (e.g. [2M,3M] + [5M,6M], gap [3M,5M]).
+# The per-file sweep-line routes each build (orders) row only to the hosts whose files
+# actually cover its key, so a row landing in a host's gap is not sent to it -- unlike
+# the old per-host [min,max] merge, which would have shipped the whole [2M,6M] span to
+# that host. Correctness is unaffected (result matches the full join, 6001215).
+select straight_join count(*)
+from tpch_iceberg.lineitem_scattered l
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+6001215
+---- TYPES
+BIGINT
+====
+---- QUERY
+# Probe range that straddles several file boundaries and gaps: every matching build
+# row must still reach the host holding the covering file. Matches the parquet oracle.
+select straight_join count(*)
+from tpch_iceberg.lineitem_scattered l
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+where l.l_orderkey between 2500000 and 5500000
+---- RESULTS
+3000230
+---- TYPES
+BIGINT
+====
+---- QUERY
+select count(*)
+from tpch_parquet.lineitem l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+where l.l_orderkey between 2500000 and 5500000
+---- RESULTS
+3000230
+---- TYPES
+BIGINT
+====
+---- QUERY
+# A disjunction that keeps only the two ends of the key space -- exactly the
+# non-contiguous shape a single host can end up owning. No matching row may be dropped.
+select straight_join count(*)
+from tpch_iceberg.lineitem_scattered l
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+where l.l_orderkey < 1500000 or l.l_orderkey > 4500000
+---- RESULTS
+3000206
+---- TYPES
+BIGINT
+====
+---- QUERY
+select count(*)
+from tpch_parquet.lineitem l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+where l.l_orderkey < 1500000 or l.l_orderkey > 4500000
+---- RESULTS
+3000206
+---- TYPES
+BIGINT
+====
+---- QUERY
+# The scattered (six-file) probe must still engage key-range filtering.
+set explain_level=3;
+explain
+select straight_join count(*)
+from tpch_iceberg.lineitem_scattered l
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:.*BROADCAST \(key-range filtered\).*
+---- TYPES
+STRING
+====

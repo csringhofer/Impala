@@ -386,14 +386,18 @@ Status Scheduler::ComputeFragmentExecParams(
         DCHECK(IsResolvedAddress(desc.krpc_address()));
         *dest->mutable_krpc_backend() = desc.krpc_address();
 
-        // FBCAST prototype: compute this destination's key range as the union of the
-        // join-key bounds of the probe files scanned on this destination's host. The
-        // range is read from the probe fragment's per-host scan assignment (see
-        // probe_state above) rather than the destination instance's own scan ranges,
-        // which are empty when the destination is a shared join-build fragment (mt_dop>0).
+        // FBCAST prototype: emit the join-key bounds of the probe files scanned on
+        // this destination's host, one interval PER FILE (not merged into a single
+        // [min,max]). The sender builds a sweep-line over all destinations' per-file
+        // intervals and routes each build row only to the hosts whose files could
+        // contain its key, so a row landing in a host's gap between two non-contiguous
+        // files is not sent to it. Bounds are read from the probe fragment's per-host
+        // scan assignment (see probe_state above) rather than the destination
+        // instance's own scan ranges, which are empty when the destination is a shared
+        // join-build fragment (mt_dop>0).
         if (stream_sink.key_range_filtered) {
-          bool present = false;
-          int64_t lo = 0, hi = 0;
+          int64_t span_lo = 0, span_hi = 0;
+          int num_files = 0;
           const auto host_it = probe_state->scan_range_assignment.find(host);
           if (host_it != probe_state->scan_range_assignment.end()) {
             for (const auto& node_ranges : host_it->second) {
@@ -406,23 +410,22 @@ Status Scheduler::ComputeFragmentExecParams(
                 if (it == stream_sink.key_range_bounds_by_file.end()) continue;
                 if (it->second.size() < 2) continue;
                 int64_t flo = it->second[0], fhi = it->second[1];
-                if (!present) {
-                  lo = flo; hi = fhi; present = true;
+                dest->add_key_range_file_los(flo);
+                dest->add_key_range_file_his(fhi);
+                if (num_files == 0) {
+                  span_lo = flo; span_hi = fhi;
                 } else {
-                  if (flo < lo) lo = flo;
-                  if (fhi > hi) hi = fhi;
+                  if (flo < span_lo) span_lo = flo;
+                  if (fhi > span_hi) span_hi = fhi;
                 }
+                ++num_files;
               }
             }
           }
-          dest->set_key_range_present(present);
-          if (present) {
-            dest->set_key_range_lo(lo);
-            dest->set_key_range_hi(hi);
-          }
+          dest->set_key_range_present(num_files > 0);
           LOG(INFO) << "FBCAST-BE: dest " << i << " host " << host.hostname()
-                    << " key_range_present=" << present << " range=[" << lo << ","
-                    << hi << "]";
+                    << " key_range_files=" << num_files << " span=[" << span_lo << ","
+                    << span_hi << "]";
         }
       }
 

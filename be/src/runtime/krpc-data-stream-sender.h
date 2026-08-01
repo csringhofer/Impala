@@ -250,13 +250,24 @@ class KrpcDataStreamSender : public DataSink {
   /// When true, partition_type_ is UNPARTITIONED but rows are routed by key range.
   const bool key_range_filtered_;
 
-  /// FBCAST prototype: per-channel key range (aligned with channels_). A row with a
-  /// non-null key K is sent to channel i iff chan_key_present_[i] and
-  /// chan_key_lo_[i] <= K <= chan_key_hi_[i]. Populated in the constructor; the
+  /// FBCAST prototype: whether each channel scans any probe file (aligned with
+  /// channels_; kept for verification logging). Populated in the constructor; the
   /// channel order is not shuffled when key_range_filtered_ so indexes stay aligned.
   std::vector<bool> chan_key_present_;
-  std::vector<int64_t> chan_key_lo_;
-  std::vector<int64_t> chan_key_hi_;
+
+  /// FBCAST prototype: sweep-line over all channels' per-file key intervals, used to
+  /// route each build row to exactly the hosts whose files could contain its key.
+  /// seg_starts_ is a sorted, ascending list of segment start keys; segment i covers
+  /// the inclusive key range [seg_starts_[i], seg_starts_[i+1]-1] (the last segment
+  /// extends to +inf). seg_channels_[i] is the sorted list of channel indices active
+  /// in segment i (the channels whose assigned files' [lo,hi] cover that segment); an
+  /// empty set is a gap, so a key falling there is routed nowhere (dropped). A key K
+  /// is routed by binary search: the greatest i with seg_starts_[i] <= K. Built in the
+  /// constructor from the destinations' key_range_file_los/his; empty when no channel
+  /// has probe files.
+  std::vector<int64_t> seg_starts_;
+  std::vector<std::vector<int>> seg_channels_;
+
   /// FBCAST prototype: rows routed to each channel (for verification logging).
   std::vector<int64_t> chan_row_count_;
 

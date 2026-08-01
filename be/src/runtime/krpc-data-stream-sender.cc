@@ -19,9 +19,12 @@
 
 #include <boost/bind.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
+#include <limits>
+#include <utility>
 #include <thrift/protocol/TDebugProtocol.h>
 
 #include "common/logging.h"
@@ -819,6 +822,10 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
 
   string process_address =
       NetworkAddressPBToString(ExecEnv::GetInstance()->krpc_address());
+  // FBCAST prototype: per-channel probe-file key intervals, collected during the
+  // destinations loop below and turned into a sweep-line (seg_starts_/seg_channels_)
+  // after it, once channel indices are fixed.
+  std::vector<std::vector<std::pair<int64_t, int64_t>>> chan_file_intervals;
   for (const auto& destination : destinations) {
     bool is_local =
         process_address == NetworkAddressPBToString(destination.krpc_backend());
@@ -833,13 +840,19 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
     }
 
     if (key_range_filtered_) {
-      // FBCAST prototype: one collector per channel, plus this channel's key range.
+      // FBCAST prototype: one collector per channel, plus this channel's per-file key
+      // intervals (collected now, turned into a sweep-line after the loop).
       partition_row_collectors_.emplace_back();
       partition_row_collectors_.back().channel_ = channels_.back().get();
       chan_key_present_.push_back(destination.key_range_present());
-      chan_key_lo_.push_back(destination.key_range_lo());
-      chan_key_hi_.push_back(destination.key_range_hi());
       chan_row_count_.push_back(0);
+      DCHECK_EQ(destination.key_range_file_los_size(),
+          destination.key_range_file_his_size());
+      chan_file_intervals.emplace_back();
+      for (int f = 0; f < destination.key_range_file_los_size(); ++f) {
+        chan_file_intervals.back().emplace_back(
+            destination.key_range_file_los(f), destination.key_range_file_his(f));
+      }
     }
 
     if (IsDirectedMode()) {
@@ -863,6 +876,57 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
     // Not done for key-range-filtered senders so channels_ stays aligned with the
     // per-channel key ranges collected above.
     random_shuffle(channels_.begin(), channels_.end());
+  }
+
+  if (key_range_filtered_) {
+    // FBCAST prototype: build the sweep-line over all channels' per-file [lo,hi]
+    // intervals (see filtered-broadcast-join.md 2a). Each file contributes an OPEN
+    // event at lo and a CLOSE event at hi+1 (inclusive upper -> exclusive segment
+    // end); sweeping the sorted events left-to-right yields disjoint segments, each
+    // starting at an event key and mapped to the set of channels with an active file.
+    // A build row is then routed by binary search on seg_starts_ (see KeyRangeAddRows).
+    struct SweepEvent { int64_t key; int chan; bool open; };
+    std::vector<SweepEvent> events;
+    for (int c = 0; c < static_cast<int>(chan_file_intervals.size()); ++c) {
+      for (const auto& iv : chan_file_intervals[c]) {
+        const int64_t lo = iv.first, hi = iv.second;
+        events.push_back({lo, c, true});
+        // Guard hi == INT64_MAX: a file ending there stays open to +inf (no CLOSE),
+        // which avoids overflow on hi + 1.
+        if (hi != std::numeric_limits<int64_t>::max()) {
+          events.push_back({hi + 1, c, false});
+        }
+      }
+    }
+    std::sort(events.begin(), events.end(),
+        [](const SweepEvent& a, const SweepEvent& b) { return a.key < b.key; });
+    // active_count[c] > 0 iff channel c has a file covering the current segment (a host
+    // may have several files active at once, hence a count rather than a flag).
+    std::vector<int> active_count(chan_file_intervals.size(), 0);
+    size_t e = 0;
+    while (e < events.size()) {
+      const int64_t key = events[e].key;
+      while (e < events.size() && events[e].key == key) {
+        const int c = events[e].chan;
+        if (events[e].open) {
+          ++active_count[c];
+        } else {
+          --active_count[c];
+        }
+        ++e;
+      }
+      std::vector<int> chans;
+      for (int c = 0; c < static_cast<int>(active_count.size()); ++c) {
+        if (active_count[c] > 0) chans.push_back(c);
+      }
+      // Segment [key, next_start - 1] is covered by 'chans'. An empty set is a gap: a
+      // key landing here is routed nowhere (dropped). Keys below seg_starts_[0] are
+      // also dropped (idx < 0 in KeyRangeAddRows).
+      seg_starts_.push_back(key);
+      seg_channels_.push_back(std::move(chans));
+    }
+    LOG(INFO) << "FBCAST-BE: sweep-line built, channels=" << channels_.size()
+              << " segments=" << seg_starts_.size();
   }
 
   DCHECK(filepath_to_hosts_.empty() || partition_type_ == TPartitionType::DIRECTED) <<
@@ -1187,11 +1251,18 @@ Status KrpcDataStreamSender::KeyRangeAddRows(RowBatch* batch) {
     int64_t key = (ktype.type == TYPE_BIGINT)
         ? *reinterpret_cast<int64_t*>(val)
         : static_cast<int64_t>(*reinterpret_cast<int32_t*>(val));
-    for (int i = 0; i < n; ++i) {
-      if (chan_key_present_[i] && key >= chan_key_lo_[i] && key <= chan_key_hi_[i]) {
-        RETURN_IF_ERROR(partition_row_collectors_[i].AppendRow(row, row_desc_));
-        ++chan_row_count_[i];
-      }
+    // Binary-search the sweep-line: the covering segment is the greatest start <= key,
+    // i.e. one before the first start strictly greater than key. idx < 0 means the key
+    // is below every segment (no file can contain it) -> dropped. An empty seg_channels_
+    // (a gap between file ranges) also drops the row.
+    const int idx = static_cast<int>(std::upper_bound(
+        seg_starts_.begin(), seg_starts_.end(), key) - seg_starts_.begin()) - 1;
+    if (idx < 0) continue;
+    for (int i : seg_channels_[idx]) {
+      DCHECK_GE(i, 0);
+      DCHECK_LT(i, n);
+      RETURN_IF_ERROR(partition_row_collectors_[i].AppendRow(row, row_desc_));
+      ++chan_row_count_[i];
     }
   }
   return Status::OK();
@@ -1373,9 +1444,8 @@ Status KrpcDataStreamSender::FlushFinal(RuntimeState* state) {
   if (key_range_filtered_) {
     for (int i = 0; i < static_cast<int>(chan_row_count_.size()); ++i) {
       LOG(INFO) << "FBCAST-BE: sender " << sender_id_ << " channel " << i
-                << " routed rows=" << chan_row_count_[i] << " range=["
-                << (chan_key_present_[i] ? chan_key_lo_[i] : 0) << ","
-                << (chan_key_present_[i] ? chan_key_hi_[i] : 0) << "]";
+                << " routed rows=" << chan_row_count_[i]
+                << " has_probe_files=" << (chan_key_present_[i] ? "true" : "false");
     }
   }
   for (unique_ptr<Channel>& channel : channels_) {

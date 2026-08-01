@@ -370,14 +370,17 @@ message PlanFragmentDestinationPB {
   optional NetworkAddressPB krpc_backend = 3;
 
   // FBCAST prototype (filtered-broadcast-join): for a key-range-filtered build
-  // stream sink, the [key_range_lo, key_range_hi] this destination covers (union
-  // of the join-key bounds of the probe files assigned to this destination
-  // instance). A build row with a non-null key is sent to this destination only if
-  // its key is within [lo, hi]. Absent/present=false means the destination has no
-  // probe files, so it receives only null-keyed rows.
+  // stream sink, the join-key bounds of the probe files assigned to this
+  // destination instance, one entry per file (NOT merged into a single interval).
+  // key_range_file_los[k]/key_range_file_his[k] are the inclusive [lo, hi] bounds
+  // of file k. The sender builds a sweep-line over all destinations' per-file
+  // intervals and routes each build row (by binary search on its key) only to the
+  // hosts whose files could contain that key -- so a row landing in a host's gap
+  // between two non-contiguous files is not sent to it. present=false (empty lists)
+  // means the destination has no probe files, so it receives only null-keyed rows.
   optional bool key_range_present = 4;
-  optional int64 key_range_lo = 5;
-  optional int64 key_range_hi = 6;
+  repeated int64 key_range_file_los = 5;
+  repeated int64 key_range_file_his = 6;
 }
 
 // Context to collect information that is shared among all instances of a particular plan
