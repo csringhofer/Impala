@@ -61,7 +61,17 @@ create table if not exists {db_name}{db_suffix}.{table_name} (
   PRIMARY KEY(L_ORDERKEY, L_PARTKEY, L_SUPPKEY, L_LINENUMBER)
 )
 partition by hash (l_orderkey) partitions 9 stored as kudu;
+---- ALTER
+-- Sort files by l_orderkey so dependent (parquet) loads write l_orderkey-ordered data.
+ALTER TABLE {table_name} SORT BY (l_orderkey);
 ---- DEPENDENT_LOAD
+-- max_fs_writers=1 gathers to a single ordered writer (global sort via the SORT BY
+-- above); parquet_file_size rolls that ordered stream into a few files with disjoint
+-- l_orderkey ranges, each kept under the HDFS block size so it stays a single scan
+-- range on one host. This makes lineitem a testbed for the filtered broadcast join
+-- (probe-side files with disjoint key ranges). The 68m size is tuned for scale factor 1.
+SET max_fs_writers=1;
+SET parquet_file_size=68m;
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}.{table_name};
 ---- LOAD
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/{table_name}'
