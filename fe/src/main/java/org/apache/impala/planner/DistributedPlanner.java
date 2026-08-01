@@ -683,54 +683,88 @@ public class DistributedPlanner {
       LOG.trace(rhsTree.getExplainString(ctx_.getQueryOptions()));
     }
 
+    // FBCAST prototype: a filtered broadcast sends each build row only to the hosts
+    // whose probe files cover its key, so its true network+build cost is the plain
+    // broadcast cost scaled by the replication ratio (the average fraction of hosts a
+    // build row reaches). Detect eligibility and compute that ratio HERE -- before the
+    // distribution-mode choice -- so the discounted cost can feed computeJoinDistribution
+    // Mode(). This matters most at large scale factors: a plain broadcast build grows
+    // linearly with the data and eventually crosses partitionCost, flipping the join to
+    // a shuffle exactly when a filtered broadcast would have stayed cheap. fbCand/fbBounds
+    // end up non-null iff FBCAST is fully eligible (structural gate + cost gates pass);
+    // they are reused for the sink marking in the BROADCAST branch below.
+    // TODO: this computes the Iceberg per-file bounds for every eligible broadcast-shaped
+    // join, even ones that stay partitioned. A cheap flip-possibility pre-check is NOT
+    // sound here (estimateReplicationRatio can drop below 1/leftChildNodes when disjoint
+    // files outnumber hosts), so bounds are always read when the structural checks pass.
+    FilteredBroadcastCandidate fbCand = detectFilteredBroadcastKey(node);
+    Map<String, long[]> fbBounds = null;
+    double fbRatio = 1.0;
+    if (fbCand != null && !probeKeyFromSingleScan(leftChildFragment.getPlanRoot(), fbCand)) {
+      // The probe key is a bare Iceberg scan slot, but the rows reaching this join do
+      // NOT come straight from that scan: an Exchange (repartition/broadcast), Union, or
+      // another join/aggregation sits in between, so the key values arriving on a host no
+      // longer correspond to the files that host scanned. Routing the build side by
+      // per-file key range would drop matches (silent wrong results). Not eligible.
+      LOG.info("FBCAST: probe key {}.{} does not come directly from a single "
+          + "scan (exchange/union/join in probe subtree); skipping optimization",
+          fbCand.probeTable.getFullName(), fbCand.columnName);
+      fbCand = null;
+    }
+    if (fbCand != null) {
+      fbBounds = logFilteredBroadcastBounds(fbCand);
+      if (fbBounds != null && filteredBroadcastGatesPass(node, fbBounds)) {
+        fbRatio = estimateReplicationRatio(new ArrayList<>(fbBounds.values()));
+      } else {
+        // Missing bounds or a cost gate rejected it (build too small / too much file
+        // overlap / single-host probe): fall back to a plain broadcast.
+        fbCand = null;
+        fbBounds = null;
+      }
+    }
+
+    // Discount the broadcast cost by the replication ratio for the distribution-mode
+    // decision only. The memory / broadcast_bytes_limit safety gate inside
+    // computeJoinDistributionMode() still applies to the FULL build (rhsDataSize), so a
+    // filtered broadcast can never be chosen when the whole build would not fit in memory.
+    long effectiveBroadcastCost = broadcastCost;
+    if (fbCand != null && broadcastCost != -1) {
+      effectiveBroadcastCost = (long) Math.ceil(broadcastCost * fbRatio);
+      LOG.info("FBCAST: discounting broadcast cost {} -> {} (replication ratio {}) "
+          + "for {}.{}", broadcastCost, effectiveBroadcastCost, fbRatio,
+          fbCand.probeTable.getFullName(), fbCand.columnName);
+    }
+
     DistributionMode distrMode = computeJoinDistributionMode(
-        node, broadcastCost, partitionCost, rhsDataSize);
+        node, effectiveBroadcastCost, partitionCost, rhsDataSize);
     node.setDistributionMode(distrMode);
 
     PlanFragment hjFragment = null;
     if (distrMode == DistributionMode.BROADCAST) {
       // Doesn't create a new fragment, but modifies leftChildFragment to execute
       // the join; the build input is provided by an ExchangeNode, which is the
-      // destination of the rightChildFragment's output
-      // FBCAST prototype: detect whether this broadcast join is a candidate for the
-      // filtered-broadcast-join optimization (probe-side bare INT/BIGINT Iceberg key).
-      FilteredBroadcastCandidate fbCand = detectFilteredBroadcastKey(node);
+      // destination of the rightChildFragment's output.
       node.setChild(0, leftChildFragment.getPlanRoot());
       connectChildFragment(node, 1, leftChildFragment, rightChildFragment);
       leftChildFragment.setPlanRoot(node);
       hjFragment = leftChildFragment;
-      if (fbCand != null && !probeKeyFromSingleScan(node.getChild(0), fbCand)) {
-        // The probe key is a bare Iceberg scan slot, but the rows reaching this
-        // join do NOT come straight from that scan: an Exchange (repartition/
-        // broadcast), Union, or another join/aggregation sits in between, so the
-        // key values arriving on a host no longer correspond to the files that
-        // host scanned. Routing the build side by per-file key range would drop
-        // matches (silent wrong results). Fall back to plain broadcast.
-        LOG.info("FBCAST: probe key {}.{} does not come directly from a single "
-            + "scan (exchange/union/join in probe subtree); skipping optimization",
-            fbCand.probeTable.getFullName(), fbCand.columnName);
-        fbCand = null;
-      }
       if (fbCand != null) {
-        Map<String, long[]> bounds = logFilteredBroadcastBounds(fbCand);
-        if (bounds != null && filteredBroadcastGatesPass(node, bounds)) {
-          // FBCAST step 3 / backend steps A+B: mark the build-side stream so the
-          // sender routes each row by key range instead of broadcasting to all
-          // hosts. The build-side join key (rhs of the eq conjunct) is the routing
-          // key the sender evaluates per row; 'bounds' (per-file key range keyed by
-          // file base name) rides on the sink to the scheduler.
-          rightChildFragment.setOutputPartition(
-              DataPartition.keyRangeFiltered(rhsJoinExprs.get(0).clone(), bounds));
-          // Mark the join so RuntimeFilterGenerator drops any REMOTE targets of the
-          // runtime filters it produces: under FBCAST each host's build partition
-          // (and hence its runtime filter) is only its key range, so publishing one
-          // host's partial filter to a scan in another fragment would drop matching
-          // rows (silent wrong results). Local targets stay (the host's probe shares
-          // its key range) so per-host filtering still works.
-          node.setFilteredBroadcast(true);
-          LOG.info("FBCAST: marking build side distribution KEY_RANGE_FILTERED "
-              + "on {}.{}", fbCand.probeTable.getFullName(), fbCand.columnName);
-        }
+        // FBCAST step 3 / backend steps A+B: mark the build-side stream so the sender
+        // routes each row by key range instead of broadcasting to all hosts. The
+        // build-side join key (rhs of the eq conjunct) is the routing key the sender
+        // evaluates per row; 'fbBounds' (per-file key range keyed by file base name)
+        // rides on the sink to the scheduler.
+        rightChildFragment.setOutputPartition(
+            DataPartition.keyRangeFiltered(rhsJoinExprs.get(0).clone(), fbBounds));
+        // Mark the join so RuntimeFilterGenerator drops any REMOTE targets of the
+        // runtime filters it produces: under FBCAST each host's build partition
+        // (and hence its runtime filter) is only its key range, so publishing one
+        // host's partial filter to a scan in another fragment would drop matching
+        // rows (silent wrong results). Local targets stay (the host's probe shares
+        // its key range) so per-host filtering still works.
+        node.setFilteredBroadcast(true);
+        LOG.info("FBCAST: marking build side distribution KEY_RANGE_FILTERED "
+            + "on {}.{}", fbCand.probeTable.getFullName(), fbCand.columnName);
       }
     } else {
       hjFragment = createPartitionedHashJoinFragment(node, analyzer,

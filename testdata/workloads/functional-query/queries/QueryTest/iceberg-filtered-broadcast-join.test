@@ -403,3 +403,43 @@ row_regex:.*key-range filtered.*
 ---- TYPES
 STRING
 ====
+---- QUERY
+# Cost-based flip: broadcast-vs-partitioned decision. A build side comparable in size to
+# the probe (here a lineitem self-join on l_orderkey) would, under plain broadcast costing,
+# lose to a partitioned (shuffle) join -- this is exactly how a growing broadcast build
+# crosses the partitioned threshold at larger scale factors. Because the probe
+# (lineitem_sorted) has disjoint per-file key ranges, a filtered broadcast ships only a
+# ~replication-ratio fraction of the build to each host, so its estimated cost is
+# discounted below the partitioned cost and the join is kept a (filtered) broadcast rather
+# than flipping to a shuffle. Correctness matches the plain oracle below.
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join tpch_parquet.lineitem b on l.l_orderkey = b.l_orderkey
+---- RESULTS
+30012985
+---- TYPES
+BIGINT
+====
+---- QUERY
+# Oracle: same self-join with a non-Iceberg probe -> no filtering, plain plan.
+select straight_join count(*)
+from tpch_parquet.lineitem l
+join tpch_parquet.lineitem b on l.l_orderkey = b.l_orderkey
+---- RESULTS
+30012985
+---- TYPES
+BIGINT
+====
+---- QUERY
+# The comparably-sized build would be PARTITIONED on plain broadcast costing; the
+# replication-ratio discount flips the distribution mode to a filtered broadcast.
+set explain_level=3;
+explain
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join tpch_parquet.lineitem b on l.l_orderkey = b.l_orderkey
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:.*BROADCAST \(key-range filtered\).*
+---- TYPES
+STRING
+====
