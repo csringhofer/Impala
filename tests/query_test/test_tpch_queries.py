@@ -42,7 +42,7 @@ class TestTpchQuery(ImpalaTestSuite):
     if cls.exploration_strategy() == 'core':
       cls.ImpalaTestMatrix.add_constraint(lambda v:\
           v.get_value('table_format').file_format in ['text', 'parquet', 'kudu', 'orc',
-                                                      'json'])
+                                                      'json', 'iceberg'])
 
   def idfn(val):
     return "TPC-H: Q{0}".format(val)
@@ -73,3 +73,4 @@ class TestTpchQueryForJdbcTables(ImpalaTestSuite):
   @pytest.mark.parametrize("query", range(1, 23), ids=idfn)
   def test_tpch(self, vector, query):
     self.run_test_case('tpch-q{0}'.format(query), vector, use_db='tpch_jdbc')
+

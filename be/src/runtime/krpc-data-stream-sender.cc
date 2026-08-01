@@ -89,6 +89,7 @@ Status KrpcDataStreamSenderConfig::Init(
   RETURN_IF_ERROR(DataSinkConfig::Init(tsink, input_row_desc, state));
   DCHECK(tsink_->__isset.stream_sink);
   partition_type_ = tsink_->stream_sink.output_partition.type;
+  key_range_filtered_ = tsink_->stream_sink.key_range_filtered;
   if (partition_type_ == TPartitionType::HASH_PARTITIONED
       || partition_type_ == TPartitionType::KUDU) {
     RETURN_IF_ERROR(
@@ -97,7 +98,17 @@ Status KrpcDataStreamSenderConfig::Init(
     exchange_hash_seed_ =
         KrpcDataStreamSender::EXCHANGE_HASH_SEED_CONST ^ state->query_id().hi;
   }
+  if (key_range_filtered_) {
+    // FBCAST prototype: the single routing key expr rides in partition_exprs.
+    RETURN_IF_ERROR(
+        ScalarExpr::Create(tsink_->stream_sink.output_partition.partition_exprs,
+            *input_row_desc_, state, &partition_exprs_));
+  }
   num_channels_ = state->fragment_ctx().destinations().size();
+  if (key_range_filtered_) {
+    LOG(INFO) << "FBCAST-BE: key_range_filtered sink, exprs="
+              << partition_exprs_.size() << " destinations=" << num_channels_;
+  }
   state->CheckAndAddCodegenDisabledMessage(codegen_status_msgs_);
   return Status::OK();
 }
@@ -790,6 +801,7 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
         Substitute("KrpcDataStreamSender (dst_id=$0)", sink.dest_node_id), state),
     sender_id_(sender_id),
     partition_type_(sink_config.partition_type_),
+    key_range_filtered_(sink_config.key_range_filtered_),
     per_channel_buffer_size_(per_channel_buffer_size),
     partition_exprs_(sink_config.partition_exprs_),
     dest_node_id_(sink.dest_node_id),
@@ -820,6 +832,16 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
       partition_row_collectors_.back().channel_ = channels_.back().get();
     }
 
+    if (key_range_filtered_) {
+      // FBCAST prototype: one collector per channel, plus this channel's key range.
+      partition_row_collectors_.emplace_back();
+      partition_row_collectors_.back().channel_ = channels_.back().get();
+      chan_key_present_.push_back(destination.key_range_present());
+      chan_key_lo_.push_back(destination.key_range_lo());
+      chan_key_hi_.push_back(destination.key_range_hi());
+      chan_row_count_.push_back(0);
+    }
+
     if (IsDirectedMode()) {
       DCHECK(host_to_channel_.find(destination.address()) == host_to_channel_.end());
       host_to_channel_[destination.address()] = channels_.back().get();
@@ -834,9 +856,12 @@ KrpcDataStreamSender::KrpcDataStreamSender(TDataSinkId sink_id, int sender_id,
     }
   }
 
-  if (partition_type_ == TPartitionType::UNPARTITIONED
-      || partition_type_ == TPartitionType::RANDOM) {
+  if ((partition_type_ == TPartitionType::UNPARTITIONED
+          || partition_type_ == TPartitionType::RANDOM)
+      && !key_range_filtered_) {
     // Randomize the order we open/transmit to channels to avoid thundering herd problems.
+    // Not done for key-range-filtered senders so channels_ stays aligned with the
+    // per-channel key ranges collected above.
     random_shuffle(channels_.begin(), channels_.end());
   }
 
@@ -1140,13 +1165,48 @@ uint64_t KrpcDataStreamSender::HashRow(TupleRow* row, uint64_t seed) {
   return hash_val;
 }
 
+Status KrpcDataStreamSender::KeyRangeAddRows(RowBatch* batch) {
+  DCHECK_EQ(partition_expr_evals_.size(), 1);
+  ScalarExprEvaluator* eval = partition_expr_evals_[0];
+  const ColumnType& ktype = eval->root().type();
+  DCHECK(ktype.type == TYPE_BIGINT || ktype.type == TYPE_INT);
+  const int n = static_cast<int>(channels_.size());
+  const int num_rows = batch->num_rows();
+  for (int r = 0; r < num_rows; ++r) {
+    TupleRow* row = batch->GetRow(r);
+    void* val = eval->GetValue(row);
+    if (val == nullptr) {
+      // A null key never matches a probe row; broadcast it to all hosts so null-aware
+      // join semantics are preserved (see filtered-broadcast-join.md).
+      for (int i = 0; i < n; ++i) {
+        RETURN_IF_ERROR(partition_row_collectors_[i].AppendRow(row, row_desc_));
+        ++chan_row_count_[i];
+      }
+      continue;
+    }
+    int64_t key = (ktype.type == TYPE_BIGINT)
+        ? *reinterpret_cast<int64_t*>(val)
+        : static_cast<int64_t>(*reinterpret_cast<int32_t*>(val));
+    for (int i = 0; i < n; ++i) {
+      if (chan_key_present_[i] && key >= chan_key_lo_[i] && key <= chan_key_hi_[i]) {
+        RETURN_IF_ERROR(partition_row_collectors_[i].AppendRow(row, row_desc_));
+        ++chan_row_count_[i];
+      }
+    }
+  }
+  return Status::OK();
+}
+
 Status KrpcDataStreamSender::Send(RuntimeState* state, RowBatch* batch) {
   SCOPED_TIMER(profile()->total_time_counter());
   DCHECK(!closed_);
   DCHECK(!flushed_);
 
   if (batch->num_rows() == 0) return Status::OK();
-  if (partition_type_ == TPartitionType::UNPARTITIONED) {
+  if (key_range_filtered_) {
+    // FBCAST prototype: route by key range instead of broadcasting to all channels.
+    RETURN_IF_ERROR(KeyRangeAddRows(batch));
+  } else if (partition_type_ == TPartitionType::UNPARTITIONED) {
     // Only skip compression if there is a single channel and destination is in the same
     // process. TODO: could be optimized to send the uncompressed buffer to the local
     // targets to avoid decompression cost at the receiver.
@@ -1310,6 +1370,14 @@ Status KrpcDataStreamSender::FlushFinal(RuntimeState* state) {
   for (PartitionRowCollector& collector: partition_row_collectors_) {
     RETURN_IF_ERROR(collector.SendCurrentBatch());
   }
+  if (key_range_filtered_) {
+    for (int i = 0; i < static_cast<int>(chan_row_count_.size()); ++i) {
+      LOG(INFO) << "FBCAST-BE: sender " << sender_id_ << " channel " << i
+                << " routed rows=" << chan_row_count_[i] << " range=["
+                << (chan_key_present_[i] ? chan_key_lo_[i] : 0) << ","
+                << (chan_key_present_[i] ? chan_key_hi_[i] : 0) << "]";
+    }
+  }
   for (unique_ptr<Channel>& channel : channels_) {
     RETURN_IF_ERROR(channel->WaitForRpc());
   }
@@ -1372,7 +1440,8 @@ Status KrpcDataStreamSender::SerializeBatch(
 Status KrpcDataStreamSender::PrepareBatchForSend(
     OutboundRowBatch* batch, bool compress) {
   DCHECK(partition_type_ == TPartitionType::HASH_PARTITIONED
-      || partition_type_ == TPartitionType::KUDU);
+      || partition_type_ == TPartitionType::KUDU
+      || key_range_filtered_);
   SCOPED_TIMER(serialize_batch_timer_);
   RETURN_IF_ERROR(batch->PrepareForSend(row_desc_->tuple_descriptors().size(),
       compress ? compression_scratch_.get() : nullptr, true));

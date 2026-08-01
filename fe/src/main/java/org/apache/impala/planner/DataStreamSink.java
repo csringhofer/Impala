@@ -17,7 +17,11 @@
 
 package org.apache.impala.planner;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+
+import com.google.common.collect.Lists;
 
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.service.BackendConfig;
@@ -57,9 +61,11 @@ public class DataStreamSink extends DataSink {
   public void appendSinkExplainString(String prefix, String detailPrefix,
       TQueryOptions queryOptions, TExplainLevel detailLevel, StringBuilder output) {
     output.append(
-        String.format("%sDATASTREAM SINK [FRAGMENT=%s, EXCHANGE=%s, %s]",
+        String.format("%sDATASTREAM SINK [FRAGMENT=%s, EXCHANGE=%s, %s%s]",
         prefix, exchNode_.getFragment().getId().toString(),
-        exchNode_.getId().toString(), exchNode_.getDisplayLabelDetail()));
+        exchNode_.getId().toString(), exchNode_.getDisplayLabelDetail(),
+        // FBCAST prototype: surface the key-range-filtered broadcast marker.
+        outputPartition_.isKeyRangeFiltered() ? " (key-range filtered)" : ""));
     output.append("\n");
   }
 
@@ -161,6 +167,20 @@ public class DataStreamSink extends DataSink {
   protected void toThriftImpl(TDataSink tsink) {
     TDataStreamSink tStreamSink =
         new TDataStreamSink(exchNode_.getId().asInt(), outputPartition_.toThrift());
+    // FBCAST prototype: propagate the key-range-filtered broadcast marker and the
+    // per-file join-key bounds (keyed by file base name) for the scheduler.
+    if (outputPartition_.isKeyRangeFiltered()) {
+      tStreamSink.setKey_range_filtered(true);
+      Map<String, long[]> bounds = outputPartition_.getKeyRangeBoundsByFile();
+      if (bounds != null) {
+        Map<String, List<Long>> tBounds = new HashMap<>();
+        for (Map.Entry<String, long[]> e : bounds.entrySet()) {
+          tBounds.put(e.getKey(),
+              Lists.newArrayList(e.getValue()[0], e.getValue()[1]));
+        }
+        tStreamSink.setKey_range_bounds_by_file(tBounds);
+      }
+    }
     tsink.setStream_sink(tStreamSink);
   }
 

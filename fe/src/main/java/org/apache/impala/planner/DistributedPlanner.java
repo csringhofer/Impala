@@ -19,6 +19,7 @@ package org.apache.impala.planner;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
@@ -27,15 +28,22 @@ import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.InsertStmt;
 import org.apache.impala.analysis.JoinOperator;
 import org.apache.impala.analysis.MultiAggregateInfo.AggPhase;
+import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotRef;
+import org.apache.impala.analysis.TupleId;
 import org.apache.impala.analysis.QueryStmt;
 import org.apache.impala.catalog.FeFsTable;
+import org.apache.impala.catalog.FeIcebergTable;
 import org.apache.impala.catalog.FeKuduTable;
+import org.apache.impala.catalog.FeTable;
+import org.apache.impala.catalog.IcebergColumn;
+import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.planner.JoinNode.DistributionMode;
 import org.apache.impala.thrift.TPartitionType;
 import org.apache.impala.thrift.TVirtualColumnType;
+import org.apache.impala.util.IcebergUtil;
 import org.apache.impala.util.KuduUtil;
 import org.apache.impala.util.MathUtil;
 import org.slf4j.Logger;
@@ -670,16 +678,198 @@ public class DistributedPlanner {
       // Doesn't create a new fragment, but modifies leftChildFragment to execute
       // the join; the build input is provided by an ExchangeNode, which is the
       // destination of the rightChildFragment's output
+      // FBCAST prototype: detect whether this broadcast join is a candidate for the
+      // filtered-broadcast-join optimization (probe-side bare INT/BIGINT Iceberg key).
+      FilteredBroadcastCandidate fbCand = detectFilteredBroadcastKey(node);
       node.setChild(0, leftChildFragment.getPlanRoot());
       connectChildFragment(node, 1, leftChildFragment, rightChildFragment);
       leftChildFragment.setPlanRoot(node);
       hjFragment = leftChildFragment;
+      if (fbCand != null && !probeKeyFromSingleScan(node.getChild(0), fbCand)) {
+        // The probe key is a bare Iceberg scan slot, but the rows reaching this
+        // join do NOT come straight from that scan: an Exchange (repartition/
+        // broadcast), Union, or another join/aggregation sits in between, so the
+        // key values arriving on a host no longer correspond to the files that
+        // host scanned. Routing the build side by per-file key range would drop
+        // matches (silent wrong results). Fall back to plain broadcast.
+        LOG.info("FBCAST: probe key {}.{} does not come directly from a single "
+            + "scan (exchange/union/join in probe subtree); skipping optimization",
+            fbCand.probeTable.getFullName(), fbCand.columnName);
+        fbCand = null;
+      }
+      if (fbCand != null) {
+        Map<String, long[]> bounds = logFilteredBroadcastBounds(fbCand);
+        if (bounds != null) {
+          // FBCAST step 3 / backend steps A+B: mark the build-side stream so the
+          // sender routes each row by key range instead of broadcasting to all
+          // hosts. The build-side join key (rhs of the eq conjunct) is the routing
+          // key the sender evaluates per row; 'bounds' (per-file key range keyed by
+          // file base name) rides on the sink to the scheduler.
+          rightChildFragment.setOutputPartition(
+              DataPartition.keyRangeFiltered(rhsJoinExprs.get(0).clone(), bounds));
+          // Mark the join so RuntimeFilterGenerator drops any REMOTE targets of the
+          // runtime filters it produces: under FBCAST each host's build partition
+          // (and hence its runtime filter) is only its key range, so publishing one
+          // host's partial filter to a scan in another fragment would drop matching
+          // rows (silent wrong results). Local targets stay (the host's probe shares
+          // its key range) so per-host filtering still works.
+          node.setFilteredBroadcast(true);
+          LOG.info("FBCAST: marking build side distribution KEY_RANGE_FILTERED "
+              + "on {}.{}", fbCand.probeTable.getFullName(), fbCand.columnName);
+        }
+      }
     } else {
       hjFragment = createPartitionedHashJoinFragment(node, analyzer,
           lhsHasCompatPartition, rhsHasCompatPartition, leftChildFragment,
           rightChildFragment, lhsJoinExprs, rhsJoinExprs, fragments);
     }
     return hjFragment;
+  }
+
+  /**
+   * FBCAST prototype (filtered-broadcast-join, see filtered-broadcast-join.md).
+   * Holds the probe-side key of a broadcast join that is a candidate for the
+   * optimization: a bare INT/BIGINT column reference on an Iceberg table.
+   */
+  private static class FilteredBroadcastCandidate {
+    final FeIcebergTable probeTable;
+    final int fieldId;
+    final String columnName;
+    final String buildLabel;
+    // Tuple id of the probe scan that produces the key. Used to verify the key
+    // reaches the join straight from that scan (no repartition/union in between).
+    final TupleId probeTupleId;
+
+    FilteredBroadcastCandidate(FeIcebergTable probeTable, int fieldId,
+        String columnName, String buildLabel, TupleId probeTupleId) {
+      this.probeTable = probeTable;
+      this.fieldId = fieldId;
+      this.columnName = columnName;
+      this.buildLabel = buildLabel;
+      this.probeTupleId = probeTupleId;
+    }
+  }
+
+  /**
+   * FBCAST step 1: returns a FilteredBroadcastCandidate if 'node' is a broadcast
+   * hash join eligible for the filtered-broadcast optimization, else null.
+   * Eligible when: the join is INNER or LEFT OUTER, there is exactly one equi-join
+   * conjunct, and its probe-side (child 0) expr is a bare SlotRef on an INT/BIGINT
+   * column of an Iceberg table. Logs the candidate at INFO with an FBCAST prefix.
+   */
+  private FilteredBroadcastCandidate detectFilteredBroadcastKey(HashJoinNode node) {
+    JoinOperator op = node.getJoinOp();
+    if (op != JoinOperator.INNER_JOIN && op != JoinOperator.LEFT_OUTER_JOIN) {
+      return null;
+    }
+    List<BinaryPredicate> eqConjuncts = node.getEqJoinConjuncts();
+    if (eqConjuncts == null || eqConjuncts.size() != 1) return null;
+
+    Expr probeExpr = eqConjuncts.get(0).getChild(0);
+    if (!(probeExpr instanceof SlotRef)) return null;
+    SlotDescriptor sd = ((SlotRef) probeExpr).getDesc();
+    if (sd == null || !sd.isScanSlot()) return null;
+    Type t = sd.getType();
+    if (!t.equals(Type.INT) && !t.equals(Type.BIGINT)) return null;
+    FeTable table = sd.getParent().getTable();
+    if (!(table instanceof FeIcebergTable)) return null;
+    if (!(sd.getColumn() instanceof IcebergColumn)) return null;
+
+    FeIcebergTable iceTable = (FeIcebergTable) table;
+    IcebergColumn col = (IcebergColumn) sd.getColumn();
+    String buildLabel = eqConjuncts.get(0).getChild(1).toSql();
+    LOG.info("FBCAST: candidate probe key {}.{} fieldId={} type={} build={}",
+        iceTable.getFullName(), col.getName(), col.getFieldId(), t.toSql(),
+        buildLabel);
+    return new FilteredBroadcastCandidate(
+        iceTable, col.getFieldId(), col.getName(), buildLabel, sd.getParent().getId());
+  }
+
+  /**
+   * FBCAST safety gate: returns true iff every probe row's key reaches the join with
+   * its host-locality intact relative to the single Iceberg scan identified by 'cand'.
+   * Walks the probe subtree (child 0) as a chain of locality-preserving nodes down to
+   * that scan, allowing:
+   *   - SelectNode: applies residual predicates, emits the same tuples/rows;
+   *   - a lower BROADCAST INNER / LEFT-OUTER join: build is broadcast to all hosts and
+   *     the probe child is read in the same fragment, so probe keys stay on their host.
+   * The surviving keys on a host therefore remain a subset of that host's per-file key
+   * ranges. Any ExchangeNode (repartition or broadcast), UnionNode, aggregation, or a
+   * PARTITIONED / RIGHT / FULL-OUTER join between the scan and the join means the keys
+   * arriving on a host no longer match the files that host scanned, so per-file
+   * key-range routing would be unsound. Being conservative here only costs a missed
+   * optimization (plain broadcast), never correctness.
+   */
+  private boolean probeKeyFromSingleScan(PlanNode n, FilteredBroadcastCandidate cand) {
+    while (true) {
+      if (n instanceof ScanNode) {
+        // The terminal scan must be the one that produces the probe key's tuple.
+        return ((ScanNode) n).getTupleDesc().getId().equals(cand.probeTupleId);
+      }
+      // SelectNode applies residual predicates but emits the same tuples/rows, so
+      // the surviving keys are still a subset of the scan's per-file key ranges.
+      if (n instanceof SelectNode) {
+        n = n.getChild(0);
+        continue;
+      }
+      // A lower BROADCAST INNER / LEFT-OUTER join preserves probe host-locality: the
+      // build side is broadcast to every host and the probe side (child 0) is read in
+      // the same fragment (no exchange), so a probe row keeps the key it was scanned
+      // with and stays on its host. Its output keys are therefore still a subset of
+      // that host's per-file ranges. Descend the probe child; ignore the build child.
+      // Broadcast-then-broadcast chains like this are very common. A PARTITIONED /
+      // shuffle join, or a RIGHT/FULL-OUTER join, would repartition or inject rows
+      // from the build side and break the invariant -> reject.
+      if (n instanceof JoinNode) {
+        JoinNode join = (JoinNode) n;
+        JoinOperator op = join.getJoinOp();
+        if (join.getDistributionMode() == DistributionMode.BROADCAST
+            && (op == JoinOperator.INNER_JOIN || op == JoinOperator.LEFT_OUTER_JOIN)) {
+          n = n.getChild(0);
+          continue;
+        }
+        return false;
+      }
+      // Exchange / Union / Aggregation / Analytic / anything else: unsafe.
+      return false;
+    }
+  }
+
+  /**
+   * FBCAST step 2: reads the probe table's per-file bounds for the candidate key
+   * and logs them plus a simple disjointness metric (count of pairwise-disjoint file
+   * ranges). If any file is missing bounds, logs that the optimization is skipped.
+   */
+  private Map<String, long[]> logFilteredBroadcastBounds(
+      FilteredBroadcastCandidate cand) throws ImpalaException {
+    Map<String, long[]> bounds =
+        IcebergUtil.getPerFileBounds(cand.probeTable, cand.fieldId);
+    if (bounds == null) {
+      LOG.info("FBCAST: {}.{} has files missing bounds; skipping optimization",
+          cand.probeTable.getFullName(), cand.columnName);
+      return null;
+    }
+    List<long[]> ranges = new ArrayList<>(bounds.values());
+    int n = ranges.size();
+    StringBuilder sb = new StringBuilder();
+    for (long[] b : ranges) {
+      sb.append(" [").append(b[0]).append(",").append(b[1]).append("]");
+    }
+    int disjointPairs = 0, totalPairs = 0;
+    for (int i = 0; i < n; ++i) {
+      for (int j = i + 1; j < n; ++j) {
+        ++totalPairs;
+        // Inclusive ranges are disjoint when one ends before the other begins.
+        if (ranges.get(i)[1] < ranges.get(j)[0]
+            || ranges.get(j)[1] < ranges.get(i)[0]) {
+          ++disjointPairs;
+        }
+      }
+    }
+    LOG.info("FBCAST: {}.{} has {} files, ranges:{}",
+        cand.probeTable.getFullName(), cand.columnName, n, sb.toString());
+    LOG.info("FBCAST: disjoint_pairs={}/{}", disjointPairs, totalPairs);
+    return bounds;
   }
 
   /**

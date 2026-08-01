@@ -70,6 +70,17 @@ struct TDataStreamSink {
   // If the partitioning type is UNPARTITIONED, the output is broadcast
   // to each destination host.
   2: required Partitions.TDataPartition output_partition
+
+  // FBCAST prototype (filtered-broadcast-join): when true this is an
+  // UNPARTITIONED (broadcast) build stream that should be routed to each
+  // destination by key range instead of broadcast to all. The single routing
+  // key expr is carried in output_partition.partition_exprs.
+  3: optional bool key_range_filtered
+
+  // FBCAST prototype: per probe data file, the [lower, upper] bound of the join
+  // key, keyed by the file's base name. The scheduler joins this with each build
+  // destination's assigned probe files to compute that destination's key range.
+  4: optional map<string, list<i64>> key_range_bounds_by_file
 }
 
 // Creates a new Hdfs files according to the evaluation of the partitionKeyExprs,

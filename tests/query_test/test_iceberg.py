@@ -2697,6 +2697,24 @@ class TestIcebergDirectedMode(IcebergTestSuite):
       self.run_test_case('QueryTest/iceberg-v2-directed-mode', vector)
 
 
+class TestIcebergFilteredBroadcastJoin(IcebergTestSuite):
+  """Tests the filtered-broadcast-join optimization: for a broadcast join whose probe
+  key comes straight from a single Iceberg scan with disjoint per-file key ranges, each
+  build row is routed only to hosts whose probe files cover its key. Correctness is
+  checked against a plain-broadcast oracle (tpch_parquet.lineitem_sorted), and engagement
+  (or safe fallback) is asserted on the verbose plan. Uses tpch_iceberg.lineitem_sorted /
+  tpch_parquet.lineitem_sorted, which are not created by the default dataload."""
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestIcebergFilteredBroadcastJoin, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_constraint(
+      lambda v: v.get_value('table_format').file_format == 'parquet')
+
+  def test_filtered_broadcast_join(self, vector):
+    self.run_test_case('QueryTest/iceberg-filtered-broadcast-join', vector)
+
+
 class TestIcebergTableWithPuffinStats(IcebergTestSuite):
   """Tests that Puffin stats are read correctly. The stats we use in these tests do not
   necessarily reflect the actual state of the table in the tests."""

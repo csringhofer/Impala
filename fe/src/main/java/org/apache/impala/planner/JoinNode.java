@@ -77,6 +77,17 @@ public abstract class JoinNode extends PlanNode {
 
   protected DistributionMode distrMode_ = DistributionMode.NONE;
 
+  // FBCAST (filtered-broadcast-join): true if this is a BROADCAST join whose build
+  // stream is routed by the probe's per-file key range (marked in DistributedPlanner
+  // via DataPartition.keyRangeFiltered). Under FBCAST each host receives only the
+  // build rows in its key range, so any runtime filter this join produces is a
+  // PARTIAL on each host. That is sound for LOCAL targets (the host's probe shares
+  // its key range) but NOT for REMOTE targets: the coordinator publishes a single
+  // instance's partial filter to remote scans (see coordinator.cc, is_broadcast_join
+  // && has_remote_targets => pending_count=1), which would drop matching rows. This
+  // flag lets RuntimeFilterGenerator drop the remote targets of such filters.
+  protected boolean isFilteredBroadcast_ = false;
+
   // Join conjuncts. eqJoinConjuncts_ are conjuncts of the form <lhs> = <rhs>;
   // otherJoinConjuncts_ are non-equi join conjuncts. For an inner join, join conjuncts
   // are conjuncts from the ON, USING or WHERE clauses. For other join types (e.g. outer
@@ -264,6 +275,8 @@ public abstract class JoinNode extends PlanNode {
   public DistributionMode getDistributionModeHint() { return distrModeHint_; }
   public DistributionMode getDistributionMode() { return distrMode_; }
   public void setDistributionMode(DistributionMode distrMode) { distrMode_ = distrMode; }
+  public boolean isFilteredBroadcast() { return isFilteredBroadcast_; }
+  public void setFilteredBroadcast(boolean b) { isFilteredBroadcast_ = b; }
   public JoinTableId getJoinTableId() { return joinTableId_; }
   public void setJoinTableId(JoinTableId id) { joinTableId_ = id; }
   public boolean hasSeparateBuild() { return joinTableId_ != JoinTableId.INVALID; }

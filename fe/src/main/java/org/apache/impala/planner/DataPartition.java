@@ -19,6 +19,7 @@ package org.apache.impala.planner;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 import org.apache.impala.analysis.Analyzer;
@@ -44,6 +45,16 @@ public class DataPartition {
   // Used for any partitioning that requires computing the partition.
   // Always non-null.
   private List<Expr> partitionExprs_;
+
+  // FBCAST prototype (filtered-broadcast-join, see filtered-broadcast-join.md).
+  // When true, this is an UNPARTITIONED (broadcast) build stream that should be
+  // routed to each host by key range instead of broadcast to all hosts. Keeping
+  // type_ = UNPARTITIONED preserves broadcast planning semantics.
+  private boolean keyRangeFiltered_ = false;
+
+  // FBCAST prototype: per probe data file, {lo, hi} of the join key keyed by file
+  // base name; carried to the scheduler via the data stream sink.
+  private Map<String, long[]> keyRangeBoundsByFile_ = null;
 
   private DataPartition(TPartitionType type, List<Expr> exprs) {
     Preconditions.checkNotNull(exprs);
@@ -79,7 +90,22 @@ public class DataPartition {
     return new DataPartition(TPartitionType.KUDU, Lists.newArrayList(expr));
   }
 
+  // FBCAST prototype: an UNPARTITIONED build stream marked for key-range routing.
+  // 'keyExpr' is the build-side join key, evaluated per row by the sender to
+  // decide the target host(s). Stored in partitionExprs_ so it is serialized to
+  // thrift like a partitioned sender's exprs (type stays UNPARTITIONED).
+  public static DataPartition keyRangeFiltered(
+      Expr keyExpr, Map<String, long[]> boundsByFile) {
+    DataPartition dp = new DataPartition(TPartitionType.UNPARTITIONED);
+    dp.keyRangeFiltered_ = true;
+    dp.partitionExprs_ = Lists.newArrayList(keyExpr);
+    dp.keyRangeBoundsByFile_ = boundsByFile;
+    return dp;
+  }
+
   public boolean isPartitioned() { return type_ != TPartitionType.UNPARTITIONED; }
+  public boolean isKeyRangeFiltered() { return keyRangeFiltered_; }
+  public Map<String, long[]> getKeyRangeBoundsByFile() { return keyRangeBoundsByFile_; }
   public boolean isHashPartitioned() { return type_ == TPartitionType.HASH_PARTITIONED; }
   public TPartitionType getType() { return type_; }
   public List<Expr> getPartitionExprs() { return partitionExprs_; }
@@ -127,6 +153,7 @@ public class DataPartition {
       }
       str.append("(" + Joiner.on(",").join(strings) +")");
     }
+    if (keyRangeFiltered_) str.append(" (key-range filtered)");
     return str.toString();
   }
 

@@ -1268,6 +1268,14 @@ public final class RuntimeFilterGenerator {
           isBoundByPartitionColumns);
       boolean isLocalTarget = isLocalTarget(filter, scanNode);
       if (runtimeFilterMode == TRuntimeFilterMode.LOCAL && !isLocalTarget) continue;
+      // FBCAST: a filtered-broadcast join produces only a PARTIAL filter on each host
+      // (each host builds from just its key-range slice of the broadcast build). The
+      // coordinator would publish one host's partial to remote targets as if it were
+      // the complete filter, dropping matching rows on other hosts. Only local targets
+      // (same fragment, same key range) are sound, so skip remote targets here. A
+      // filter left with no targets is dropped by finalizeRuntimeFilter, exactly as in
+      // LOCAL runtime-filter mode.
+      if (filter.getSrc().isFilteredBroadcast() && !isLocalTarget) continue;
 
       // Check that the scan node supports applying filters of this type and targetExpr.
       if (scanNode instanceof HdfsScanNode) {

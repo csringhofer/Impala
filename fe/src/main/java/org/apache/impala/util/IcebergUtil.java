@@ -39,6 +39,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -676,6 +677,52 @@ public class IcebergUtil {
     }
 
     return scan.planFiles();
+  }
+
+  /**
+   * FBCAST prototype (filtered-broadcast-join, see filtered-broadcast-join.md).
+   * Returns, per surviving data file in the current snapshot, the [lower, upper]
+   * bounds of the column with the given Iceberg field id as a long[]{lo, hi}
+   * (works for INT and BIGINT keys), keyed by the data file's base name.
+   * Returns null (meaning "cannot optimize, fall back to plain broadcast") when the
+   * table has no snapshot, the field is unknown, or ANY data file is missing bounds
+   * for the field.
+   */
+  public static Map<String, long[]> getPerFileBounds(
+      FeIcebergTable table, int fieldId) throws TableLoadingException {
+    if (table.snapshotId() == -1) return null;
+    Types.NestedField field = table.getIcebergSchema().findField(fieldId);
+    if (field == null) {
+      LOG.info("FBCAST: field id {} not found in schema of {}", fieldId,
+          table.getFullName());
+      return null;
+    }
+    Type iceType = field.type();
+    // LinkedHashMap preserves file scan order for stable logging.
+    Map<String, long[]> bounds = new LinkedHashMap<>();
+    // includeColumnStats() is required for the returned DataFiles to carry the
+    // per-column lower/upper bounds (Iceberg drops them from scans by default).
+    TableScan scan = newScan(table).useSnapshot(table.snapshotId())
+        .includeColumnStats();
+    try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
+      for (FileScanTask task : tasks) {
+        Map<Integer, ByteBuffer> lowers = task.file().lowerBounds();
+        Map<Integer, ByteBuffer> uppers = task.file().upperBounds();
+        if (lowers == null || uppers == null) return null;
+        ByteBuffer loBuf = lowers.get(fieldId);
+        ByteBuffer hiBuf = uppers.get(fieldId);
+        if (loBuf == null || hiBuf == null) return null;
+        long lo = ((Number) Conversions.fromByteBuffer(iceType, loBuf)).longValue();
+        long hi = ((Number) Conversions.fromByteBuffer(iceType, hiBuf)).longValue();
+        String path = task.file().path().toString();
+        String baseName = path.substring(path.lastIndexOf('/') + 1);
+        bounds.put(baseName, new long[] {lo, hi});
+      }
+    } catch (IOException e) {
+      throw new TableLoadingException(
+          "FBCAST: error reading Iceberg per-file bounds.", e);
+    }
+    return bounds;
   }
 
   /**

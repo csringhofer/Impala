@@ -1,0 +1,301 @@
+====
+---- QUERY
+# Simple broadcast join whose probe key (l_orderkey) comes straight from a single
+# Iceberg scan with disjoint per-file key ranges -> filtered broadcast engages.
+# Result must match the plain-broadcast oracle (tpch_parquet.lineitem_sorted, below).
+select count(*)
+from tpch_iceberg.lineitem_sorted l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+6001215
+---- TYPES
+BIGINT
+====
+---- QUERY
+# Oracle for the case above: non-Iceberg probe -> plain broadcast, no filtering.
+select count(*)
+from tpch_parquet.lineitem_sorted l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+6001215
+---- TYPES
+BIGINT
+====
+---- QUERY
+# The build sink of the l_orderkey broadcast join must be marked key-range filtered.
+set explain_level=3;
+explain
+select count(*)
+from tpch_iceberg.lineitem_sorted l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:.*BROADCAST \(key-range filtered\).*
+---- TYPES
+STRING
+====
+---- QUERY
+# Broadcast forced via /*+broadcast*/ hint (distribution-mode hint short-circuits the
+# cost-based choice): filtering must still engage on the hinted broadcast join.
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+6001215
+---- TYPES
+BIGINT
+====
+---- QUERY
+set explain_level=3;
+explain
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:.*BROADCAST \(key-range filtered\).*
+---- TYPES
+STRING
+====
+---- QUERY
+# A residual filter on the probe (SelectNode / pushed predicate) is row-preserving,
+# so filtering still engages; result matches the parquet oracle.
+select count(*)
+from tpch_iceberg.lineitem_sorted l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+where l.l_orderkey > 3000000
+---- RESULTS
+3001544
+---- TYPES
+BIGINT
+====
+---- QUERY
+select count(*)
+from tpch_parquet.lineitem_sorted l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+where l.l_orderkey > 3000000
+---- RESULTS
+3001544
+---- TYPES
+BIGINT
+====
+---- QUERY
+set explain_level=3;
+explain
+select count(*)
+from tpch_iceberg.lineitem_sorted l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+where l.l_orderkey > 3000000
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:.*BROADCAST \(key-range filtered\).*
+---- TYPES
+STRING
+====
+---- QUERY
+# GROUP BY on the join key: the probe slot is an aggregation output, not a scan slot,
+# so no candidate is even detected. Result is correct and must NOT be key-range filtered.
+select count(*)
+from (select l_orderkey from tpch_iceberg.lineitem_sorted group by l_orderkey) l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+1500000
+---- TYPES
+BIGINT
+====
+---- QUERY
+select count(*)
+from (select l_orderkey from tpch_parquet.lineitem_sorted group by l_orderkey) l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+1500000
+---- TYPES
+BIGINT
+====
+---- QUERY
+# An aggregation between scan and join breaks the single-scan invariant -> must skip.
+set explain_level=3;
+explain
+select count(*)
+from (select l_orderkey from tpch_iceberg.lineitem_sorted group by l_orderkey) l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS: VERIFY_IS_NOT_IN
+row_regex:.*key-range filtered.*
+---- TYPES
+STRING
+====
+---- QUERY
+# UNION ALL feeds the probe: the join slot is a union output, not a scan slot,
+# so no candidate is detected. Result is correct.
+select count(*)
+from (select l_orderkey from tpch_iceberg.lineitem_sorted
+      union all select l_orderkey from tpch_iceberg.lineitem_sorted) l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+12002430
+---- TYPES
+BIGINT
+====
+---- QUERY
+select count(*)
+from (select l_orderkey from tpch_parquet.lineitem_sorted
+      union all select l_orderkey from tpch_parquet.lineitem_sorted) l
+join tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+12002430
+---- TYPES
+BIGINT
+====
+---- QUERY
+# Shuffle join below the broadcast join repartitions lineitem by hash(l_orderkey):
+# probe rows no longer match the files their host scanned. The structural gate must
+# reject this (silent data loss otherwise). Result matches the parquet oracle.
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join /*+shuffle*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+join /*+broadcast*/ tpch_parquet.customer c on o.o_custkey = c.c_custkey
+where l.l_orderkey between 100 and 200000
+---- RESULTS
+200259
+---- TYPES
+BIGINT
+====
+---- QUERY
+select straight_join count(*)
+from tpch_parquet.lineitem_sorted l
+join /*+shuffle*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+join /*+broadcast*/ tpch_parquet.customer c on o.o_custkey = c.c_custkey
+where l.l_orderkey between 100 and 200000
+---- RESULTS
+200259
+---- TYPES
+BIGINT
+====
+---- QUERY
+# The shuffle exchange on the probe key path must prevent key-range filtering.
+set explain_level=3;
+explain
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join /*+shuffle*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+join /*+broadcast*/ tpch_parquet.customer c on o.o_custkey = c.c_custkey
+where l.l_orderkey between 100 and 200000
+---- RESULTS: VERIFY_IS_NOT_IN
+row_regex:.*key-range filtered.*
+---- TYPES
+STRING
+====
+---- QUERY
+# Broadcast-then-broadcast chain: a lower BROADCAST INNER join (on l_returnflag)
+# sits between the scan and the l_orderkey broadcast join. A broadcast join keeps
+# probe rows on their host, so the single-scan invariant still holds and filtering
+# must engage. Such chains are very common. Result matches the parquet oracle.
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join /*+broadcast*/ (select distinct l_returnflag as rf from tpch_parquet.lineitem) d
+  on l.l_returnflag = d.rf
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+6001215
+---- TYPES
+BIGINT
+====
+---- QUERY
+select straight_join count(*)
+from tpch_parquet.lineitem_sorted l
+join /*+broadcast*/ (select distinct l_returnflag as rf from tpch_parquet.lineitem) d
+  on l.l_returnflag = d.rf
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS
+6001215
+---- TYPES
+BIGINT
+====
+---- QUERY
+# The l_orderkey build sink must be key-range filtered even with the lower broadcast
+# join in between (the lower join's own build sink stays a plain broadcast).
+set explain_level=3;
+explain
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join /*+broadcast*/ (select distinct l_returnflag as rf from tpch_parquet.lineitem) d
+  on l.l_returnflag = d.rf
+join /*+broadcast*/ tpch_parquet.orders o on l.l_orderkey = o.o_orderkey
+---- RESULTS: VERIFY_IS_SUBSET
+row_regex:.*BROADCAST \(key-range filtered\).*
+---- TYPES
+STRING
+====
+---- QUERY
+# REMOTE runtime filter correctness. Two broadcast joins on the SAME key: the top
+# FBCAST join builds a runtime filter from o2.o_orderkey that ALSO targets the o1
+# scan, which lives in a different fragment (a REMOTE target). Under FBCAST each
+# host only holds its key-range slice of the broadcast build, so each host's runtime
+# filter is PARTIAL. The coordinator publishes a single instance's filter to remote
+# targets (is_broadcast_join && has_remote_targets -> pending_count=1), so an
+# unguarded partial would drop matching o1 rows. We force the scan to block for the
+# filter so any mis-pruning is deterministic (not timing-dependent). Must match the
+# plain-broadcast oracle below (6001215).
+set runtime_filter_wait_time_ms=30000;
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join /*+broadcast*/ tpch_parquet.orders o1 on l.l_orderkey = o1.o_orderkey
+join /*+broadcast*/ tpch_parquet.orders o2 on l.l_orderkey = o2.o_orderkey
+---- RESULTS
+6001215
+---- TYPES
+BIGINT
+====
+---- QUERY
+set runtime_filter_wait_time_ms=30000;
+select straight_join count(*)
+from tpch_parquet.lineitem_sorted l
+join /*+broadcast*/ tpch_parquet.orders o1 on l.l_orderkey = o1.o_orderkey
+join /*+broadcast*/ tpch_parquet.orders o2 on l.l_orderkey = o2.o_orderkey
+---- RESULTS
+6001215
+---- TYPES
+BIGINT
+====
+---- QUERY
+# Same remote-filter shape, probe narrowed to file-1's key range. The hosts scanning
+# the other two files get no probe rows, so their build partition -- and their
+# runtime filter -- is EMPTY. Before the fix the coordinator could publish one of
+# those empty partials to the remote o1 scan, dropping ALL o1 rows -> result 0.
+# Must match the oracle (500291).
+set runtime_filter_wait_time_ms=30000;
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join /*+broadcast*/ tpch_parquet.orders o1 on l.l_orderkey = o1.o_orderkey
+join /*+broadcast*/ tpch_parquet.orders o2 on l.l_orderkey = o2.o_orderkey
+where l.l_orderkey between 1 and 500000
+---- RESULTS
+500291
+---- TYPES
+BIGINT
+====
+---- QUERY
+set runtime_filter_wait_time_ms=30000;
+select straight_join count(*)
+from tpch_parquet.lineitem_sorted l
+join /*+broadcast*/ tpch_parquet.orders o1 on l.l_orderkey = o1.o_orderkey
+join /*+broadcast*/ tpch_parquet.orders o2 on l.l_orderkey = o2.o_orderkey
+where l.l_orderkey between 1 and 500000
+---- RESULTS
+500291
+---- TYPES
+BIGINT
+====
+---- QUERY
+# The FBCAST join's runtime filter (RF on o2.o_orderkey) must be applied only to the
+# LOCAL probe scan (l). Its REMOTE target -- the o1 scan in another fragment -- must
+# be dropped, so o1's scan carries no incoming runtime filter on o_orderkey from the
+# top join.
+set explain_level=2;
+explain
+select straight_join count(*)
+from tpch_iceberg.lineitem_sorted l
+join /*+broadcast*/ tpch_parquet.orders o1 on l.l_orderkey = o1.o_orderkey
+join /*+broadcast*/ tpch_parquet.orders o2 on l.l_orderkey = o2.o_orderkey
+---- RESULTS: VERIFY_IS_NOT_IN
+row_regex:.*-> o1.o_orderkey.*
+---- TYPES
+STRING
+====

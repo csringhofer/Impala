@@ -60,6 +60,12 @@ class KrpcDataStreamSenderConfig : public DataSinkConfig {
   /// The type of partitioning to perform.
   TPartitionType::type partition_type_ = TPartitionType::UNPARTITIONED;
 
+  /// FBCAST prototype (filtered-broadcast-join): when true, this is an
+  /// UNPARTITIONED (broadcast) build stream that routes each row to the
+  /// destination(s) whose key range covers the row's key. partition_exprs_ holds
+  /// the single routing key expr.
+  bool key_range_filtered_ = false;
+
   /// Expressions of partition keys. It's used to compute the
   /// per-row partition values for shuffling exchange;
   std::vector<ScalarExpr*> partition_exprs_;
@@ -223,6 +229,11 @@ class KrpcDataStreamSender : public DataSink {
   /// insertion into the channel fails. Returns OK status otherwise.
   Status HashAndAddRows(RowBatch* batch);
 
+  /// FBCAST prototype (filtered-broadcast-join): route each row by its INT/BIGINT
+  /// key. A null key goes to all channels; a non-null key goes to every channel
+  /// whose [key_range_lo_, key_range_hi_] covers it. Uses partition_row_collectors_.
+  Status KeyRangeAddRows(RowBatch* batch);
+
   /// Functions to dump the content of the "filename to hosts" related mappings into logs.
   void DumpFilenameToHostsMapping() const;
   void DumpDestinationHosts() const;
@@ -234,6 +245,20 @@ class KrpcDataStreamSender : public DataSink {
 
   /// The type of partitioning to perform.
   const TPartitionType::type partition_type_;
+
+  /// FBCAST prototype: true if this is a key-range-filtered broadcast build sink.
+  /// When true, partition_type_ is UNPARTITIONED but rows are routed by key range.
+  const bool key_range_filtered_;
+
+  /// FBCAST prototype: per-channel key range (aligned with channels_). A row with a
+  /// non-null key K is sent to channel i iff chan_key_present_[i] and
+  /// chan_key_lo_[i] <= K <= chan_key_hi_[i]. Populated in the constructor; the
+  /// channel order is not shuffled when key_range_filtered_ so indexes stay aligned.
+  std::vector<bool> chan_key_present_;
+  std::vector<int64_t> chan_key_lo_;
+  std::vector<int64_t> chan_key_hi_;
+  /// FBCAST prototype: rows routed to each channel (for verification logging).
+  std::vector<int64_t> chan_row_count_;
 
   /// Amount of per-channel buffering for rows before sending them to the destination.
   const int per_channel_buffer_size_;

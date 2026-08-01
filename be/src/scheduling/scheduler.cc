@@ -358,6 +358,23 @@ Status Scheduler::ComputeFragmentExecParams(
       FragmentScheduleState* dest_state = state->GetFragmentScheduleState(dest_idx);
 
       // populate src_state->destinations
+      const TDataStreamSink& stream_sink = src_fragment.output_sink.stream_sink;
+
+      // FBCAST prototype: resolve the fragment that actually scans the probe files.
+      // With mt_dop>0 a broadcast join's destination is a separate join-build fragment
+      // (one shared instance per host) that holds no scan ranges of its own; the probe
+      // scan lives in the join fragment it feeds, reachable via join_build_sink's
+      // dest_node_id. With mt_dop=0 the destination fragment contains the probe scan
+      // itself, so probe_state == dest_state. Its scan_range_assignment maps host ->
+      // (probe scan node -> ranges); key_range_bounds_by_file is keyed by file base name.
+      const FragmentScheduleState* probe_state = dest_state;
+      if (stream_sink.key_range_filtered
+          && dest_state->fragment.output_sink.__isset.join_build_sink) {
+        int join_fragment_idx = state->GetFragmentIdx(
+            dest_state->fragment.output_sink.join_build_sink.dest_node_id);
+        probe_state = state->GetFragmentScheduleState(join_fragment_idx);
+      }
+
       for (int i = 0; i < dest_state->instance_states.size(); ++i) {
         PlanFragmentDestinationPB* dest = src_state->exec_params->add_destinations();
         *dest->mutable_fragment_instance_id() =
@@ -368,6 +385,45 @@ Status Scheduler::ComputeFragmentExecParams(
         DCHECK(desc.has_krpc_address());
         DCHECK(IsResolvedAddress(desc.krpc_address()));
         *dest->mutable_krpc_backend() = desc.krpc_address();
+
+        // FBCAST prototype: compute this destination's key range as the union of the
+        // join-key bounds of the probe files scanned on this destination's host. The
+        // range is read from the probe fragment's per-host scan assignment (see
+        // probe_state above) rather than the destination instance's own scan ranges,
+        // which are empty when the destination is a shared join-build fragment (mt_dop>0).
+        if (stream_sink.key_range_filtered) {
+          bool present = false;
+          int64_t lo = 0, hi = 0;
+          const auto host_it = probe_state->scan_range_assignment.find(host);
+          if (host_it != probe_state->scan_range_assignment.end()) {
+            for (const auto& node_ranges : host_it->second) {
+              for (const ScanRangeParamsPB& srp : node_ranges.second) {
+                if (!srp.scan_range().has_hdfs_file_split()) continue;
+                const std::string& rel =
+                    srp.scan_range().hdfs_file_split().relative_path();
+                std::string base = rel.substr(rel.find_last_of('/') + 1);
+                const auto it = stream_sink.key_range_bounds_by_file.find(base);
+                if (it == stream_sink.key_range_bounds_by_file.end()) continue;
+                if (it->second.size() < 2) continue;
+                int64_t flo = it->second[0], fhi = it->second[1];
+                if (!present) {
+                  lo = flo; hi = fhi; present = true;
+                } else {
+                  if (flo < lo) lo = flo;
+                  if (fhi > hi) hi = fhi;
+                }
+              }
+            }
+          }
+          dest->set_key_range_present(present);
+          if (present) {
+            dest->set_key_range_lo(lo);
+            dest->set_key_range_hi(hi);
+          }
+          LOG(INFO) << "FBCAST-BE: dest " << i << " host " << host.hostname()
+                    << " key_range_present=" << present << " range=[" << lo << ","
+                    << hi << "]";
+        }
       }
 
       // enumerate senders consecutively;
@@ -1387,9 +1443,26 @@ void Scheduler::GetScanHosts(const vector<TPlanNodeId>& scan_ids,
   }
 }
 
+// FBCAST prototype (filtered-broadcast-join): log the per-file join-key bounds that
+// arrived on each key-range-filtered build stream sink.
+static void LogFbcastFileBounds(ScheduleState* state) {
+  for (FragmentScheduleState& f : state->fragment_schedule_states()) {
+    if (!f.fragment.output_sink.__isset.stream_sink) continue;
+    const TDataStreamSink& sink = f.fragment.output_sink.stream_sink;
+    if (!sink.key_range_filtered) continue;
+    for (const auto& e : sink.key_range_bounds_by_file) {
+      const std::vector<int64_t>& b = e.second;
+      LOG(INFO) << "FBCAST-BE: sink file=" << e.first << " key range=["
+                << (b.size() > 0 ? b[0] : 0) << "," << (b.size() > 1 ? b[1] : 0)
+                << "]";
+    }
+  }
+}
+
 Status Scheduler::Schedule(const ExecutorConfig& executor_config, ScheduleState* state) {
   RETURN_IF_ERROR(DebugAction(state->query_options(), "SCHEDULER_SCHEDULE"));
   RETURN_IF_ERROR(ComputeScanRangeAssignment(executor_config, state));
+  LogFbcastFileBounds(state);
   RETURN_IF_ERROR(ComputeFragmentExecParams(executor_config, state));
   ComputeBackendExecParams(executor_config, state);
 #ifndef NDEBUG
