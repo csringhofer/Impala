@@ -65,13 +65,12 @@ partition by hash (l_orderkey) partitions 9 stored as kudu;
 -- Sort files by l_orderkey so dependent (parquet) loads write l_orderkey-ordered data.
 ALTER TABLE {table_name} SORT BY (l_orderkey);
 ---- DEPENDENT_LOAD
--- max_fs_writers=1 gathers to a single ordered writer (global sort via the SORT BY
--- above); parquet_file_size rolls that ordered stream into a few files with disjoint
--- l_orderkey ranges, each kept under the HDFS block size so it stays a single scan
--- range on one host. This makes lineitem a testbed for the filtered broadcast join
--- (probe-side files with disjoint key ranges). The 68m size is tuned for scale factor 1.
+-- max_fs_writers=1 gathers to a single writer whose input is globally sorted (via the
+-- SORT BY above), so the written files have disjoint l_orderkey ranges. This makes
+-- lineitem a testbed for the filtered broadcast join (probe-side files with disjoint
+-- key ranges). No file-size cap: files split only when the writer rolls, so the ranges
+-- stay disjoint at any scale factor (one file may be smaller than the rest).
 SET max_fs_writers=1;
-SET parquet_file_size=68m;
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}.{table_name};
 ---- LOAD
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/{table_name}'
@@ -248,7 +247,17 @@ create table if not exists {db_name}{db_suffix}.{table_name} (
   O_COMMENT STRING
 )
 partition by hash (o_orderkey) partitions 9 stored as kudu;
+---- ALTER
+-- Sort files by o_orderkey so dependent (parquet) loads write o_orderkey-ordered data.
+ALTER TABLE {table_name} SORT BY (o_orderkey);
 ---- DEPENDENT_LOAD
+-- Mirror of lineitem: max_fs_writers=1 gathers to a single writer whose input is
+-- globally sorted (via the SORT BY above), so the written files have disjoint
+-- o_orderkey ranges. This makes orders a filtered-broadcast-join probe testbed for
+-- queries where lineitem is filtered small (the build) and orders is the probe on
+-- o_orderkey. No file-size cap: ranges stay disjoint at any scale factor (one file
+-- may be smaller than the rest).
+SET max_fs_writers=1;
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM {db_name}.{table_name};
 ---- LOAD
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/impala-data/{db_name}/{table_name}'
