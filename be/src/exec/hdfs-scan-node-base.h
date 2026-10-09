@@ -203,6 +203,17 @@ class ScanRangeSharedState {
   /// left to read.
   Status GetNextScanRange(RuntimeState* state, io::ScanRange** scan_range);
 
+  /// Returns true if no more scan ranges can ever become available, i.e. the queue is
+  /// drained and every instance has finished submitting its ranges. This is the same
+  /// condition that makes GetNextScanRange() return a nullptr range. Ranges are only
+  /// enqueued after 'remaining_scan_range_submissions_' has been incremented for them,
+  /// so once this returns true it stays true and a caller can rely on it to detect
+  /// end-of-stream before the next GetNextScanRange() call.
+  bool NoMoreScanRanges() {
+    DCHECK(use_mt_scan_node_) << "Should only be called by MT scan nodes";
+    return scan_range_queue_.Empty() && remaining_scan_range_submissions_.Load() == 0;
+  }
+
   /// Add the required hooks to the runtime state that gets triggered in case of
   /// cancellation. Must be called before adding or removing scan ranges to the queue.
   void AddCancellationHook(RuntimeState* state);

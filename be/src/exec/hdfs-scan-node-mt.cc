@@ -122,6 +122,18 @@ Status HdfsScanNodeMt::GetNext(RuntimeState* state, RowBatch* row_batch, bool* e
     scanner_.reset();
     scan_range_ = nullptr;
     return Status::OK();
+  } else if (scanner_->eos() && !deterministic_scanrange_assignment_
+      && shared_state_->NoMoreScanRanges()) {
+    // This scanner finished its scan range and no further range can become available,
+    // so these are the last rows. Report eos now instead of on a follow-up GetNext()
+    // call that would return an empty batch. This lets a data sink mark end-of-stream
+    // on this batch rather than emitting a separate empty one - see
+    // KrpcDataStreamSender. This is only an optimization: if NoMoreScanRanges() is
+    // false we fall back to reporting eos on the next call.
+    scanner_->Close(row_batch);
+    scanner_.reset();
+    scan_range_ = nullptr;
+    *eos = true;
   }
   COUNTER_SET(rows_returned_counter_, rows_returned());
 
