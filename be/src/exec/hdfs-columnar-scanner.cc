@@ -179,24 +179,18 @@ Status HdfsColumnarScanner::Codegen(HdfsScanPlanNode* node, FragmentState* state
   RETURN_IF_ERROR(ExecNode::CodegenEvalConjuncts(codegen, conjuncts, &eval_conjuncts_fn));
   DCHECK(eval_conjuncts_fn != nullptr);
 
+  // ProcessScratchBatch() evaluates the conjuncts in two loops, with and without
+  // runtime filters.
   int replaced = codegen->ReplaceCallSites(fn, eval_conjuncts_fn, "EvalConjuncts");
-  DCHECK_REPLACE_COUNT(replaced, 1);
+  DCHECK_REPLACE_COUNT(replaced, 2);
 
   llvm::Function* eval_runtime_filters_fn;
-  RETURN_IF_ERROR(CodegenEvalRuntimeFilters(
-      codegen, node->runtime_filter_exprs_, &eval_runtime_filters_fn));
+  RETURN_IF_ERROR(CodegenEvalRuntimeFiltersOnRows(codegen, node->runtime_filter_exprs_,
+      node->tnode_->runtime_filters, &eval_runtime_filters_fn));
   DCHECK(eval_runtime_filters_fn != nullptr);
 
-  replaced = codegen->ReplaceCallSites(fn, eval_runtime_filters_fn, "EvalRuntimeFilters");
-  DCHECK_REPLACE_COUNT(replaced, 1);
-
-  llvm::Function* prefetch_runtime_filters_fn;
-  RETURN_IF_ERROR(CodegenPrefetchRuntimeFilters(codegen, node->runtime_filter_exprs_,
-      node->tnode_->runtime_filters, &prefetch_runtime_filters_fn));
-  DCHECK(prefetch_runtime_filters_fn != nullptr);
-
   replaced = codegen->ReplaceCallSites(
-      fn, prefetch_runtime_filters_fn, "PrefetchRuntimeFilters");
+      fn, eval_runtime_filters_fn, "EvalRuntimeFiltersOnRows");
   DCHECK_REPLACE_COUNT(replaced, 1);
 
   fn->setName("ProcessScratchBatch");

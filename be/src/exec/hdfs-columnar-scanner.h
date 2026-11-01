@@ -34,12 +34,6 @@ struct ScratchTupleBatch;
 /// conjuncts and runtime filters.
 class HdfsColumnarScanner : public HdfsScanner {
  public:
-  /// Number of tuples whose Bloom filter buckets ProcessScratchBatch() prefetches before
-  /// evaluating the runtime filters on them. Enough to overlap many cache misses, but
-  /// few enough that the prefetched buckets stay in the L1 cache until they are used.
-  /// 64 was the fastest in a microbenchmark of 8-64 MB filters.
-  static constexpr int RUNTIME_FILTER_PREFETCH_BATCH_SIZE = 64;
-
   HdfsColumnarScanner(HdfsScanNodeBase* scan_node, RuntimeState* state);
   virtual ~HdfsColumnarScanner();
 
@@ -98,7 +92,10 @@ class HdfsColumnarScanner : public HdfsScanner {
 
   /// Processes a single row batch for TransferScratchTuples, looping over scratch_batch_
   /// until it is exhausted or the output is full. Called for the case when there are
-  /// materialized tuples. This is a separate function so it can be codegened.
+  /// materialized tuples. This is a separate function so it can be codegened. If there
+  /// are runtime filters, they are evaluated on batches of up to
+  /// RUNTIME_FILTER_BATCH_SIZE tuples with EvalRuntimeFiltersOnRows(), and the conjuncts
+  /// only on the tuples that pass them.
   int ProcessScratchBatch(RowBatch* dst_batch);
 
   /// List of pair of (column index, reservation allocated).

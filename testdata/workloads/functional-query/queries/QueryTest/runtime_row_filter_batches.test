@@ -1,0 +1,20 @@
+====
+---- QUERY
+####################################################
+# Two filters on the same scan. Runtime filters are evaluated on batches of rows, each
+# filter only on the rows that passed the previous filters, so 'Rows processed' is the
+# 7300 rows of 'a' for its first filter plus the 8 rows that passed it for the second
+# one. The test runs this with a small batch size too, which limits the batches of rows
+# to the remaining space in the output row batch.
+####################################################
+SET RUNTIME_FILTER_WAIT_TIME_MS=$RUNTIME_FILTER_WAIT_TIME_MS;
+SET RUNTIME_FILTER_MODE=GLOBAL;
+select STRAIGHT_JOIN count(*) from alltypes a
+    join [BROADCAST] alltypestiny c on a.int_col = c.int_col
+    join [BROADCAST] alltypestiny b on a.id = b.id
+---- RESULTS
+8
+---- RUNTIME_PROFILE
+aggregation(SUM, Rows processed): 7308
+aggregation(SUM, Rows rejected): 7298
+====

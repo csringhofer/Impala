@@ -123,10 +123,10 @@ struct FilterContext {
   /// a match in 'filter'. Returns false otherwise.
   bool Eval(TupleRow* row) const noexcept;
 
-  /// Evaluates 'row' with 'expr_eval' and prefetches the bucket of the resulting value in
-  /// the Bloom filter of 'filter', see RuntimeFilter::PrefetchBloomFilter(). Only valid
-  /// for Bloom filters.
-  void Prefetch(TupleRow* row) const noexcept;
+  /// Evaluates 'row' with 'expr_eval' and returns the hash of the resulting value that
+  /// the Bloom filter of 'filter' is looked up with, see
+  /// RuntimeFilter::BloomFilterHash(). Only valid for Bloom filters.
+  uint32_t BloomFilterHash(TupleRow* row) const noexcept;
 
   /// Evaluates 'row' with 'expr_eval' and inserts the value into 'local_bloom_filter'
   /// or 'local_min_max_filter' as appropriate. Bloom filter inserts may be deferred
@@ -153,8 +153,8 @@ struct FilterContext {
   static Status CodegenEval(LlvmCodeGen* codegen, ScalarExpr* filter_expr,
       llvm::Function** fn) WARN_UNUSED_RESULT;
 
-  /// Codegen Prefetch() the same way as CodegenEval().
-  static Status CodegenPrefetch(LlvmCodeGen* codegen, ScalarExpr* filter_expr,
+  /// Codegen BloomFilterHash() the same way as CodegenEval().
+  static Status CodegenBloomFilterHash(LlvmCodeGen* codegen, ScalarExpr* filter_expr,
       llvm::Function** fn) WARN_UNUSED_RESULT;
 
   /// Codegen Insert() by codegen'ing the expression 'filter_expr', replacing the type

@@ -357,12 +357,8 @@ class HdfsScanner {
     /// Apply the filter at row group level only.
     uint8_t enabled_for_rowgroup;
 
-    /// Set to 1 if PrefetchRuntimeFilters() prefetches the filter's Bloom filter buckets,
-    /// see UpdateRuntimeFilterPrefetch().
-    uint8_t prefetch_for_row;
-
     /// Padding to ensure structs do not straddle cache-line boundary.
-    uint8_t padding[4];
+    uint8_t padding[5];
 
     LocalFilterStats()
       : considered(0),
@@ -370,8 +366,7 @@ class HdfsScanner {
         total_possible(0),
         enabled_for_row(1),
         enabled_for_page(1),
-        enabled_for_rowgroup(1),
-        prefetch_for_row(0) {}
+        enabled_for_rowgroup(1) {}
   };
 
   /// Cached runtime filter contexts, one for each filter that applies to this column.
@@ -391,32 +386,38 @@ class HdfsScanner {
   /// row batches. Will update 'filter_stats_'.
   void CheckFiltersEffectiveness();
 
-  /// Evaluates 'row' against the i-th runtime filter for this scan node and returns
-  /// true if 'row' finds a match in the filter. Returns false otherwise.
-  bool EvalRuntimeFilter(int i, TupleRow* row);
+  /// Maximum number of rows that EvalRuntimeFiltersOnRows() is called with.
+  static constexpr int RUNTIME_FILTER_BATCH_SIZE = 128;
 
-  /// Evaluates runtime filters (if any) against the given row. Returns true if
-  /// they passed, false otherwise. Maintains the runtime filter stats, determines
-  /// whether the filters are effective, and disables them if they are not. This is
-  /// replaced by generated code at runtime.
-  bool EvalRuntimeFilters(TupleRow* row);
+  /// Evaluates the runtime filters (if any) on 'num_rows' rows, filter by filter. The
+  /// rows are the tuples at 'tuples' + sel[j] * 'tuple_size' for j < 'num_rows', with
+  /// increasing indexes in 'sel'. Removes the indexes of the rows that a filter rejects
+  /// from 'sel', keeping the order of the rest, so each filter is only evaluated on the
+  /// rows that passed the previous ones. Returns the number of rows that passed all
+  /// filters. 'hashes' is scratch space for at least 'num_rows' hashes. Maintains the
+  /// runtime filter stats per row, which determine whether the filters are effective
+  /// (see CheckFiltersEffectiveness()). This is replaced by generated code at runtime.
+  ///
+  /// Evaluating a filter on a batch of rows keeps the result of each row out of the
+  /// control flow, so the evaluation of a row does not wait for the previous rows and
+  /// mispredicted branches do not discard it. It also lets Bloom filter buckets be
+  /// prefetched without evaluating the filter expression and hashing twice.
+  int EvalRuntimeFiltersOnRows(
+      uint8_t* tuples, int tuple_size, int* sel, int num_rows, uint32_t* hashes);
 
-  /// Sets 'prefetch_for_row' of each filter's stats: true for Bloom filters that are
-  /// enabled for rows, have arrived, are not always true and whose arrived filter is
-  /// large enough to benefit from prefetching (see BloomFilter::ShouldPrefetch()).
-  /// Returns true if any filter is prefetched. Filters can arrive or be disabled at any
-  /// time, so this is called for each batch.
-  bool UpdateRuntimeFilterPrefetch();
+  /// Evaluates the i-th runtime filter, which is a Bloom filter, on the rows given by
+  /// 'tuples', 'tuple_size', 'sel' and 'num_rows' like EvalRuntimeFiltersOnRows(). It
+  /// first computes the hashes of all rows into 'hashes', then prefetches their buckets
+  /// if 'may_prefetch' is true and the filter is large enough (see
+  /// BloomFilter::ShouldPrefetch()), then looks them up. Returns the number of rows that
+  /// passed, whose indexes are moved to the start of 'sel'.
+  int EvalBloomFilterOnRows(int i, uint8_t* tuples, int tuple_size, int* sel,
+      int num_rows, uint32_t* hashes, bool may_prefetch);
 
-  /// Prefetches the Bloom filter bucket that 'row' maps to for the i-th runtime filter,
-  /// if its 'prefetch_for_row' is set.
-  void PrefetchRuntimeFilter(int i, TupleRow* row);
-
-  /// Calls PrefetchRuntimeFilter() for every runtime filter. Prefetching the buckets of
-  /// a batch of rows before evaluating the filters on them with EvalRuntimeFilters()
-  /// overlaps the cache misses of the batch. This is replaced by generated code at
-  /// runtime.
-  void PrefetchRuntimeFilters(TupleRow* row);
+  /// Same as EvalBloomFilterOnRows() for the i-th runtime filter if it is not a Bloom
+  /// filter, evaluated row by row.
+  int EvalRuntimeFilterOnRows(
+      int i, uint8_t* tuples, int tuple_size, int* sel, int num_rows);
 
   /// Find and return the last split in the file if it is assigned to this scan node.
   /// Returns NULL otherwise.
@@ -620,19 +621,15 @@ class HdfsScanner {
   static Status CodegenInitTuple(
       const HdfsScanPlanNode* node, LlvmCodeGen* codegen, llvm::Function** init_tuple_fn);
 
-  /// Codegen EvalRuntimeFilters() by unrolling the loop in the interpreted version
-  /// and emitting a customized version of EvalRuntimeFilter() for each filter in
-  /// 'filter_ctxs'. Return error status on failure. The generated function is returned
-  /// via 'fn'.
-  static Status CodegenEvalRuntimeFilters(LlvmCodeGen* codegen,
-      const std::vector<ScalarExpr*>& filter_exprs, llvm::Function** fn)
-      WARN_UNUSED_RESULT;
-
-  /// Codegen PrefetchRuntimeFilters() the same way as CodegenEvalRuntimeFilters(), but
-  /// only for the Bloom filters in 'filter_descs' (which have the same order as
-  /// 'filter_exprs') whose planned size is at least --bloom_filter_prefetch_min_bytes.
-  /// If there are none, the generated function does nothing.
-  static Status CodegenPrefetchRuntimeFilters(LlvmCodeGen* codegen,
+  /// Codegen EvalRuntimeFiltersOnRows() by unrolling the loop over the filters in the
+  /// interpreted version and emitting a customized version of EvalBloomFilterOnRows() or
+  /// EvalRuntimeFilterOnRows() for each filter, with the filter expression and hashing
+  /// codegen'd for the expression's type. 'filter_descs' has the same order as
+  /// 'filter_exprs'. Prefetching is only generated for Bloom filters planned at least
+  /// --bloom_filter_prefetch_min_bytes large: a filter can be shrunk after planning,
+  /// but never grows. Return error status on failure. The generated function is
+  /// returned via 'fn'.
+  static Status CodegenEvalRuntimeFiltersOnRows(LlvmCodeGen* codegen,
       const std::vector<ScalarExpr*>& filter_exprs,
       const std::vector<TRuntimeFilterDesc>& filter_descs, llvm::Function** fn)
       WARN_UNUSED_RESULT;

@@ -25,9 +25,7 @@ bool IR_ALWAYS_INLINE RuntimeFilter::Eval(
   switch (filter_desc().type) {
     case TRuntimeFilterType::BLOOM: {
       if (bloom_filter_.Load() == BloomFilter::ALWAYS_TRUE_FILTER) return true;
-      uint32_t h = RawValue::GetHashValueFastHash32(
-          val, col_type, RuntimeFilterBank::DefaultHashSeed());
-      return bloom_filter_.Load()->Find(h);
+      return bloom_filter_.Load()->Find(BloomFilterHash(val, col_type));
     }
     case TRuntimeFilterType::MIN_MAX: {
       // Min/max overlap does not deal with nulls (val==nullptr).
@@ -50,12 +48,8 @@ bool IR_ALWAYS_INLINE RuntimeFilter::Eval(
   return true;
 }
 
-void IR_ALWAYS_INLINE RuntimeFilter::PrefetchBloomFilter(
+uint32_t IR_ALWAYS_INLINE RuntimeFilter::BloomFilterHash(
     void* val, const ColumnType& col_type) const noexcept {
-  DCHECK(is_bloom_filter());
-  const BloomFilter* bloom_filter = bloom_filter_.Load();
-  if (bloom_filter == BloomFilter::ALWAYS_TRUE_FILTER) return;
-  uint32_t h = RawValue::GetHashValueFastHash32(
+  return RawValue::GetHashValueFastHash32(
       val, col_type, RuntimeFilterBank::DefaultHashSeed());
-  bloom_filter->Prefetch(h);
 }

@@ -22,6 +22,7 @@
 #include "util/string-parser.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/tuple.h"
+#include "util/bloom-filter.h"
 
 #include "common/names.h"
 
@@ -97,25 +98,54 @@ void StringToDecimalSymbolDummy() {
   StringToDecimal16(nullptr, 0, 0, 0, false, nullptr);
 }
 
-bool HdfsScanner::EvalRuntimeFilter(int i, TupleRow* row) {
+int HdfsScanner::EvalBloomFilterOnRows(int i, uint8_t* tuples, int tuple_size,
+    int* sel, int num_rows, uint32_t* hashes, bool may_prefetch) {
+  if (num_rows == 0) return 0;
   LocalFilterStats* stats = &filter_stats_[i];
   const FilterContext* ctx = filter_ctxs_[i];
-  ++stats->total_possible;
-  if (stats->enabled_for_row && ctx->filter->HasFilter()) {
-    // Evaluating IN-list filter is much slower than evaluating the corresponding bloom
-    // filter. Skip it until we improve its performance.
-    if (ctx->filter->is_in_list_filter()) return true;
-    ++stats->considered;
-    if (!ctx->Eval(row)) {
-      ++stats->rejected;
-      return false;
-    }
+  stats->total_possible += num_rows;
+  if (!stats->enabled_for_row || !ctx->filter->HasFilter()) return num_rows;
+  stats->considered += num_rows;
+  const BloomFilter* bloom_filter = ctx->filter->get_bloom_filter();
+  if (bloom_filter == BloomFilter::ALWAYS_TRUE_FILTER) return num_rows;
+  for (int j = 0; j < num_rows; ++j) {
+    Tuple* tuple = reinterpret_cast<Tuple*>(tuples + sel[j] * tuple_size);
+    hashes[j] = ctx->BloomFilterHash(reinterpret_cast<TupleRow*>(&tuple));
   }
-  return true;
+  // The arrived filter may be smaller than planned, see
+  // --bloom_filter_shrink_error_rate.
+  if (may_prefetch && BloomFilter::ShouldPrefetch(bloom_filter->directory_size())) {
+    for (int j = 0; j < num_rows; ++j) bloom_filter->Prefetch(hashes[j]);
+  }
+  // Compact 'sel' without branching on the result of Find().
+  int num_passed = 0;
+  for (int j = 0; j < num_rows; ++j) {
+    sel[num_passed] = sel[j];
+    num_passed += bloom_filter->Find(hashes[j]);
+  }
+  stats->rejected += num_rows - num_passed;
+  return num_passed;
 }
 
-void HdfsScanner::PrefetchRuntimeFilter(int i, TupleRow* row) {
-  if (filter_stats_[i].prefetch_for_row) filter_ctxs_[i]->Prefetch(row);
+int HdfsScanner::EvalRuntimeFilterOnRows(
+    int i, uint8_t* tuples, int tuple_size, int* sel, int num_rows) {
+  if (num_rows == 0) return 0;
+  LocalFilterStats* stats = &filter_stats_[i];
+  const FilterContext* ctx = filter_ctxs_[i];
+  stats->total_possible += num_rows;
+  if (!stats->enabled_for_row || !ctx->filter->HasFilter()) return num_rows;
+  // Evaluating IN-list filter is much slower than evaluating the corresponding bloom
+  // filter. Skip it until we improve its performance.
+  if (ctx->filter->is_in_list_filter()) return num_rows;
+  stats->considered += num_rows;
+  int num_passed = 0;
+  for (int j = 0; j < num_rows; ++j) {
+    Tuple* tuple = reinterpret_cast<Tuple*>(tuples + sel[j] * tuple_size);
+    sel[num_passed] = sel[j];
+    num_passed += ctx->Eval(reinterpret_cast<TupleRow*>(&tuple));
+  }
+  stats->rejected += num_rows - num_passed;
+  return num_passed;
 }
 
 bool HdfsScanner::TextConverterWriteSlotInterpretedIR(HdfsScanner* hdfs_scanner,

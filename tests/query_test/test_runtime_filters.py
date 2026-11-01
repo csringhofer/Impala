@@ -21,6 +21,7 @@ import os
 import pytest
 import re
 import time
+from copy import deepcopy
 
 from tests.common.environ import build_flavor_timeout, ImpalaTestClusterProperties
 from tests.common.impala_cluster import ImpalaCluster
@@ -435,6 +436,21 @@ class TestRuntimeRowFilters(ImpalaTestSuite):
       '$NUM_FILTER_UPDATES': str(num_updates)
     }
     self.run_test_case('QueryTest/runtime_row_filters', vector, test_file_vars=vars)
+
+  @pytest.mark.parametrize("batch_size,disable_codegen",
+      [(0, False), (7, False), (7, True)])
+  def test_row_filter_batches(self, vector, batch_size, disable_codegen):
+    """Runtime filters are evaluated on batches of rows that are not larger than the
+    remaining space in the output row batch. Run with a small batch size to have many
+    such batches, with and without codegen."""
+    self.execute_query("SET MINMAX_FILTER_SORTED_COLUMNS=false")
+    self.execute_query("SET MINMAX_FILTER_PARTITION_COLUMNS=false")
+    self.execute_query("SET PARQUET_DICTIONARY_RUNTIME_FILTER_ENTRY_LIMIT=0")
+    new_vector = deepcopy(vector)
+    new_vector.get_value('exec_option')['batch_size'] = batch_size
+    new_vector.get_value('exec_option')['disable_codegen'] = disable_codegen
+    self.run_test_case('QueryTest/runtime_row_filter_batches', new_vector,
+        test_file_vars=DEFAULT_VARS)
 
 
 @SkipIfLocal.multiple_impalad

@@ -88,9 +88,9 @@ bool FilterContext::Eval(TupleRow* row) const noexcept {
   return filter->Eval(val, expr_eval->root().type());
 }
 
-void FilterContext::Prefetch(TupleRow* row) const noexcept {
+uint32_t FilterContext::BloomFilterHash(TupleRow* row) const noexcept {
   void* val = expr_eval->GetValue(row);
-  filter->PrefetchBloomFilter(val, expr_eval->root().type());
+  return filter->BloomFilterHash(val, expr_eval->root().type());
 }
 
 void FilterContext::Insert(TupleRow* row) const noexcept {
@@ -269,14 +269,9 @@ static Status CodegenEvalAndCallFilter(LlvmCodeGen* codegen, ScalarExpr* filter_
   llvm::Value* filter_arg = builder.CreateLoad(filter_type, filter_ptr, "filter_arg");
 
   llvm::Value* run_filter_args[] = {filter_arg, val_ptr_phi, expr_type_arg};
-  if (return_type->isVoidTy()) {
-    builder.CreateCall(runtime_filter_fn, run_filter_args);
-    builder.CreateRetVoid();
-  } else {
-    llvm::Value* filter_result =
-        builder.CreateCall(runtime_filter_fn, run_filter_args, "filter_result");
-    builder.CreateRet(filter_result);
-  }
+  llvm::Value* filter_result =
+      builder.CreateCall(runtime_filter_fn, run_filter_args, "filter_result");
+  builder.CreateRet(filter_result);
 
   *fn = codegen->FinalizeFunction(eval_filter_fn);
   if (*fn == nullptr) {
@@ -291,11 +286,11 @@ Status FilterContext::CodegenEval(
       "FilterContextEval", codegen->bool_type(), fn);
 }
 
-Status FilterContext::CodegenPrefetch(
+Status FilterContext::CodegenBloomFilterHash(
     LlvmCodeGen* codegen, ScalarExpr* filter_expr, llvm::Function** fn) {
   return CodegenEvalAndCallFilter(codegen, filter_expr,
-      IRFunction::RUNTIME_FILTER_PREFETCH_BLOOM, "FilterContextPrefetch",
-      codegen->void_type(), fn);
+      IRFunction::RUNTIME_FILTER_BLOOM_FILTER_HASH, "FilterContextBloomFilterHash",
+      codegen->i32_type(), fn);
 }
 
 // An example of the generated code the following query: RF001[min_max] -> a.smallint_col

@@ -354,7 +354,7 @@ inline const uint8_t* ALWAYS_INLINE BloomFilter::BucketAddress(
 inline void ALWAYS_INLINE BloomFilter::Prefetch(
     const uint32_t hash, bool for_write) const noexcept {
   // Locality 3 prefetches into the L1 cache: few enough buckets are prefetched at once
-  // (see DEFERRED_INSERT_BATCH_SIZE and HdfsColumnarScanner::ProcessScratchBatch()) for
+  // (see DEFERRED_INSERT_BATCH_SIZE and HdfsScanner::EvalBloomFilterOnRows()) for
   // them to stay there until they are used.
   if (for_write) {
     __builtin_prefetch(BucketAddress(hash), 1, 3);

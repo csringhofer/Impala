@@ -46,39 +46,51 @@ int HdfsColumnarScanner::ProcessScratchBatch(RowBatch* dst_batch) {
   // Do not use batch_->AtCapacity() in this loop because it is not necessary
   // to perform the memory capacity check.
   bool* is_selected = scratch_batch_->selected_rows.get() + scratch_batch_->tuple_idx;
-  // If any Bloom filter is large enough, the buckets of the next
-  // RUNTIME_FILTER_PREFETCH_BATCH_SIZE tuples are prefetched before evaluating the
-  // filters on them, so that their cache misses overlap. 'prefetched_end' is the end of
-  // the tuples prefetched so far.
-  const bool prefetch_filters = UpdateRuntimeFilterPrefetch();
-  uint8_t* prefetched_end = scratch_tuple;
-  while (scratch_tuple != scratch_tuple_end) {
-    if (prefetch_filters && scratch_tuple == prefetched_end) {
-      const int64_t num_tuples = std::min<int64_t>(RUNTIME_FILTER_PREFETCH_BATCH_SIZE,
-          (scratch_tuple_end - scratch_tuple) / tuple_size);
-      prefetched_end = scratch_tuple + num_tuples * tuple_size;
-      for (uint8_t* tuple = scratch_tuple; tuple != prefetched_end; tuple += tuple_size) {
-        Tuple* row = reinterpret_cast<Tuple*>(tuple);
-        PrefetchRuntimeFilters(reinterpret_cast<TupleRow*>(&row));
+  if (filter_ctxs_.empty()) {
+    while (scratch_tuple != scratch_tuple_end) {
+      *output_row = reinterpret_cast<Tuple*>(scratch_tuple);
+      scratch_tuple += tuple_size;
+      // Evaluate the conjuncts.
+      if (!ExecNode::EvalConjuncts(conjunct_evals, num_conjuncts,
+          reinterpret_cast<TupleRow*>(output_row))) {
+        *is_selected++ = false;
+        continue;
       }
+      // Row survived the conjuncts.
+      *is_selected++ = true;
+      ++output_row;
+      if (output_row == output_row_end) break;
     }
-    *output_row = reinterpret_cast<Tuple*>(scratch_tuple);
-    scratch_tuple += tuple_size;
-    // Evaluate runtime filters and conjuncts. Short-circuit the evaluation if
-    // the filters/conjuncts are empty to avoid function calls.
-    if (!EvalRuntimeFilters(reinterpret_cast<TupleRow*>(output_row))) {
-      *is_selected++ = false;
-      continue;
+  } else {
+    DCHECK_GT(tuple_size, 0);
+    // Indexes of the tuples of the current batch that passed the runtime filters.
+    int sel[RUNTIME_FILTER_BATCH_SIZE];
+    uint32_t hashes[RUNTIME_FILTER_BATCH_SIZE];
+    while (scratch_tuple != scratch_tuple_end && output_row != output_row_end) {
+      // Each tuple produces at most one output row, so a batch that is not larger than
+      // the remaining capacity of 'dst_batch' is always processed completely.
+      const int num_tuples = std::min<int64_t>({RUNTIME_FILTER_BATCH_SIZE,
+          (scratch_tuple_end - scratch_tuple) / tuple_size,
+          output_row_end - output_row});
+      for (int i = 0; i < num_tuples; ++i) sel[i] = i;
+      const int num_passed =
+          EvalRuntimeFiltersOnRows(scratch_tuple, tuple_size, sel, num_tuples, hashes);
+      memset(is_selected, 0, num_tuples * sizeof(bool));
+      // Evaluate the conjuncts on the tuples that passed the runtime filters.
+      for (int i = 0; i < num_passed; ++i) {
+        const int idx = sel[i];
+        *output_row = reinterpret_cast<Tuple*>(scratch_tuple + idx * tuple_size);
+        if (!ExecNode::EvalConjuncts(conjunct_evals, num_conjuncts,
+            reinterpret_cast<TupleRow*>(output_row))) {
+          continue;
+        }
+        // Row survived runtime filters and conjuncts.
+        is_selected[idx] = true;
+        ++output_row;
+      }
+      scratch_tuple += num_tuples * tuple_size;
+      is_selected += num_tuples;
     }
-    if (!ExecNode::EvalConjuncts(conjunct_evals, num_conjuncts,
-        reinterpret_cast<TupleRow*>(output_row))) {
-      *is_selected++ = false;
-      continue;
-    }
-    // Row survived runtime filters and conjuncts.
-    *is_selected++ = true;
-    ++output_row;
-    if (output_row == output_row_end) break;
   }
   scratch_batch_->tuple_idx += (scratch_tuple - scratch_tuple_start) / tuple_size;
   return output_row - output_row_start;

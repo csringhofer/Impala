@@ -859,8 +859,8 @@ Status HdfsParquetScanner::EvaluateOverlapForRowGroup(
     /// Update two fields in the entry at index 'idx' in local filter stats so that
     /// the info can be used when checking out the pages in the group in
     /// FindSkipRangesForPagesWithMinMaxFilters() and rows in these pages in
-    /// HdfsScanner::EvalRuntimeFilter(). The worthiness flag is ANDed into the enabled
-    /// field so that the state in enabled will never go back to 1 once set to 0.
+    /// HdfsScanner::EvalRuntimeFilterOnRows(). The worthiness flag is ANDed into the
+    /// enabled field so that the state in enabled will never go back to 1 once set to 0.
     /// The filtering level control is considered too.
     filter_stats_[idx].enabled_for_row &=
         (level == TMinmaxFilteringLevel::ROW) && worthiness;
