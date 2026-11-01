@@ -88,13 +88,18 @@ bool FilterContext::Eval(TupleRow* row) const noexcept {
   return filter->Eval(val, expr_eval->root().type());
 }
 
+void FilterContext::Prefetch(TupleRow* row) const noexcept {
+  void* val = expr_eval->GetValue(row);
+  filter->PrefetchBloomFilter(val, expr_eval->root().type());
+}
+
 void FilterContext::Insert(TupleRow* row) const noexcept {
   if (filter->is_bloom_filter()) {
     if (local_bloom_filter == nullptr) return;
     void* val = expr_eval->GetValue(row);
     uint32_t filter_hash = RawValue::GetHashValueFastHash32(
         val, expr_eval->root().type(), RuntimeFilterBank::DefaultHashSeed());
-    local_bloom_filter->Insert(filter_hash);
+    local_bloom_filter->InsertDeferred(filter_hash);
   } else if (filter->is_min_max_filter()) {
     if (local_min_max_filter == nullptr || local_min_max_filter->AlwaysTrue()) return;
     void* val = expr_eval->GetValue(row);
@@ -138,6 +143,8 @@ void FilterContext::MaterializeValues() const {
     local_min_max_filter->MaterializeValues();
   } else if (filter->is_in_list_filter() && local_in_list_filter != nullptr) {
     local_in_list_filter->MaterializeValues();
+  } else if (filter->is_bloom_filter() && local_bloom_filter != nullptr) {
+    local_bloom_filter->FlushDeferredInserts();
   }
 }
 
@@ -186,14 +193,20 @@ void FilterContext::MaterializeValues() const {
 //       %"struct.impala::ColumnType"* @expr_type_arg)
 //   ret i1 %passed_filter
 // }
-Status FilterContext::CodegenEval(
-    LlvmCodeGen* codegen, ScalarExpr* filter_expr, llvm::Function** fn) {
+/// Codegens the function 'fn_name'(FilterContext* this, TupleRow* row), which evaluates
+/// 'filter_expr' on 'row' and passes a pointer to the result (NULL if it is NULL) and
+/// the type of 'filter_expr' as a constant to the RuntimeFilter method
+/// 'runtime_filter_fn_id' of 'this->filter'. Returns its result, which has type
+/// 'return_type'.
+static Status CodegenEvalAndCallFilter(LlvmCodeGen* codegen, ScalarExpr* filter_expr,
+    IRFunction::Type runtime_filter_fn_id, const char* fn_name, llvm::Type* return_type,
+    llvm::Function** fn) {
   llvm::LLVMContext& context = codegen->context();
   LlvmBuilder builder(context);
 
   *fn = nullptr;
   llvm::StructType* filter_context_type = codegen->GetStructType<FilterContext>();
-  LlvmCodeGen::FnPrototype prototype(codegen, "FilterContextEval", codegen->bool_type());
+  LlvmCodeGen::FnPrototype prototype(codegen, fn_name, return_type);
   prototype.AddArgument(LlvmCodeGen::NamedVariable("this", codegen->ptr_type()));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("row", codegen->ptr_type()));
 
@@ -206,9 +219,8 @@ Status FilterContext::CodegenEval(
   RETURN_IF_ERROR(filter_expr->GetCodegendComputeFn(codegen, false, &compute_fn));
   DCHECK(compute_fn != nullptr);
 
-  // The function for checking against the bloom filter for match.
-  llvm::Function* runtime_filter_fn =
-      codegen->GetFunction(IRFunction::RUNTIME_FILTER_EVAL, false);
+  // The method of RuntimeFilter to call with the value.
+  llvm::Function* runtime_filter_fn = codegen->GetFunction(runtime_filter_fn_id, false);
   DCHECK(runtime_filter_fn != nullptr);
 
   // Load 'expr_eval' from 'this_arg' FilterContext object.
@@ -239,7 +251,7 @@ Status FilterContext::CodegenEval(
   llvm::Value* native_ptr = SlotDescriptor::CodegenStoreNonNullAnyValToNewAlloca(rwi);
   builder.CreateBr(eval_filter_block);
 
-  // Get the arguments in place to call 'runtime_filter_fn' to see if the row passes.
+  // Get the arguments in place to call 'runtime_filter_fn'.
   builder.SetInsertPoint(eval_filter_block);
   llvm::PHINode* val_ptr_phi = rwi.CodegenNullPhiNode(native_ptr, null_ptr,
       "val_ptr_phi");
@@ -257,15 +269,33 @@ Status FilterContext::CodegenEval(
   llvm::Value* filter_arg = builder.CreateLoad(filter_type, filter_ptr, "filter_arg");
 
   llvm::Value* run_filter_args[] = {filter_arg, val_ptr_phi, expr_type_arg};
-  llvm::Value* passed_filter =
-      builder.CreateCall(runtime_filter_fn, run_filter_args, "passed_filter");
-  builder.CreateRet(passed_filter);
+  if (return_type->isVoidTy()) {
+    builder.CreateCall(runtime_filter_fn, run_filter_args);
+    builder.CreateRetVoid();
+  } else {
+    llvm::Value* filter_result =
+        builder.CreateCall(runtime_filter_fn, run_filter_args, "filter_result");
+    builder.CreateRet(filter_result);
+  }
 
   *fn = codegen->FinalizeFunction(eval_filter_fn);
   if (*fn == nullptr) {
-    return Status("Codegen'ed FilterContext::Eval() fails verification, see log");
+    return Status(Substitute("Codegen'ed $0() fails verification, see log", fn_name));
   }
   return Status::OK();
+}
+
+Status FilterContext::CodegenEval(
+    LlvmCodeGen* codegen, ScalarExpr* filter_expr, llvm::Function** fn) {
+  return CodegenEvalAndCallFilter(codegen, filter_expr, IRFunction::RUNTIME_FILTER_EVAL,
+      "FilterContextEval", codegen->bool_type(), fn);
+}
+
+Status FilterContext::CodegenPrefetch(
+    LlvmCodeGen* codegen, ScalarExpr* filter_expr, llvm::Function** fn) {
+  return CodegenEvalAndCallFilter(codegen, filter_expr,
+      IRFunction::RUNTIME_FILTER_PREFETCH_BLOOM, "FilterContextPrefetch",
+      codegen->void_type(), fn);
 }
 
 // An example of the generated code the following query: RF001[min_max] -> a.smallint_col

@@ -24,6 +24,8 @@
 #include <memory>
 #include <ostream>
 
+#include <gflags/gflags.h>
+
 #include "gen-cpp/data_stream_service.pb.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_sidecar.h"
@@ -31,9 +33,21 @@
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "runtime/exec-env.h"
+#include "runtime/mem-tracker.h"
 #include "util/kudu-status-util.h"
 
 using namespace std;
+
+// Filters larger than the L2 cache of a core (1-2 MB on current server CPUs) are mostly
+// read from L3 or memory. In a microbenchmark with a 30 MB L3 cache, prefetching broke
+// even at 8 MB single-threaded, but at 1-4 MB with three filters per row on two
+// hyperthreads of a core.
+DEFINE_int64(bloom_filter_prefetch_min_bytes, 2L * 1024 * 1024, "(Advanced) Runtime "
+    "Bloom filters of at least this many bytes are built and probed in batches whose "
+    "buckets are prefetched first, so that the cache misses of a batch overlap. Applies "
+    "to filters built by hash joins and evaluated by Parquet and ORC scans. Smaller "
+    "filters mostly stay in the CPU cache, so prefetching would only slow them down. "
+    "A negative value disables prefetching.");
 
 namespace impala {
 
@@ -45,14 +59,17 @@ BloomFilter::BloomFilter(BufferPool::ClientHandle* client)
 BloomFilter::~BloomFilter() {}
 
 Status BloomFilter::Init(const int log_bufferpool_space, uint32_t hash_seed) {
+  hash_seed_ = hash_seed;
   KUDU_RETURN_IF_ERROR(
       block_bloom_filter_.Init(log_bufferpool_space, kudu::FAST_HASH, hash_seed),
       "Failed to init Block Bloom Filter");
+  InitDeferredInserts();
   return Status::OK();
 }
 
 Status BloomFilter::Init(const BloomFilterPB& protobuf, const uint8_t* directory_in,
     size_t directory_in_size, uint32_t hash_seed) {
+  hash_seed_ = hash_seed;
   if (protobuf.always_false() || directory_in_size == 0) {
     // Directory size equal 0 only when it's always false.
     KUDU_RETURN_IF_ERROR(block_bloom_filter_.Init(
@@ -65,11 +82,129 @@ Status BloomFilter::Init(const BloomFilterPB& protobuf, const uint8_t* directory
             protobuf.log_bufferpool_space(), slice, false, kudu::FAST_HASH, hash_seed),
         "Failed to init Block Bloom Filter");
   }
+  InitDeferredInserts();
   return Status::OK();
 }
 
+void BloomFilter::InitDeferredInserts() {
+  num_deferred_inserts_ = 0;
+  defer_inserts_ = ShouldPrefetch(block_bloom_filter_.GetSpaceUsed());
+}
+
 void BloomFilter::Close() {
+  // Hashes buffered by InsertDeferred() would not fit into a re-initialized directory.
+  num_deferred_inserts_ = 0;
   block_bloom_filter_.Close();
+}
+
+bool BloomFilter::ShouldPrefetch(int64_t directory_bytes) {
+  return FLAGS_bloom_filter_prefetch_min_bytes >= 0
+      && directory_bytes >= FLAGS_bloom_filter_prefetch_min_bytes;
+}
+
+void BloomFilter::FlushDeferredInserts() noexcept {
+  const int n = num_deferred_inserts_;
+  if (n == 0) return;
+  // Issue all prefetches first, then insert: the inserts find their buckets in the
+  // cache instead of waiting for each cache miss in turn.
+  for (int i = 0; i < n; ++i) Prefetch(deferred_inserts_[i], /*for_write=*/true);
+  for (int i = 0; i < n; ++i) block_bloom_filter_.Insert(deferred_inserts_[i]);
+  num_deferred_inserts_ = 0;
+}
+
+namespace {
+
+/// Number of 32-bit words in a bucket of kudu::BlockBloomFilter.
+constexpr int BUCKET_WORDS = 8;
+
+/// Sum over the buckets of the folded directory 'lo[i] | hi[i]' (or just 'lo[i]' if 'hi'
+/// is null) of the product of the number of set bits in each word of the bucket. The
+/// fpp is this sum divided by 32^8 and by the number of buckets. Stops early and returns
+/// a value above 'limit' as soon as the sum exceeds 'limit'.
+double SumOfBucketProducts(const uint32_t* lo, const uint32_t* hi, int64_t num_buckets,
+    double limit) {
+  double sum = 0;
+  // Check the limit every 1024 buckets.
+  constexpr int64_t CHECK_INTERVAL = 1024;
+  for (int64_t start = 0; start < num_buckets; start += CHECK_INTERVAL) {
+    const int64_t end = std::min(num_buckets, start + CHECK_INTERVAL);
+    for (int64_t b = start; b < end; ++b) {
+      // The product of 8 counts of at most 32 fits into 40 bits.
+      uint64_t product = 1;
+      for (int w = 0; w < BUCKET_WORDS; ++w) {
+        const int64_t i = b * BUCKET_WORDS + w;
+        const uint32_t word = hi == nullptr ? lo[i] : (lo[i] | hi[i]);
+        product *= __builtin_popcount(word);
+      }
+      sum += static_cast<double>(product);
+    }
+    if (sum > limit) return sum;
+  }
+  return sum;
+}
+
+/// 32^8: the product of the bit counts of a bucket with all bits set.
+constexpr double FULL_BUCKET_PRODUCT = 1099511627776.0;
+
+} // namespace
+
+double BloomFilter::EstimateFpp(const uint8_t* directory, int64_t directory_size) {
+  const int64_t num_buckets = directory_size / (BUCKET_WORDS * sizeof(uint32_t));
+  DCHECK_GT(num_buckets, 0);
+  const double sum = SumOfBucketProducts(reinterpret_cast<const uint32_t*>(directory),
+      nullptr, num_buckets, std::numeric_limits<double>::infinity());
+  return sum / FULL_BUCKET_PRODUCT / num_buckets;
+}
+
+int BloomFilter::ShrinkDirectory(
+    uint8_t* directory, int log_space, double max_fpp, int min_log_space) {
+  // Kudu's smallest directory has 2 buckets.
+  min_log_space = std::max(min_log_space, LOG_BUCKET_BYTE_SIZE + 1);
+  while (log_space > min_log_space) {
+    const int64_t half_size = int64_t{1} << (log_space - 1);
+    const int64_t num_buckets = half_size >> LOG_BUCKET_BYTE_SIZE;
+    // Check the fpp of the folded directory before folding, so that the directory stays
+    // unchanged if the fpp would be too high.
+    const double limit = max_fpp * FULL_BUCKET_PRODUCT * num_buckets;
+    const uint32_t* lo = reinterpret_cast<const uint32_t*>(directory);
+    const uint32_t* hi = reinterpret_cast<const uint32_t*>(directory + half_size);
+    if (SumOfBucketProducts(lo, hi, num_buckets, limit) > limit) break;
+    kudu::BlockBloomFilter::OrEqualArray(half_size, directory + half_size, directory);
+    --log_space;
+  }
+  return log_space;
+}
+
+Status BloomFilter::Shrink(
+    double max_fpp, int min_log_space, MemTracker* tracker, bool* shrunk) {
+  DCHECK(!HasDeferredInserts());
+  *shrunk = false;
+  const int log_space = block_bloom_filter_.log_space_bytes();
+  if (AlwaysFalse() || log_space <= min_log_space) return Status::OK();
+  // The copy of the shrunk directory is at most half of the current size. Reserve it
+  // before changing the directory, so that the filter is either shrunk or unchanged.
+  const int64_t max_copy_size = directory_size() / 2;
+  if (!tracker->TryConsume(max_copy_size)) return Status::OK();
+  uint8_t* directory = const_cast<uint8_t*>(block_bloom_filter_.directory().data());
+  const int new_log_space = ShrinkDirectory(directory, log_space, max_fpp, min_log_space);
+  if (new_log_space == log_space) {
+    tracker->Release(max_copy_size);
+    return Status::OK();
+  }
+  // InitFromDirectory() frees the current directory before allocating the new one, so
+  // copy the shrunk directory first.
+  const int64_t new_size = int64_t{1} << new_log_space;
+  unique_ptr<uint8_t[]> copy(new uint8_t[new_size]);
+  memcpy(copy.get(), directory, new_size);
+  kudu::Status status = block_bloom_filter_.InitFromDirectory(new_log_space,
+      kudu::Slice(copy.get(), new_size), /*always_false=*/false, kudu::FAST_HASH,
+      hash_seed_);
+  copy.reset();
+  tracker->Release(max_copy_size);
+  KUDU_RETURN_IF_ERROR(status, "Failed to shrink Block Bloom Filter");
+  InitDeferredInserts();
+  *shrunk = true;
+  return Status::OK();
 }
 
 void BloomFilter::AddDirectorySidecar(BloomFilterPB* rpc_params,
@@ -107,6 +242,7 @@ void BloomFilter::AddDirectorySidecar(BloomFilterPB* rpc_params,
 
 void BloomFilter::ToProtobuf(
     BloomFilterPB* protobuf, kudu::rpc::RpcController* controller) const {
+  DCHECK(!HasDeferredInserts());
   protobuf->set_log_bufferpool_space(block_bloom_filter_.log_space_bytes());
   if (AlwaysFalse()) {
     protobuf->set_always_false(true);
@@ -138,6 +274,7 @@ int64_t BloomFilter::GetBufferPoolSpaceUsed() {
 void BloomFilter::Or(const BloomFilter& other) {
   DCHECK_NE(this, &other);
   DCHECK_NE(&other, ALWAYS_TRUE_FILTER);
+  DCHECK(!HasDeferredInserts());
   if (other.AlwaysFalse()) return;
   DCHECK_EQ(
       block_bloom_filter_.log_space_bytes(), other.block_bloom_filter_.log_space_bytes());
@@ -147,6 +284,8 @@ void BloomFilter::Or(const BloomFilter& other) {
 void BloomFilter::RawOr(const BloomFilter& other) {
   DCHECK_NE(this, &other);
   DCHECK_NE(&other, ALWAYS_TRUE_FILTER);
+  DCHECK(!HasDeferredInserts());
+  DCHECK(!other.HasDeferredInserts());
   DCHECK_EQ(
       block_bloom_filter_.log_space_bytes(), other.block_bloom_filter_.log_space_bytes());
   kudu::Slice target_slice = block_bloom_filter_.directory();
@@ -157,6 +296,7 @@ void BloomFilter::RawOr(const BloomFilter& other) {
 
 void BloomFilter::Or(const BloomFilterPB& in, const kudu::Slice& input_slice) {
   DCHECK_NE(this, BloomFilter::ALWAYS_TRUE_FILTER);
+  DCHECK(!HasDeferredInserts());
   DCHECK(!in.always_true());
   if (in.always_false()) return;
   DCHECK_EQ(in.log_bufferpool_space(), block_bloom_filter_.log_space_bytes());

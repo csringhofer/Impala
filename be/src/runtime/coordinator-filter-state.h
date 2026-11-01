@@ -120,6 +120,12 @@ class Coordinator::FilterState {
   /// Disables the filter and releases the consumed memory if the filter is a Bloom
   /// filter.
   void DisableAndRelease(MemTracker* tracker, const bool all_updates_received);
+
+  /// Shrinks the aggregated Bloom filter with BloomFilter::ShrinkDirectory() as
+  /// configured by --bloom_filter_shrink_error_rate, and releases the memory that is
+  /// not needed anymore from 'tracker'. Must only be called once all updates were
+  /// applied, before the filter is published.
+  void ShrinkBloomFilter(MemTracker* tracker);
   /// Disables the filter but does not release the consumed memory.
   void Disable(const bool all_updates_received);
   /// Release consumed memory of this filter. Caller must hold `lock_` and make sure

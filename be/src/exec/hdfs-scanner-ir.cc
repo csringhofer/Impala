@@ -114,6 +114,10 @@ bool HdfsScanner::EvalRuntimeFilter(int i, TupleRow* row) {
   return true;
 }
 
+void HdfsScanner::PrefetchRuntimeFilter(int i, TupleRow* row) {
+  if (filter_stats_[i].prefetch_for_row) filter_ctxs_[i]->Prefetch(row);
+}
+
 bool HdfsScanner::TextConverterWriteSlotInterpretedIR(HdfsScanner* hdfs_scanner,
     int slot_idx, Tuple* tuple, const char* data, int len, MemPool* pool) {
   constexpr bool copy_string = false;

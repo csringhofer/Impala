@@ -123,8 +123,14 @@ struct FilterContext {
   /// a match in 'filter'. Returns false otherwise.
   bool Eval(TupleRow* row) const noexcept;
 
+  /// Evaluates 'row' with 'expr_eval' and prefetches the bucket of the resulting value in
+  /// the Bloom filter of 'filter', see RuntimeFilter::PrefetchBloomFilter(). Only valid
+  /// for Bloom filters.
+  void Prefetch(TupleRow* row) const noexcept;
+
   /// Evaluates 'row' with 'expr_eval' and inserts the value into 'local_bloom_filter'
-  /// or 'local_min_max_filter' as appropriate.
+  /// or 'local_min_max_filter' as appropriate. Bloom filter inserts may be deferred
+  /// until MaterializeValues(), see BloomFilter::InsertDeferred().
   void Insert(TupleRow* row) const noexcept;
 
   /// Implements different flavors of insertion based on filter type and comparison
@@ -137,13 +143,18 @@ struct FilterContext {
 
   /// Materialize filter values by copying any values stored by filters into memory owned
   /// by the filter. Filters may assume that the memory for Insert()-ed values stays valid
-  /// until this is called.
+  /// until this is called. Also completes the deferred inserts of the Bloom filter. Must
+  /// be called after each batch of Insert() calls.
   void MaterializeValues() const;
 
   /// Codegen Eval() by codegen'ing the expression 'filter_expr' and replacing the type
   /// argument to RuntimeFilter::Eval() with a constant. On success, 'fn' is set to
   /// the generated function. On failure, an error status is returned.
   static Status CodegenEval(LlvmCodeGen* codegen, ScalarExpr* filter_expr,
+      llvm::Function** fn) WARN_UNUSED_RESULT;
+
+  /// Codegen Prefetch() the same way as CodegenEval().
+  static Status CodegenPrefetch(LlvmCodeGen* codegen, ScalarExpr* filter_expr,
       llvm::Function** fn) WARN_UNUSED_RESULT;
 
   /// Codegen Insert() by codegen'ing the expression 'filter_expr', replacing the type

@@ -112,6 +112,12 @@ class RuntimeFilter {
   /// Inlined in IR so that the constant 'col_type' can be propagated.
   bool IR_ALWAYS_INLINE Eval(void* val, const ColumnType& col_type) const noexcept;
 
+  /// Prefetches the bucket that Eval() of 'val' would look up in 'bloom_filter_', if it
+  /// has been set. Only valid for Bloom filters. Inlined in IR so that the constant
+  /// 'col_type' can be propagated.
+  void IR_ALWAYS_INLINE PrefetchBloomFilter(
+      void* val, const ColumnType& col_type) const noexcept;
+
   /// Returns the amount of time in milliseconds elapsed between the registration of the
   /// filter and its arrival. If the filter has not yet arrived, it returns the time
   /// elapsed since registration.

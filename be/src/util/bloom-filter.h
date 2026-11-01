@@ -47,6 +47,7 @@ class RpcController;
 namespace impala {
 class BloomFilter;
 class BloomFilterPB;
+class MemTracker;
 } // namespace impala
 
 // Need this forward declaration since we make bloom_filter_test_util::BfUnion() a friend
@@ -100,6 +101,7 @@ class BloomFilter {
       BloomFilterPB* protobuf);
 
   bool AlwaysFalse() const {
+    DCHECK(!HasDeferredInserts());
     return block_bloom_filter_.always_false() && !not_always_false_;
   }
 
@@ -111,12 +113,77 @@ class BloomFilter {
   /// this Bloom filter, since the collision probability (the probability that two
   /// non-equal values will have the same hash value) is 0.
   void Insert(const uint32_t hash) noexcept;
-  // Same as above for codegen
+
+  /// Same as Insert(), but if the filter is large enough to use prefetching (see
+  /// ShouldPrefetch()), the hash is only buffered. Every DEFERRED_INSERT_BATCH_SIZE
+  /// hashes and in FlushDeferredInserts(), the buckets of the buffered hashes are
+  /// prefetched and then the hashes are inserted, so that the cache misses of the
+  /// inserts overlap instead of stalling one at a time. Until FlushDeferredInserts() is
+  /// called, the filter does not contain the buffered hashes, so it must be called
+  /// before the filter is read or sent (Find(), Or(), ToProtobuf(), etc.).
+  /// FilterContext::MaterializeValues() calls it after each build batch.
+  void InsertDeferred(const uint32_t hash) noexcept;
+  /// Inserts the hashes buffered by InsertDeferred(). Cheap if there are none.
+  void FlushDeferredInserts() noexcept;
+  bool HasDeferredInserts() const { return num_deferred_inserts_ > 0; }
+  /// Same as InsertDeferred() for codegen.
   void IR_ALWAYS_INLINE IrInsert(const uint32_t hash) noexcept;
 
   /// Finds an element in the BloomFilter, returning true if it is found and false (with
   /// high probabilty) if it is not.
   bool Find(const uint32_t hash) const noexcept;
+
+  /// Prefetches the bucket of 'hash' into the cache, so that a following Find() or
+  /// Insert() of 'hash' does not need to wait for it. Only worth it for filters that do
+  /// not fit into the cache, see ShouldPrefetch(), and only if many buckets are
+  /// prefetched before the first one is used.
+  void Prefetch(const uint32_t hash, bool for_write = false) const noexcept;
+
+  /// Returns true if Bloom filters of 'directory_bytes' bytes are large enough that
+  /// prefetching batches of their buckets speeds up inserts and lookups, i.e. they
+  /// are at least --bloom_filter_prefetch_min_bytes large. Smaller filters mostly stay
+  /// in the CPU cache, so the extra work of prefetching would only slow them down.
+  static bool ShouldPrefetch(int64_t directory_bytes);
+
+  /// Returns the estimated false positive probability of the Bloom filter directory
+  /// 'directory' of 'directory_size' bytes, i.e. the probability that Find() returns true
+  /// for a random hash that was not inserted. Find() checks one bit in each of the 8
+  /// 32-bit words of a bucket, so this is the mean over all buckets of the product of
+  /// the fractions of set bits in their words.
+  static double EstimateFpp(const uint8_t* directory, int64_t directory_size);
+
+  /// Halves the size of the directory of a Bloom filter of 2^'log_space' bytes by
+  /// folding it in place, as long as the estimated false positive probability (see
+  /// EstimateFpp()) of the result stays at most 'max_fpp' and its size at least
+  /// 2^'min_log_space' bytes. Returns the log2 of the new size. The first 2^<result>
+  /// bytes of 'directory' are then the directory of a filter of that size that contains
+  /// the same values. The directory is unchanged if the result is 'log_space'.
+  ///
+  /// Folding is exact: kudu::BlockBloomFilter takes the bucket index of a hash from the
+  /// low bits of Rehash32to32(hash) (see BucketAddress()) and sets the same bits inside
+  /// the bucket regardless of the filter size. So OR-ing bucket i with bucket i + n/2
+  /// gives bucket i of a filter with n/2 buckets into which the same hashes were
+  /// inserted.
+  static int ShrinkDirectory(
+      uint8_t* directory, int log_space, double max_fpp, int min_log_space);
+
+  /// Shrinks this filter with ShrinkDirectory() and reallocates its directory with the
+  /// new size. Sets 'shrunk' to whether the size changed. The filter must not be used
+  /// concurrently and its directory must not be referenced elsewhere, e.g. by an RPC
+  /// sidecar. A temporary copy of the shrunk directory is tracked by 'tracker'; if it
+  /// cannot be allocated, the filter is not changed. If an error is returned, the
+  /// filter has lost its directory and must not be used anymore.
+  Status Shrink(double max_fpp, int min_log_space, MemTracker* tracker, bool* shrunk);
+
+  /// Size of the directory in bytes.
+  int64_t directory_size() const { return block_bloom_filter_.GetSpaceUsed(); }
+
+  /// Address of the bucket of 'hash' in the directory of 'block_bloom_filter_'.
+  /// kudu::BlockBloomFilter does not expose it, so this repeats its computation on its
+  /// public state: the bucket index is Rehash32to32(hash) & directory_mask_, and a
+  /// bucket is 32 bytes. Used only for prefetching, so a mismatch with Kudu would make
+  /// prefetching useless, but not results wrong. bloom-filter-test.cc checks it.
+  const uint8_t* BucketAddress(const uint32_t hash) const noexcept;
 
   /// Computes the logical OR of this filter with 'other' and stores the result in this
   /// filter.
@@ -183,7 +250,10 @@ class BloomFilter {
   static void AddDirectorySidecar(BloomFilterPB* rpc_params,
       kudu::rpc::RpcController* controller, const string& directory);
 
-  kudu::BlockBloomFilter* GetBlockBloomFilter() { return &block_bloom_filter_; }
+  kudu::BlockBloomFilter* GetBlockBloomFilter() {
+    DCHECK(!HasDeferredInserts());
+    return &block_bloom_filter_;
+  }
 
  private:
   /// Buffer allocator is used by Kudu::BlockBloomFilter to allocate memory for
@@ -195,6 +265,37 @@ class BloomFilter {
 
   /// Flag to override block_bloom_filter_.always_false() in AlwaysFalse() method.
   bool not_always_false_ = false;
+
+  /// The hash seed passed to Init(), used when Shrink() re-initializes the filter.
+  uint32_t hash_seed_ = 0;
+
+  /// Number of hashes buffered by InsertDeferred() before their buckets are prefetched
+  /// and they are inserted. Prefetching more buckets before using the first one overlaps
+  /// more cache misses, but the prefetched buckets should also still be in the L1 cache
+  /// when they are used. 128 was the fastest in a microbenchmark of 8-16 MB filters.
+  static constexpr int DEFERRED_INSERT_BATCH_SIZE = 128;
+
+  /// True if InsertDeferred() buffers hashes, i.e. ShouldPrefetch() for this filter.
+  /// Set in Init().
+  bool defer_inserts_ = false;
+
+  /// Hashes buffered by InsertDeferred() that are not inserted yet.
+  int num_deferred_inserts_ = 0;
+  uint32_t deferred_inserts_[DEFERRED_INSERT_BATCH_SIZE];
+
+  /// Log2 of the size of a bucket of kudu::BlockBloomFilter in bytes (its private
+  /// kLogBucketByteSize).
+  static constexpr int LOG_BUCKET_BYTE_SIZE = 5;
+
+  /// Same as the private kudu::BlockBloomFilter::Rehash32to32().
+  static uint32_t Rehash32to32(const uint32_t hash) {
+    constexpr uint64_t m = 0x7850f11ec6d14889ULL;
+    constexpr uint64_t a = 0x6773610597ca4c63ULL;
+    return (static_cast<uint64_t>(hash) * m + a) >> 32U;
+  }
+
+  /// Resets the state of InsertDeferred() for the newly initialized directory.
+  void InitDeferredInserts();
 
   /// Serializes this filter as Protobuf.
   void ToProtobuf(BloomFilterPB* protobuf, kudu::rpc::RpcController* controller) const;
@@ -223,8 +324,43 @@ inline void ALWAYS_INLINE BloomFilter::Insert(const uint32_t hash) noexcept {
   block_bloom_filter_.Insert(hash);
 }
 
+inline void ALWAYS_INLINE BloomFilter::InsertDeferred(const uint32_t hash) noexcept {
+  if (!defer_inserts_) {
+    block_bloom_filter_.Insert(hash);
+    return;
+  }
+  deferred_inserts_[num_deferred_inserts_++] = hash;
+  if (UNLIKELY(num_deferred_inserts_ == DEFERRED_INSERT_BATCH_SIZE)) {
+    FlushDeferredInserts();
+  }
+}
+
 inline bool ALWAYS_INLINE BloomFilter::Find(const uint32_t hash) const noexcept {
+  DCHECK(!HasDeferredInserts());
   return block_bloom_filter_.Find(hash);
+}
+
+inline const uint8_t* ALWAYS_INLINE BloomFilter::BucketAddress(
+    const uint32_t hash) const noexcept {
+  // kudu::BlockBloomFilter::log_space_bytes() is log_num_buckets_ + kLogBucketByteSize.
+  const int log_num_buckets =
+      block_bloom_filter_.log_space_bytes() - LOG_BUCKET_BYTE_SIZE;
+  const uint32_t directory_mask = static_cast<uint32_t>((1ULL << log_num_buckets) - 1);
+  const uint32_t bucket_idx = Rehash32to32(hash) & directory_mask;
+  return block_bloom_filter_.directory().data()
+      + (static_cast<uint64_t>(bucket_idx) << LOG_BUCKET_BYTE_SIZE);
+}
+
+inline void ALWAYS_INLINE BloomFilter::Prefetch(
+    const uint32_t hash, bool for_write) const noexcept {
+  // Locality 3 prefetches into the L1 cache: few enough buckets are prefetched at once
+  // (see DEFERRED_INSERT_BATCH_SIZE and HdfsColumnarScanner::ProcessScratchBatch()) for
+  // them to stay there until they are used.
+  if (for_write) {
+    __builtin_prefetch(BucketAddress(hash), 1, 3);
+  } else {
+    __builtin_prefetch(BucketAddress(hash), 0, 3);
+  }
 }
 
 } // namespace impala

@@ -49,6 +49,7 @@
 #include "runtime/query-driver.h"
 #include "runtime/query-exec-mgr.h"
 #include "runtime/query-state.h"
+#include "runtime/runtime-filter-bank.h"
 #include "runtime/raw-value.h"
 #include "scheduling/admission-control-client.h"
 #include "scheduling/scheduler.h"
@@ -82,6 +83,7 @@ using boost::algorithm::split;
 using boost::filesystem::path;
 
 DECLARE_string(hostname);
+DECLARE_double(bloom_filter_shrink_error_rate);
 DECLARE_int64(large_execquery_rpc_threshold_bytes);
 
 using namespace impala;
@@ -1678,6 +1680,9 @@ void Coordinator::UpdateFilter(const UpdateFilterParamsPB& params, RpcContext* c
     }
 
     if (state->is_bloom_filter()) {
+      // All updates were OR-ed together, so the filter can be shrunk to the size its
+      // contents need.
+      if (state->enabled()) state->ShrinkBloomFilter(filter_mem_tracker_);
       // Assign an outgoing bloom filter.
       *rpc_params.mutable_bloom_filter() = state->bloom_filter();
 
@@ -1806,6 +1811,30 @@ void Coordinator::FilterState::ApplyUpdate(
   if (pending_count_ == 0 || disabled()) {
     completion_time_ = coord->query_events_->ElapsedTime();
   }
+}
+
+void Coordinator::FilterState::ShrinkBloomFilter(MemTracker* tracker) {
+  DCHECK(is_bloom_filter());
+  DCHECK_EQ(pending_count_, 0);
+  if (FLAGS_bloom_filter_shrink_error_rate <= 0 || bloom_filter_.always_false()
+      || bloom_filter_.always_true()) {
+    return;
+  }
+  const int log_space = bloom_filter_.log_bufferpool_space();
+  const int64_t old_size = bloom_filter_directory_.size();
+  DCHECK_EQ(old_size, int64_t{1} << log_space);
+  const int new_log_space = BloomFilter::ShrinkDirectory(
+      reinterpret_cast<uint8_t*>(bloom_filter_directory_.data()), log_space,
+      FLAGS_bloom_filter_shrink_error_rate, RuntimeFilterBank::MinShrunkLogSpace());
+  if (new_log_space == log_space) return;
+  const int64_t new_size = int64_t{1} << new_log_space;
+  bloom_filter_directory_.resize(new_size);
+  bloom_filter_directory_.shrink_to_fit();
+  tracker->Release(old_size - new_size);
+  bloom_filter_.set_log_bufferpool_space(new_log_space);
+  VLOG(2) << "Shrunk bloom filter " << desc_.filter_id << " from "
+          << PrettyPrinter::Print(old_size, TUnit::BYTES) << " to "
+          << PrettyPrinter::Print(new_size, TUnit::BYTES);
 }
 
 void Coordinator::FilterState::DisableAndRelease(

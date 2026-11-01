@@ -357,8 +357,12 @@ class HdfsScanner {
     /// Apply the filter at row group level only.
     uint8_t enabled_for_rowgroup;
 
+    /// Set to 1 if PrefetchRuntimeFilters() prefetches the filter's Bloom filter buckets,
+    /// see UpdateRuntimeFilterPrefetch().
+    uint8_t prefetch_for_row;
+
     /// Padding to ensure structs do not straddle cache-line boundary.
-    uint8_t padding[5];
+    uint8_t padding[4];
 
     LocalFilterStats()
       : considered(0),
@@ -366,7 +370,8 @@ class HdfsScanner {
         total_possible(0),
         enabled_for_row(1),
         enabled_for_page(1),
-        enabled_for_rowgroup(1) {}
+        enabled_for_rowgroup(1),
+        prefetch_for_row(0) {}
   };
 
   /// Cached runtime filter contexts, one for each filter that applies to this column.
@@ -395,6 +400,23 @@ class HdfsScanner {
   /// whether the filters are effective, and disables them if they are not. This is
   /// replaced by generated code at runtime.
   bool EvalRuntimeFilters(TupleRow* row);
+
+  /// Sets 'prefetch_for_row' of each filter's stats: true for Bloom filters that are
+  /// enabled for rows, have arrived, are not always true and whose arrived filter is
+  /// large enough to benefit from prefetching (see BloomFilter::ShouldPrefetch()).
+  /// Returns true if any filter is prefetched. Filters can arrive or be disabled at any
+  /// time, so this is called for each batch.
+  bool UpdateRuntimeFilterPrefetch();
+
+  /// Prefetches the Bloom filter bucket that 'row' maps to for the i-th runtime filter,
+  /// if its 'prefetch_for_row' is set.
+  void PrefetchRuntimeFilter(int i, TupleRow* row);
+
+  /// Calls PrefetchRuntimeFilter() for every runtime filter. Prefetching the buckets of
+  /// a batch of rows before evaluating the filters on them with EvalRuntimeFilters()
+  /// overlaps the cache misses of the batch. This is replaced by generated code at
+  /// runtime.
+  void PrefetchRuntimeFilters(TupleRow* row);
 
   /// Find and return the last split in the file if it is assigned to this scan node.
   /// Returns NULL otherwise.
@@ -604,6 +626,15 @@ class HdfsScanner {
   /// via 'fn'.
   static Status CodegenEvalRuntimeFilters(LlvmCodeGen* codegen,
       const std::vector<ScalarExpr*>& filter_exprs, llvm::Function** fn)
+      WARN_UNUSED_RESULT;
+
+  /// Codegen PrefetchRuntimeFilters() the same way as CodegenEvalRuntimeFilters(), but
+  /// only for the Bloom filters in 'filter_descs' (which have the same order as
+  /// 'filter_exprs') whose planned size is at least --bloom_filter_prefetch_min_bytes.
+  /// If there are none, the generated function does nothing.
+  static Status CodegenPrefetchRuntimeFilters(LlvmCodeGen* codegen,
+      const std::vector<ScalarExpr*>& filter_exprs,
+      const std::vector<TRuntimeFilterDesc>& filter_descs, llvm::Function** fn)
       WARN_UNUSED_RESULT;
 
   /// Report parse error for column @ desc.   If abort_on_error is true, sets

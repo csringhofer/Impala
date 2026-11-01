@@ -29,11 +29,13 @@
 #include "runtime/test-env.h"
 #include "service/fe-support.h"
 #include "testutil/gtest-util.h"
+#include "util/bit-util.h"
 
 #include "gen-cpp/data_stream_service.pb.h"
 
 // This flag is used in Kudu to temporarily disable AVX2 support for testing purpose.
 DECLARE_bool(disable_blockbloomfilter_avx2);
+DECLARE_int64(bloom_filter_prefetch_min_bytes);
 
 using namespace std;
 
@@ -360,6 +362,269 @@ TEST_F(BloomFilterTest, FindInvalid) {
           << " expected_fpp = " << expected_fpp;
     }
   }
+}
+
+// BucketAddress() repeats Kudu's private bucket computation. Check that it is the
+// bucket that Kudu's Insert() writes. CreateBloomFilter() randomly disables Kudu's AVX2
+// path, so both Kudu paths are covered.
+TEST_F(BloomFilterTest, BucketAddressMatchesKudu) {
+  constexpr int BUCKET_BYTES = 32;
+  // 5 is the smallest filter (2 buckets), 20 = 1 MB is the default
+  // RUNTIME_FILTER_MIN_SIZE, 23 needs more than 16 bits of bucket index.
+  for (int log_space : {5, 6, 10, 16, 20, 23}) {
+    BloomFilter* bf = CreateBloomFilter(log_space);
+    kudu::Slice directory = bf->GetBlockBloomFilter()->directory();
+    uint8_t* dir_begin = const_cast<uint8_t*>(directory.data());
+    const uint8_t* dir_end = dir_begin + directory.size();
+    for (int i = 0; i < 1000; ++i) {
+      uint32_t h = MakeRand();
+      uint8_t* bucket = const_cast<uint8_t*>(bf->BucketAddress(h));
+      ASSERT_GE(bucket, dir_begin);
+      ASSERT_LE(bucket + BUCKET_BYTES, dir_end);
+      ASSERT_EQ(0, (bucket - dir_begin) % BUCKET_BYTES);
+      // The directory is all zeros here, so Insert() sets bits only in the bucket of
+      // 'h'. Clear them again to keep the directory zero.
+      bf->Insert(h);
+      ASSERT_TRUE(bf->Find(h));
+      bool bucket_has_bits = false;
+      for (int j = 0; j < BUCKET_BYTES; ++j) bucket_has_bits |= bucket[j] != 0;
+      ASSERT_TRUE(bucket_has_bits) << "log_space=" << log_space << " h=" << h;
+      memset(bucket, 0, BUCKET_BYTES);
+    }
+    // If any Insert() had set bits in a different bucket, they would still be set.
+    EXPECT_EQ(dir_end, std::find_if(dir_begin, const_cast<uint8_t*>(dir_end),
+        [](uint8_t b) { return b != 0; })) << "log_space=" << log_space;
+    // Prefetch() only computes the same address, it must not change the filter.
+    for (int i = 0; i < 100; ++i) {
+      bf->Prefetch(MakeRand());
+      bf->Prefetch(MakeRand(), /*for_write=*/true);
+    }
+  }
+}
+
+// InsertDeferred() and IrInsert(), followed by FlushDeferredInserts(), must leave the
+// filter in the same state as Insert().
+TEST_F(BloomFilterTest, DeferredInsertsMatchInsert) {
+  gflags::FlagSaver saver;
+  // Make every filter defer its inserts.
+  FLAGS_bloom_filter_prefetch_min_bytes = 0;
+  for (int log_space : {5, 10, 16, 20}) {
+    // Less than one batch, exactly one batch and several batches with a remainder.
+    for (int num_inserts : {1, 127, 128, 1000}) {
+      BloomFilter* direct_bf = CreateBloomFilter(log_space);
+      BloomFilter* deferred_bf = CreateBloomFilter(log_space);
+      BloomFilter* ir_bf = CreateBloomFilter(log_space);
+      vector<uint32_t> hashes;
+      for (int i = 0; i < num_inserts; ++i) {
+        uint32_t h = MakeRand();
+        hashes.push_back(h);
+        direct_bf->Insert(h);
+        deferred_bf->InsertDeferred(h);
+        ir_bf->IrInsert(h);
+      }
+      // The batch of 128 is inserted when it is full, the rest is buffered.
+      EXPECT_EQ(num_inserts % 128 != 0, deferred_bf->HasDeferredInserts());
+      EXPECT_EQ(num_inserts % 128 != 0, ir_bf->HasDeferredInserts());
+      deferred_bf->FlushDeferredInserts();
+      ir_bf->FlushDeferredInserts();
+      EXPECT_FALSE(deferred_bf->HasDeferredInserts());
+      EXPECT_FALSE(ir_bf->AlwaysFalse());
+      // Flushing again does nothing.
+      ir_bf->FlushDeferredInserts();
+      for (uint32_t h : hashes) {
+        ASSERT_TRUE(deferred_bf->Find(h));
+        ASSERT_TRUE(ir_bf->Find(h));
+      }
+      kudu::Slice direct_dir = direct_bf->GetBlockBloomFilter()->directory();
+      for (BloomFilter* bf : {deferred_bf, ir_bf}) {
+        kudu::Slice dir = bf->GetBlockBloomFilter()->directory();
+        ASSERT_EQ(direct_dir.size(), dir.size());
+        EXPECT_EQ(0, memcmp(direct_dir.data(), dir.data(), dir.size()))
+            << "log_space=" << log_space << " num_inserts=" << num_inserts;
+      }
+    }
+  }
+}
+
+// Only filters of at least --bloom_filter_prefetch_min_bytes defer their inserts.
+TEST_F(BloomFilterTest, DeferredInsertsThreshold) {
+  gflags::FlagSaver saver;
+  FLAGS_bloom_filter_prefetch_min_bytes = 1 << 16;
+  EXPECT_FALSE(BloomFilter::ShouldPrefetch((1 << 16) - 1));
+  EXPECT_TRUE(BloomFilter::ShouldPrefetch(1 << 16));
+  BloomFilter* small_bf = CreateBloomFilter(15);
+  BloomFilter* large_bf = CreateBloomFilter(16);
+  small_bf->InsertDeferred(42);
+  large_bf->InsertDeferred(42);
+  EXPECT_FALSE(small_bf->HasDeferredInserts());
+  EXPECT_TRUE(small_bf->Find(42));
+  EXPECT_TRUE(large_bf->HasDeferredInserts());
+  large_bf->FlushDeferredInserts();
+  EXPECT_TRUE(large_bf->Find(42));
+
+  // A negative value disables prefetching.
+  FLAGS_bloom_filter_prefetch_min_bytes = -1;
+  EXPECT_FALSE(BloomFilter::ShouldPrefetch(int64_t{1} << 40));
+  BloomFilter* bf = CreateBloomFilter(20);
+  bf->InsertDeferred(42);
+  EXPECT_FALSE(bf->HasDeferredInserts());
+  EXPECT_TRUE(bf->Find(42));
+}
+
+// Close() and Init() drop deferred inserts, they would not fit into a new directory.
+TEST_F(BloomFilterTest, DeferredInsertsReinit) {
+  gflags::FlagSaver saver;
+  FLAGS_bloom_filter_prefetch_min_bytes = 0;
+  BloomFilter* bf = CreateBloomFilter(20);
+  for (int i = 0; i < 10; ++i) bf->InsertDeferred(MakeRand());
+  EXPECT_TRUE(bf->HasDeferredInserts());
+  bf->Close();
+  EXPECT_FALSE(bf->HasDeferredInserts());
+  EXPECT_OK(bf->Init(10, 0));
+  EXPECT_FALSE(bf->HasDeferredInserts());
+  EXPECT_TRUE(bf->AlwaysFalse());
+  bf->InsertDeferred(42);
+  EXPECT_TRUE(bf->HasDeferredInserts());
+  EXPECT_OK(bf->Init(10, 0));
+  EXPECT_FALSE(bf->HasDeferredInserts());
+  EXPECT_TRUE(bf->AlwaysFalse());
+}
+
+// Folding a directory with ShrinkDirectory() must give exactly the directory of a
+// smaller filter with the same inserts. This relies on how Kudu computes bucket indexes,
+// a mismatch would make shrunk filters drop rows.
+TEST_F(BloomFilterTest, ShrinkDirectoryMatchesSmallerFilter) {
+  for (int log_space : {13, 16, 20}) {
+    for (int folds : {1, 3, 7}) {
+      BloomFilter* large = CreateBloomFilter(log_space);
+      BloomFilter* small = CreateBloomFilter(log_space - folds);
+      for (int i = 0; i < 300; ++i) {
+        uint32_t h = MakeRand();
+        large->Insert(h);
+        small->Insert(h);
+      }
+      kudu::Slice large_dir = large->GetBlockBloomFilter()->directory();
+      string folded(reinterpret_cast<const char*>(large_dir.data()), large_dir.size());
+      // An fpp limit of 1 folds down to 'min_log_space'.
+      ASSERT_EQ(log_space - folds,
+          BloomFilter::ShrinkDirectory(reinterpret_cast<uint8_t*>(&folded[0]), log_space,
+              1.0, log_space - folds));
+      kudu::Slice small_dir = small->GetBlockBloomFilter()->directory();
+      ASSERT_EQ(small_dir.size(), size_t{1} << (log_space - folds));
+      EXPECT_EQ(0, memcmp(small_dir.data(), folded.data(), small_dir.size()))
+          << "log_space=" << log_space << " folds=" << folds;
+    }
+  }
+}
+
+// EstimateFpp() agrees with Kudu's FalsePositiveProb() and with measured lookups.
+TEST_F(BloomFilterTest, EstimateFpp) {
+  // About 10 bits per value, ~1% fpp.
+  for (const auto& [log_space, ndv] : {std::pair{16, 50000}, std::pair{20, 800000}}) {
+    BloomFilter* bf = CreateBloomFilter(log_space);
+    for (int i = 0; i < ndv; ++i) bf->Insert(MakeRand());
+    kudu::Slice dir = bf->GetBlockBloomFilter()->directory();
+    const double estimate = BloomFilter::EstimateFpp(dir.data(), dir.size());
+    const double expected = BloomFilter::FalsePositiveProb(ndv, log_space);
+    EXPECT_GT(estimate, expected * 0.8) << "log_space=" << log_space;
+    EXPECT_LT(estimate, expected * 1.25) << "log_space=" << log_space;
+    constexpr int NUM_PROBES = 200000;
+    int found = 0;
+    for (int i = 0; i < NUM_PROBES; ++i) found += bf->Find(MakeRand());
+    EXPECT_GT(found, NUM_PROBES * estimate * 0.8) << "log_space=" << log_space;
+    EXPECT_LT(found, NUM_PROBES * estimate * 1.25) << "log_space=" << log_space;
+  }
+  BloomFilter* empty = CreateBloomFilter(16);
+  kudu::Slice dir = empty->GetBlockBloomFilter()->directory();
+  EXPECT_EQ(0, BloomFilter::EstimateFpp(dir.data(), dir.size()));
+}
+
+// ShrinkDirectory() folds as long as the estimated fpp stays at most the limit.
+TEST_F(BloomFilterTest, ShrinkDirectoryFppLimit) {
+  constexpr double MAX_FPP = 0.001;
+  constexpr int MIN_LOG_SPACE = 13;
+  for (int ndv : {0, 1, 1000, 30000}) {
+    BloomFilter* bf = CreateBloomFilter(20);
+    for (int i = 0; i < ndv; ++i) bf->Insert(MakeRand());
+    kudu::Slice dir = bf->GetBlockBloomFilter()->directory();
+    string shrunk(reinterpret_cast<const char*>(dir.data()), dir.size());
+    uint8_t* shrunk_data = reinterpret_cast<uint8_t*>(&shrunk[0]);
+    const int log_space = BloomFilter::ShrinkDirectory(shrunk_data, 20, MAX_FPP,
+        MIN_LOG_SPACE);
+    EXPECT_GE(log_space, MIN_LOG_SPACE);
+    EXPECT_LE(BloomFilter::EstimateFpp(shrunk_data, int64_t{1} << log_space), MAX_FPP);
+    if (log_space > MIN_LOG_SPACE) {
+      // One more fold would have exceeded the limit.
+      ASSERT_EQ(log_space - 1,
+          BloomFilter::ShrinkDirectory(shrunk_data, log_space, 1.0, log_space - 1));
+      EXPECT_GT(BloomFilter::EstimateFpp(shrunk_data, int64_t{1} << (log_space - 1)),
+          MAX_FPP) << "ndv=" << ndv;
+    }
+    // The planner's formula picks about the same size.
+    if (ndv >= 1000) {
+      EXPECT_NEAR(BloomFilter::MinLogSpace(ndv, MAX_FPP), log_space, 1) << "ndv=" << ndv;
+    }
+  }
+  // A filter that is already above the limit (~10 bits per value, ~1% fpp) is left
+  // unchanged.
+  BloomFilter* full = CreateBloomFilter(16);
+  for (int i = 0; i < 50000; ++i) full->Insert(MakeRand());
+  kudu::Slice dir = full->GetBlockBloomFilter()->directory();
+  string copy(reinterpret_cast<const char*>(dir.data()), dir.size());
+  EXPECT_EQ(16, BloomFilter::ShrinkDirectory(
+      reinterpret_cast<uint8_t*>(&copy[0]), 16, MAX_FPP, MIN_LOG_SPACE));
+  EXPECT_EQ(0, memcmp(dir.data(), copy.data(), dir.size()));
+}
+
+// BloomFilter::Shrink() reallocates a smaller directory that finds the same values.
+TEST_F(BloomFilterTest, Shrink) {
+  MemTracker tracker;
+  BloomFilter* bf = CreateBloomFilter(20);
+  vector<uint32_t> hashes;
+  for (int i = 0; i < 1000; ++i) {
+    hashes.push_back(MakeRand());
+    bf->Insert(hashes.back());
+  }
+  bool shrunk = false;
+  ASSERT_OK(bf->Shrink(0.001, 13, &tracker, &shrunk));
+  EXPECT_TRUE(shrunk);
+  EXPECT_LT(bf->directory_size(), 1 << 20);
+  EXPECT_GE(bf->directory_size(), 1 << 13);
+  EXPECT_EQ(bf->directory_size(), bf->GetBlockBloomFilter()->directory().size());
+  EXPECT_EQ(0, tracker.consumption());
+  EXPECT_FALSE(bf->AlwaysFalse());
+  for (uint32_t h : hashes) ASSERT_TRUE(bf->Find(h));
+  // The shrunk filter can still be serialized and inserted into.
+  BloomFilterPB pb;
+  RpcController controller;
+  BloomFilter::ToProtobuf(bf, &controller, &pb);
+  EXPECT_EQ(BitUtil::Log2Ceiling64(bf->directory_size()), pb.log_bufferpool_space());
+  bf->Insert(42);
+  EXPECT_TRUE(bf->Find(42));
+
+  // Empty filters and filters at the minimum size are not shrunk.
+  BloomFilter* empty = CreateBloomFilter(20);
+  ASSERT_OK(empty->Shrink(0.001, 13, &tracker, &shrunk));
+  EXPECT_FALSE(shrunk);
+  EXPECT_EQ(1 << 20, empty->directory_size());
+  BloomFilter* tiny = CreateBloomFilter(13);
+  tiny->Insert(42);
+  ASSERT_OK(tiny->Shrink(0.001, 13, &tracker, &shrunk));
+  EXPECT_FALSE(shrunk);
+
+  // If the temporary copy does not fit into the memory limit, nothing changes.
+  MemTracker limited(1000);
+  BloomFilter* unchanged = CreateBloomFilter(20);
+  unchanged->Insert(42);
+  string before(reinterpret_cast<const char*>(
+      unchanged->GetBlockBloomFilter()->directory().data()), 1 << 20);
+  ASSERT_OK(unchanged->Shrink(0.001, 13, &limited, &shrunk));
+  EXPECT_FALSE(shrunk);
+  EXPECT_EQ(0, memcmp(before.data(),
+      unchanged->GetBlockBloomFilter()->directory().data(), 1 << 20));
+  EXPECT_EQ(0, limited.consumption());
+  tracker.Close();
+  limited.Close();
 }
 
 TEST_F(BloomFilterTest, Protobuf) {

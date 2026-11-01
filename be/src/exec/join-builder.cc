@@ -161,6 +161,10 @@ void JoinBuilder::PublishRuntimeFilters(const std::vector<FilterContext>& filter
     BloomFilter* bloom_filter = nullptr;
     if (ctx.local_bloom_filter != nullptr) {
       bloom_filter = ctx.local_bloom_filter;
+      // MaterializeValues() should have flushed them after the last build batch. Flush
+      // anyway, a filter missing values would wrongly reject rows.
+      DCHECK(!bloom_filter->HasDeferredInserts());
+      bloom_filter->FlushDeferredInserts();
       ++num_enabled_filters;
     } else if (ctx.local_min_max_filter != nullptr) {
       /// Apply the column min/max stats (if applicable) to shut down the min/max

@@ -191,6 +191,10 @@ class RuntimeFilterBank {
   static const int64_t MIN_BLOOM_FILTER_SIZE = 4 * 1024;           // 4KB
   static const int64_t MAX_BLOOM_FILTER_SIZE = 512 * 1024 * 1024; // 512MB
 
+  /// Log2 of the smallest size that complete Bloom filters are shrunk to, see
+  /// --bloom_filter_shrink_error_rate.
+  static int MinShrunkLogSpace();
+
  private:
   struct PerFilterState;
 
@@ -355,6 +359,14 @@ class RuntimeFilterBank {
   /// produced_filter.result_filter->is_intermediate_aggregator() == true.
   void CombinePeerAndLocalUpdates(
       std::unique_lock<SpinLock>* lock, ProducedFilter& produced_filter);
+
+  /// Shrinks 'bloom_filter', a complete filter that is only used by local consumers,
+  /// with BloomFilter::Shrink() as configured by --bloom_filter_shrink_error_rate.
+  /// Returns false if that failed and 'bloom_filter' cannot be used anymore.
+  bool ShrinkCompleteBloomFilter(int32_t filter_id, BloomFilter* bloom_filter);
+
+  /// Records in the host profile that filter 'filter_id' was shrunk.
+  void AddShrunkFilterInfo(int32_t filter_id, int64_t old_size, int64_t new_size);
 
   /// Distribute 'complete_filter' to local and/or remote target.
   /// Caller must hold 'lock' (which is over 'PerFilterState.lock').

@@ -190,6 +190,15 @@ Status HdfsColumnarScanner::Codegen(HdfsScanPlanNode* node, FragmentState* state
   replaced = codegen->ReplaceCallSites(fn, eval_runtime_filters_fn, "EvalRuntimeFilters");
   DCHECK_REPLACE_COUNT(replaced, 1);
 
+  llvm::Function* prefetch_runtime_filters_fn;
+  RETURN_IF_ERROR(CodegenPrefetchRuntimeFilters(codegen, node->runtime_filter_exprs_,
+      node->tnode_->runtime_filters, &prefetch_runtime_filters_fn));
+  DCHECK(prefetch_runtime_filters_fn != nullptr);
+
+  replaced = codegen->ReplaceCallSites(
+      fn, prefetch_runtime_filters_fn, "PrefetchRuntimeFilters");
+  DCHECK_REPLACE_COUNT(replaced, 1);
+
   fn->setName("ProcessScratchBatch");
   *process_scratch_batch_fn = codegen->FinalizeFunction(fn);
   if (*process_scratch_batch_fn == nullptr) {

@@ -33,6 +33,7 @@
 #include "runtime/runtime-filter.inline.h"
 #include "runtime/tuple-row.h"
 #include "util/bitmap.h"
+#include "util/bloom-filter.h"
 #include "util/codec.h"
 #include "util/test-info.h"
 
@@ -729,6 +730,71 @@ Status HdfsScanner::CodegenEvalRuntimeFilters(
   return Status::OK();
 }
 
+Status HdfsScanner::CodegenPrefetchRuntimeFilters(LlvmCodeGen* codegen,
+    const vector<ScalarExpr*>& filter_exprs,
+    const vector<TRuntimeFilterDesc>& filter_descs, llvm::Function** fn) {
+  DCHECK_EQ(filter_exprs.size(), filter_descs.size());
+  llvm::LLVMContext& context = codegen->context();
+  LlvmBuilder builder(context);
+
+  *fn = nullptr;
+  LlvmCodeGen::FnPrototype prototype(codegen, "PrefetchRuntimeFilters",
+      codegen->void_type());
+  prototype.AddArgument(LlvmCodeGen::NamedVariable("this", codegen->ptr_type()));
+  prototype.AddArgument(LlvmCodeGen::NamedVariable("row", codegen->ptr_type()));
+
+  llvm::Value* args[2];
+  llvm::Function* prefetch_runtime_filters_fn =
+      prototype.GeneratePrototype(&builder, args);
+  llvm::Value* this_arg = args[0];
+  llvm::Value* row_arg = args[1];
+
+  int num_prefetched_filters = 0;
+  for (int i = 0; i < filter_exprs.size(); ++i) {
+    // Only Bloom filters that can be large enough to be prefetched at runtime (see
+    // UpdateRuntimeFilterPrefetch()) get code. A filter can be shrunk after planning,
+    // but never grows, so its planned size is an upper bound of its size at runtime.
+    const TRuntimeFilterDesc& filter_desc = filter_descs[i];
+    if (filter_desc.type != TRuntimeFilterType::BLOOM
+        || !BloomFilter::ShouldPrefetch(filter_desc.filter_size_bytes)) {
+      continue;
+    }
+    ++num_prefetched_filters;
+    // Make a clone of HdfsScanner::PrefetchRuntimeFilter(int i, TupleRow* row).
+    llvm::Function* prefetch_runtime_filter_fn =
+        codegen->GetFunction(IRFunction::HDFS_SCANNER_PREFETCH_RUNTIME_FILTER, true);
+    DCHECK(prefetch_runtime_filter_fn != nullptr);
+
+    llvm::Function* prefetch_one_filter_fn;
+    DCHECK(filter_exprs[i] != nullptr);
+    RETURN_IF_ERROR(FilterContext::CodegenPrefetch(codegen, filter_exprs[i],
+        &prefetch_one_filter_fn));
+    DCHECK(prefetch_one_filter_fn != nullptr);
+
+    // "FilterContext8Prefetch" is FilterContext::Prefetch(impala::TupleRow*).
+    int replaced = codegen->ReplaceCallSites(prefetch_runtime_filter_fn,
+        prefetch_one_filter_fn, "FilterContext8Prefetch");
+    DCHECK_REPLACE_COUNT(replaced, 1);
+
+    llvm::Value* idx = codegen->GetI32Constant(i);
+    builder.CreateCall(prefetch_runtime_filter_fn,
+        llvm::ArrayRef<llvm::Value*>({this_arg, idx, row_arg}));
+  }
+  builder.CreateRetVoid();
+  // Don't inline this function to avoid code bloat in ProcessScratchBatch(), like
+  // EvalRuntimeFilters(). An empty one is inlined as a no-op.
+  if (num_prefetched_filters > 0) {
+    prefetch_runtime_filters_fn->addFnAttr(llvm::Attribute::NoInline);
+  }
+
+  *fn = codegen->FinalizeFunction(prefetch_runtime_filters_fn);
+  if (*fn == nullptr) {
+    return Status("Codegen'd HdfsScanner::PrefetchRuntimeFilters() failed "
+        "verification, see log");
+  }
+  return Status::OK();
+}
+
 Status HdfsScanner::UpdateDecompressor(const THdfsCompression::type& compression) {
   // Check whether the file in the stream has different compression from the last one.
   if (compression != decompression_type_) {
@@ -1047,4 +1113,27 @@ bool HdfsScanner::EvalRuntimeFilters(TupleRow* row) {
     if (!EvalRuntimeFilter(i, row)) return false;
   }
   return true;
+}
+
+bool HdfsScanner::UpdateRuntimeFilterPrefetch() {
+  bool any_prefetch = false;
+  for (int i = 0; i < filter_ctxs_.size(); ++i) {
+    const RuntimeFilter* filter = filter_ctxs_[i]->filter;
+    LocalFilterStats* stats = &filter_stats_[i];
+    // The arrived filter may be smaller than planned, see
+    // --bloom_filter_shrink_error_rate.
+    const BloomFilter* bloom_filter =
+        filter->is_bloom_filter() && filter->HasFilter() ? filter->get_bloom_filter()
+                                                         : nullptr;
+    stats->prefetch_for_row = stats->enabled_for_row
+        && bloom_filter != BloomFilter::ALWAYS_TRUE_FILTER
+        && BloomFilter::ShouldPrefetch(bloom_filter->directory_size());
+    any_prefetch |= stats->prefetch_for_row;
+  }
+  return any_prefetch;
+}
+
+void HdfsScanner::PrefetchRuntimeFilters(TupleRow* row) {
+  int num_filters = filter_ctxs_.size();
+  for (int i = 0; i < num_filters; ++i) PrefetchRuntimeFilter(i, row);
 }

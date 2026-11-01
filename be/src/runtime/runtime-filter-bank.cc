@@ -57,7 +57,17 @@ DEFINE_double(max_filter_error_rate, 0.10, "(Advanced) The target false positive
     "probability used to determine the ideal size for each bloom filter size. This value "
     "can be overriden by the RUNTIME_FILTER_ERROR_RATE query option.");
 
+DEFINE_double(bloom_filter_shrink_error_rate, 0.0001, "(Advanced) Before a complete "
+    "runtime Bloom filter is published to the scans that evaluate it, it is shrunk by "
+    "repeatedly folding it in half, as long as its estimated false positive rate stays "
+    "at most this value. Filters are often much larger than needed, because their size "
+    "is planned from estimates and is at least RUNTIME_FILTER_MIN_SIZE. Smaller filters "
+    "are faster to evaluate and to send. Applies to filters aggregated by the "
+    "coordinator and to filters that are only used on the backend that produced them. "
+    "0 disables shrinking.");
+
 DECLARE_int32(runtime_filter_wait_time_ms);
+DECLARE_int64(min_buffer_size);
 
 const int64_t RuntimeFilterBank::MIN_BLOOM_FILTER_SIZE;
 const int64_t RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE;
@@ -486,6 +496,17 @@ void RuntimeFilterBank::DistributeCompleteFilter(
         DCHECK(consumed_filter->filter_desc().is_broadcast_join)
             << consumed_filter->filter_desc();
       } else {
+        // The filter is final if it is not sent to the coordinator or an aggregator to
+        // be merged with other filters of the same size.
+        const bool sent_remotely = has_remote_target
+            && query_state_->query_options().runtime_filter_mode
+                == TRuntimeFilterMode::GLOBAL;
+        if (bloom_filter != nullptr && !sent_remotely
+            && !ShrinkCompleteBloomFilter(filter_id, bloom_filter)) {
+          // 'bloom_filter' lost its directory, let all rows pass.
+          consumed_filter->SetFilter(BloomFilter::ALWAYS_TRUE_FILTER, nullptr, nullptr);
+          return;
+        }
         consumed_filter->SetFilter(complete_filter);
         string into_key;
         if (in_list_filter != nullptr) {
@@ -642,6 +663,12 @@ void RuntimeFilterBank::PublishGlobalFilter(
           fs->bloom_filters.push_back(bloom_filter);
           DCHECK_EQ(required_space, bloom_filter->GetBufferPoolSpaceUsed());
           bloom_memory_allocated_->Add(bloom_filter->GetBufferPoolSpaceUsed());
+          // The coordinator may have shrunk the filter, see
+          // Coordinator::FilterState::ShrinkBloomFilter().
+          if (bloom_filter->directory_size() < fs->consumed_filter->filter_size()) {
+            AddShrunkFilterInfo(params.filter_id(), fs->consumed_filter->filter_size(),
+                bloom_filter->directory_size());
+          }
         }
       }
     }
@@ -665,6 +692,38 @@ void RuntimeFilterBank::PublishGlobalFilter(
   query_state_->host_profile()->AddInfoString(
       Substitute("Filter $0 arrival$1", params.filter_id(), details),
       PrettyPrinter::Print(fs->consumed_filter->arrival_delay_ms(), TUnit::TIME_MS));
+}
+
+int RuntimeFilterBank::MinShrunkLogSpace() {
+  // Smaller filters would not use less memory, the buffer pool allocates at least
+  // --min_buffer_size bytes.
+  return BitUtil::Log2Ceiling64(
+      std::max<int64_t>(MIN_BLOOM_FILTER_SIZE, FLAGS_min_buffer_size));
+}
+
+bool RuntimeFilterBank::ShrinkCompleteBloomFilter(
+    int32_t filter_id, BloomFilter* bloom_filter) {
+  if (FLAGS_bloom_filter_shrink_error_rate <= 0 || bloom_filter->AlwaysFalse()) {
+    return true;
+  }
+  const int64_t old_size = bloom_filter->directory_size();
+  bool shrunk;
+  Status status = bloom_filter->Shrink(FLAGS_bloom_filter_shrink_error_rate,
+      MinShrunkLogSpace(), filter_mem_tracker_, &shrunk);
+  if (!status.ok()) {
+    LOG(ERROR) << "Unable to shrink bloom filter " << filter_id << ": "
+               << status.GetDetail();
+    return false;
+  }
+  if (shrunk) AddShrunkFilterInfo(filter_id, old_size, bloom_filter->directory_size());
+  return true;
+}
+
+void RuntimeFilterBank::AddShrunkFilterInfo(
+    int32_t filter_id, int64_t old_size, int64_t new_size) {
+  query_state_->host_profile()->AddInfoString(Substitute("Filter $0 size", filter_id),
+      Substitute("$0 (shrunk from $1)", PrettyPrinter::Print(new_size, TUnit::BYTES),
+          PrettyPrinter::Print(old_size, TUnit::BYTES)));
 }
 
 BloomFilter* RuntimeFilterBank::AllocateScratchBloomFilter(int32_t filter_id) {

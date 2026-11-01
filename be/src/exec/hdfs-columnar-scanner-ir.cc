@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+
 #include "exec/exec-node.inline.h"
 #include "exec/hdfs-columnar-scanner.h"
 #include "runtime/row-batch.h"
@@ -44,7 +46,22 @@ int HdfsColumnarScanner::ProcessScratchBatch(RowBatch* dst_batch) {
   // Do not use batch_->AtCapacity() in this loop because it is not necessary
   // to perform the memory capacity check.
   bool* is_selected = scratch_batch_->selected_rows.get() + scratch_batch_->tuple_idx;
+  // If any Bloom filter is large enough, the buckets of the next
+  // RUNTIME_FILTER_PREFETCH_BATCH_SIZE tuples are prefetched before evaluating the
+  // filters on them, so that their cache misses overlap. 'prefetched_end' is the end of
+  // the tuples prefetched so far.
+  const bool prefetch_filters = UpdateRuntimeFilterPrefetch();
+  uint8_t* prefetched_end = scratch_tuple;
   while (scratch_tuple != scratch_tuple_end) {
+    if (prefetch_filters && scratch_tuple == prefetched_end) {
+      const int64_t num_tuples = std::min<int64_t>(RUNTIME_FILTER_PREFETCH_BATCH_SIZE,
+          (scratch_tuple_end - scratch_tuple) / tuple_size);
+      prefetched_end = scratch_tuple + num_tuples * tuple_size;
+      for (uint8_t* tuple = scratch_tuple; tuple != prefetched_end; tuple += tuple_size) {
+        Tuple* row = reinterpret_cast<Tuple*>(tuple);
+        PrefetchRuntimeFilters(reinterpret_cast<TupleRow*>(&row));
+      }
+    }
     *output_row = reinterpret_cast<Tuple*>(scratch_tuple);
     scratch_tuple += tuple_size;
     // Evaluate runtime filters and conjuncts. Short-circuit the evaluation if
