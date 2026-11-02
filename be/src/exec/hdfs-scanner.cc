@@ -17,6 +17,8 @@
 
 #include "exec/hdfs-scanner.h"
 
+#include <numeric>
+
 #include "codegen/codegen-anyval.h"
 #include "exec/base-sequence-scanner.h"
 #include "exec/exec-node.inline.h"
@@ -633,11 +635,12 @@ Status HdfsScanner::CodegenInitTuple(
   return Status::OK();
 }
 
-// The generated EvalRuntimeFiltersOnRows() calls a clone of EvalBloomFilterOnRows() or
-// EvalRuntimeFilterOnRows() for each filter, in order, passing the number of rows that
-// passed the previous filter to the next one. In the clones, FilterContext::Eval() and
+// The generated EvalRuntimeFiltersOnRows() is a clone of the cross-compiled loop over
+// 'filter_order_', in which EvalOneRuntimeFilterOnRows() is replaced with a switch over
+// the filter index. Each case calls a clone of EvalBloomFilterOnRows() or
+// EvalRuntimeFilterOnRows(), in which FilterContext::Eval() and
 // FilterContext::BloomFilterHash() are replaced with the versions generated for the
-// filter's expression, and 'may_prefetch' is a constant.
+// filter's expression, and the filter index and 'may_prefetch' are constants.
 Status HdfsScanner::CodegenEvalRuntimeFiltersOnRows(LlvmCodeGen* codegen,
     const vector<ScalarExpr*>& filter_exprs,
     const vector<TRuntimeFilterDesc>& filter_descs, llvm::Function** fn) {
@@ -646,28 +649,44 @@ Status HdfsScanner::CodegenEvalRuntimeFiltersOnRows(LlvmCodeGen* codegen,
   LlvmBuilder builder(context);
 
   *fn = nullptr;
-  LlvmCodeGen::FnPrototype prototype(codegen, "EvalRuntimeFiltersOnRows",
+  LlvmCodeGen::FnPrototype prototype(codegen, "EvalOneRuntimeFilterOnRows",
       codegen->i32_type());
   prototype.AddArgument(LlvmCodeGen::NamedVariable("this", codegen->ptr_type()));
+  prototype.AddArgument(LlvmCodeGen::NamedVariable("i", codegen->i32_type()));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("tuples", codegen->ptr_type()));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("tuple_size", codegen->i32_type()));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("sel", codegen->ptr_type()));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("num_rows", codegen->i32_type()));
   prototype.AddArgument(LlvmCodeGen::NamedVariable("hashes", codegen->ptr_type()));
 
-  llvm::Value* args[6];
-  llvm::Function* eval_runtime_filters_fn = prototype.GeneratePrototype(&builder, args);
+  llvm::Value* args[7];
+  llvm::Function* eval_one_filter_fn = prototype.GeneratePrototype(&builder, args);
   llvm::Value* this_arg = args[0];
-  llvm::Value* tuples_arg = args[1];
-  llvm::Value* tuple_size_arg = args[2];
-  llvm::Value* sel_arg = args[3];
-  llvm::Value* num_rows = args[4];
-  llvm::Value* hashes_arg = args[5];
+  llvm::Value* filter_idx_arg = args[1];
+  llvm::Value* tuples_arg = args[2];
+  llvm::Value* tuple_size_arg = args[3];
+  llvm::Value* sel_arg = args[4];
+  llvm::Value* num_rows_arg = args[5];
+  llvm::Value* hashes_arg = args[6];
+
+  // The filter index is always one of the cases.
+  llvm::BasicBlock* default_block =
+      llvm::BasicBlock::Create(context, "unknown_filter", eval_one_filter_fn);
+  llvm::SwitchInst* filter_switch =
+      builder.CreateSwitch(filter_idx_arg, default_block, filter_exprs.size());
+  builder.SetInsertPoint(default_block);
+  builder.CreateRet(num_rows_arg);
 
   for (int i = 0; i < filter_exprs.size(); ++i) {
     DCHECK(filter_exprs[i] != nullptr);
     const TRuntimeFilterDesc& filter_desc = filter_descs[i];
+    llvm::BasicBlock* case_block = llvm::BasicBlock::Create(
+        context, Substitute("filter_$0", i), eval_one_filter_fn);
+    filter_switch->addCase(
+        llvm::cast<llvm::ConstantInt>(codegen->GetI32Constant(i)), case_block);
+    builder.SetInsertPoint(case_block);
     llvm::Value* idx = codegen->GetI32Constant(i);
+    llvm::Value* num_passed;
     if (filter_desc.type == TRuntimeFilterType::BLOOM) {
       // Make a clone of HdfsScanner::EvalBloomFilterOnRows().
       llvm::Function* eval_filter_fn = codegen->GetFunction(
@@ -685,35 +704,47 @@ Status HdfsScanner::CodegenEvalRuntimeFiltersOnRows(LlvmCodeGen* codegen,
       // is only needed if the planned size is large enough.
       llvm::Value* may_prefetch = codegen->GetBoolConstant(
           BloomFilter::ShouldPrefetch(filter_desc.filter_size_bytes));
-      num_rows = builder.CreateCall(eval_filter_fn,
+      num_passed = builder.CreateCall(eval_filter_fn,
           llvm::ArrayRef<llvm::Value*>({this_arg, idx, tuples_arg, tuple_size_arg,
-              sel_arg, num_rows, hashes_arg, may_prefetch}));
+              sel_arg, num_rows_arg, hashes_arg, may_prefetch}));
     } else {
       // Make a clone of HdfsScanner::EvalRuntimeFilterOnRows().
       llvm::Function* eval_filter_fn = codegen->GetFunction(
           IRFunction::HDFS_SCANNER_EVAL_RUNTIME_FILTER_ON_ROWS, true);
       DCHECK(eval_filter_fn != nullptr);
-      llvm::Function* eval_one_filter_fn;
+      llvm::Function* eval_row_fn;
       RETURN_IF_ERROR(
-          FilterContext::CodegenEval(codegen, filter_exprs[i], &eval_one_filter_fn));
-      DCHECK(eval_one_filter_fn != nullptr);
+          FilterContext::CodegenEval(codegen, filter_exprs[i], &eval_row_fn));
+      DCHECK(eval_row_fn != nullptr);
       // "FilterContext4Eval" is FilterContext::Eval(impala::TupleRow*).
       int replaced = codegen->ReplaceCallSites(
-          eval_filter_fn, eval_one_filter_fn, "FilterContext4Eval");
+          eval_filter_fn, eval_row_fn, "FilterContext4Eval");
       DCHECK_REPLACE_COUNT(replaced, 1);
-      num_rows = builder.CreateCall(eval_filter_fn,
+      num_passed = builder.CreateCall(eval_filter_fn,
           llvm::ArrayRef<llvm::Value*>(
-              {this_arg, idx, tuples_arg, tuple_size_arg, sel_arg, num_rows}));
+              {this_arg, idx, tuples_arg, tuple_size_arg, sel_arg, num_rows_arg}));
     }
-  }
-  builder.CreateRet(num_rows);
-  // Don't inline this function to avoid code bloat in ProcessScratchBatch(). If there
-  // is any filter, it is large enough to not benefit much from inlining.
-  if (!filter_exprs.empty()) {
-    eval_runtime_filters_fn->addFnAttr(llvm::Attribute::NoInline);
+    builder.CreateRet(num_passed);
   }
 
-  *fn = codegen->FinalizeFunction(eval_runtime_filters_fn);
+  eval_one_filter_fn = codegen->FinalizeFunction(eval_one_filter_fn);
+  if (eval_one_filter_fn == nullptr) {
+    return Status("Codegen'd HdfsScanner::EvalOneRuntimeFilterOnRows() failed "
+        "verification, see log");
+  }
+
+  // Make a clone of HdfsScanner::EvalRuntimeFiltersOnRows().
+  llvm::Function* eval_filters_fn = codegen->GetFunction(
+      IRFunction::HDFS_SCANNER_EVAL_RUNTIME_FILTERS_ON_ROWS, true);
+  DCHECK(eval_filters_fn != nullptr);
+  int replaced = codegen->ReplaceCallSites(
+      eval_filters_fn, eval_one_filter_fn, "EvalOneRuntimeFilterOnRows");
+  DCHECK_REPLACE_COUNT(replaced, 1);
+  // Don't inline this function to avoid code bloat in ProcessScratchBatch(). If there
+  // is any filter, it is large enough to not benefit much from inlining.
+  if (!filter_exprs.empty()) eval_filters_fn->addFnAttr(llvm::Attribute::NoInline);
+
+  *fn = codegen->FinalizeFunction(eval_filters_fn);
   if (*fn == nullptr) {
     return Status("Codegen'd HdfsScanner::EvalRuntimeFiltersOnRows() failed "
         "verification, see log");
@@ -955,11 +986,20 @@ void HdfsScanner::CheckFiltersEffectiveness() {
     LocalFilterStats* stats = &filter_stats_[i];
     const RuntimeFilter* filter = filter_ctxs_[i]->filter;
     double reject_ratio = stats->rejected / static_cast<double>(stats->considered);
+    // Only the scanners that evaluate the filters with EvalRuntimeFiltersOnRows() count
+    // the rows that reach the first filter.
+    bool reached_by_most_rows = num_rows_runtime_filtered_ == 0
+        || stats->total_possible * 2 > num_rows_runtime_filtered_;
     if (filter->AlwaysTrue() ||
-        reject_ratio < FLAGS_min_filter_reject_ratio) {
+        (reject_ratio < FLAGS_min_filter_reject_ratio && reached_by_most_rows)) {
       stats->enabled_for_row = 0;
     }
   }
+}
+
+void HdfsScanner::InitRuntimeFilterOrder() {
+  filter_order_.resize(filter_ctxs_.size());
+  std::iota(filter_order_.begin(), filter_order_.end(), 0);
 }
 
 Status HdfsScanner::IssueFooterRanges(HdfsScanNodeBase* scan_node,
@@ -1033,16 +1073,11 @@ ScanRange* HdfsScanner::FindFooterSplit(HdfsFileDesc* file) {
   return nullptr;
 }
 
-int HdfsScanner::EvalRuntimeFiltersOnRows(
-    uint8_t* tuples, int tuple_size, int* sel, int num_rows, uint32_t* hashes) {
-  const int num_filters = filter_ctxs_.size();
-  for (int i = 0; i < num_filters; ++i) {
-    if (filter_ctxs_[i]->filter->is_bloom_filter()) {
-      num_rows = EvalBloomFilterOnRows(
-          i, tuples, tuple_size, sel, num_rows, hashes, /*may_prefetch=*/true);
-    } else {
-      num_rows = EvalRuntimeFilterOnRows(i, tuples, tuple_size, sel, num_rows);
-    }
+int HdfsScanner::EvalOneRuntimeFilterOnRows(
+    int i, uint8_t* tuples, int tuple_size, int* sel, int num_rows, uint32_t* hashes) {
+  if (filter_ctxs_[i]->filter->is_bloom_filter()) {
+    return EvalBloomFilterOnRows(
+        i, tuples, tuple_size, sel, num_rows, hashes, /*may_prefetch=*/true);
   }
-  return num_rows;
+  return EvalRuntimeFilterOnRows(i, tuples, tuple_size, sel, num_rows);
 }

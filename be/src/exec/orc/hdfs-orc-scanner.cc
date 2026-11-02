@@ -343,6 +343,7 @@ Status HdfsOrcScanner::Open(ScannerContext* context) {
     filter_ctxs_.push_back(&ctx);
   }
   filter_stats_.resize(filter_ctxs_.size());
+  InitRuntimeFilterOrder();
   reader_mem_pool_.reset(new OrcMemPool(this));
   reader_options_.setMemoryPool(*reader_mem_pool_);
 

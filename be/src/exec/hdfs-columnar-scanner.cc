@@ -41,6 +41,9 @@ PROFILE_DEFINE_COUNTER(
 PROFILE_DEFINE_COUNTER(NumScannersWithNoReads, STABLE_LOW, TUnit::UNIT,
     "Number of scanners that end up doing no reads because their splits don't overlap "
     "with the midpoint of any row-group/stripe in the file.");
+PROFILE_DEFINE_COUNTER(NumRuntimeFilterSwaps, DEBUG, TUnit::UNIT,
+    "Number of times the order of two runtime filters evaluated on rows was swapped "
+    "because the second one rejected a larger fraction of rows.");
 PROFILE_DEFINE_SUMMARY_STATS_TIMER(FooterProcessingTime, STABLE_LOW,
     "Average and min/max time spent processing the footer by each split.");
 PROFILE_DEFINE_SUMMARY_STATS_COUNTER(ColumnarScannerIdealReservation, DEBUG, TUnit::BYTES,
@@ -105,6 +108,7 @@ Status HdfsColumnarScanner::Open(ScannerContext* context) {
   num_cols_counter_ = PROFILE_NumColumns.Instantiate(profile);
   num_scanners_with_no_reads_counter_ =
       PROFILE_NumScannersWithNoReads.Instantiate(profile);
+  num_runtime_filter_swaps_counter_ = PROFILE_NumRuntimeFilterSwaps.Instantiate(profile);
   process_footer_timer_stats_ = PROFILE_FooterProcessingTime.Instantiate(profile);
   columnar_scanner_ideal_reservation_counter_ =
       PROFILE_ColumnarScannerIdealReservation.Instantiate(profile);
@@ -345,6 +349,9 @@ void HdfsColumnarScanner::AddSkippedReadBytesCounter(int64_t total_bytes) {
 }
 
 void HdfsColumnarScanner::CloseInternal() {
+  if (num_runtime_filter_swaps_counter_ != nullptr) {
+    COUNTER_ADD(num_runtime_filter_swaps_counter_, num_runtime_filter_swaps_);
+  }
   if (scratch_mem_alloc_duration_ != nullptr) {
     DCHECK(scratch_mem_free_duration_ != nullptr);
     DCHECK(scratch_mem_alloc_bytes_ != nullptr);

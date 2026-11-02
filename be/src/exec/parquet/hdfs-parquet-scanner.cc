@@ -211,6 +211,7 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
     }
   }
   filter_stats_.resize(filter_ctxs_.size());
+  InitRuntimeFilterOrder();
   for (int i = 0; i < filter_stats_.size(); ++i) {
     filter_stats_[i].enabled_for_rowgroup = true;
     filter_stats_[i].enabled_for_page = true;

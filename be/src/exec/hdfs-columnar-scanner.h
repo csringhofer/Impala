@@ -142,6 +142,9 @@ class HdfsColumnarScanner : public HdfsScanner {
   /// with the midpoint of any row-group/stripe in the file.
   RuntimeProfile::Counter* num_scanners_with_no_reads_counter_;
 
+  /// Number of times two runtime filters were swapped, see EvalRuntimeFiltersOnRows().
+  RuntimeProfile::Counter* num_runtime_filter_swaps_counter_ = nullptr;
+
   /// Average and min/max time spent processing the footer by each split.
   RuntimeProfile::SummaryStatsCounter* process_footer_timer_stats_;
 

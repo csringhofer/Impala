@@ -172,6 +172,8 @@ ir_functions = [
    "_ZN6impala11HdfsScanner21EvalBloomFilterOnRowsEiPhiPiiPjb"],
   ["HDFS_SCANNER_EVAL_RUNTIME_FILTER_ON_ROWS",
    "_ZN6impala11HdfsScanner23EvalRuntimeFilterOnRowsEiPhiPii"],
+  ["HDFS_SCANNER_EVAL_RUNTIME_FILTERS_ON_ROWS",
+   "_ZN6impala11HdfsScanner24EvalRuntimeFiltersOnRowsEPhiPiiPj"],
   ["HDFS_SCANNER_TEXT_CONVERTER_WRITE_SLOT_INTERPRETED_IR",
    "_ZN6impala11HdfsScanner35TextConverterWriteSlotInterpretedIREPS0_iPNS_5TupleEPKciPNS_7MemPoolE"],
   ["STRING_TO_BOOL", "IrStringToBool"],

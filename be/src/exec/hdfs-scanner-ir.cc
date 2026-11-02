@@ -127,6 +127,34 @@ int HdfsScanner::EvalBloomFilterOnRows(int i, uint8_t* tuples, int tuple_size,
   return num_passed;
 }
 
+int HdfsScanner::EvalRuntimeFiltersOnRows(
+    uint8_t* tuples, int tuple_size, int* sel, int num_rows, uint32_t* hashes) {
+  DCHECK_EQ(filter_order_.size(), filter_ctxs_.size());
+  num_rows_runtime_filtered_ += num_rows;
+  // The rows that reached and that passed the filter at the previous position.
+  int prev_in = 0;
+  int prev_passed = 0;
+  const int num_filters = filter_order_.size();
+  for (int k = 0; k < num_filters && num_rows > 0; ++k) {
+    const int num_in = num_rows;
+    num_rows = EvalOneRuntimeFilterOnRows(
+        filter_order_[k], tuples, tuple_size, sel, num_rows, hashes);
+    // Swap with the previous filter if this one rejected a larger fraction of its rows:
+    // (num_in - num_rows) / num_in > (prev_in - prev_passed) / prev_in. The swapped
+    // filter keeps its counts, the next filter is compared with them.
+    if (k > 0
+        && static_cast<int64_t>(num_in - num_rows) * prev_in
+            > static_cast<int64_t>(prev_in - prev_passed) * num_in) {
+      std::swap(filter_order_[k - 1], filter_order_[k]);
+      ++num_runtime_filter_swaps_;
+    } else {
+      prev_in = num_in;
+      prev_passed = num_rows;
+    }
+  }
+  return num_rows;
+}
+
 int HdfsScanner::EvalRuntimeFilterOnRows(
     int i, uint8_t* tuples, int tuple_size, int* sel, int num_rows) {
   if (num_rows == 0) return 0;

@@ -377,13 +377,32 @@ class HdfsScanner {
   /// Close().
   vector<LocalFilterStats> filter_stats_;
 
+  /// The order in which EvalRuntimeFiltersOnRows() evaluates the filters, as indexes
+  /// into 'filter_ctxs_'. Starts with the planner's order, see InitRuntimeFilterOrder().
+  vector<int> filter_order_;
+
+  /// Number of times EvalRuntimeFiltersOnRows() swapped two filters in 'filter_order_'.
+  int64_t num_runtime_filter_swaps_ = 0;
+
+  /// Number of rows that EvalRuntimeFiltersOnRows() was called with, i.e. that reached
+  /// the first filter.
+  int64_t num_rows_runtime_filtered_ = 0;
+
+  /// Initializes 'filter_order_' to the order of 'filter_ctxs_'. Must be called after
+  /// 'filter_ctxs_' is set.
+  void InitRuntimeFilterOrder();
+
   /// Counter for the number of batches returned from GetNext(). Only updated by the
   /// GetNext() API (i.e. PlanNode::num_instances_per_node() > 0),
   /// not the ProcessSplit() API.
   int64_t getnext_batches_returned_ = 0;
 
   /// Check runtime filters' effectiveness every BATCHES_PER_FILTER_SELECTIVITY_CHECK
-  /// row batches. Will update 'filter_stats_'.
+  /// row batches. Will update 'filter_stats_'. Disables a filter if it rejects less than
+  /// --min_filter_reject_ratio of the rows it is evaluated on and more than half of the
+  /// rows reach it. A filter behind a selective filter costs little, and
+  /// can move to the front again if the other filter stops rejecting rows (see
+  /// EvalRuntimeFiltersOnRows()).
   void CheckFiltersEffectiveness();
 
   /// Maximum number of rows that EvalRuntimeFiltersOnRows() is called with.
@@ -396,7 +415,16 @@ class HdfsScanner {
   /// rows that passed the previous ones. Returns the number of rows that passed all
   /// filters. 'hashes' is scratch space for at least 'num_rows' hashes. Maintains the
   /// runtime filter stats per row, which determine whether the filters are effective
-  /// (see CheckFiltersEffectiveness()). This is replaced by generated code at runtime.
+  /// (see CheckFiltersEffectiveness()).
+  ///
+  /// The filters are evaluated in the order of 'filter_order_'. If a filter rejected a
+  /// larger fraction of the rows it was evaluated on than the filter before it, the two
+  /// are swapped for the next call, so that the filters that reject the most rows move to
+  /// the front. If the filters are independent, the fraction a filter rejects of the rows
+  /// that passed the previous filters estimates the fraction it would reject of all rows.
+  /// Swapping after every call is cheap and follows changes in the data. A filter behind
+  /// a selective one is evaluated on few rows, so its fraction is noisy, but then it also
+  /// costs little to evaluate it in the wrong order.
   ///
   /// Evaluating a filter on a batch of rows keeps the result of each row out of the
   /// control flow, so the evaluation of a row does not wait for the previous rows and
@@ -404,6 +432,12 @@ class HdfsScanner {
   /// prefetched without evaluating the filter expression and hashing twice.
   int EvalRuntimeFiltersOnRows(
       uint8_t* tuples, int tuple_size, int* sel, int num_rows, uint32_t* hashes);
+
+  /// Evaluates the i-th runtime filter with EvalBloomFilterOnRows() or
+  /// EvalRuntimeFilterOnRows(), depending on its type. This is replaced by generated
+  /// code at runtime.
+  int EvalOneRuntimeFilterOnRows(
+      int i, uint8_t* tuples, int tuple_size, int* sel, int num_rows, uint32_t* hashes);
 
   /// Evaluates the i-th runtime filter, which is a Bloom filter, on the rows given by
   /// 'tuples', 'tuple_size', 'sel' and 'num_rows' like EvalRuntimeFiltersOnRows(). It
@@ -621,11 +655,11 @@ class HdfsScanner {
   static Status CodegenInitTuple(
       const HdfsScanPlanNode* node, LlvmCodeGen* codegen, llvm::Function** init_tuple_fn);
 
-  /// Codegen EvalRuntimeFiltersOnRows() by unrolling the loop over the filters in the
-  /// interpreted version and emitting a customized version of EvalBloomFilterOnRows() or
-  /// EvalRuntimeFilterOnRows() for each filter, with the filter expression and hashing
-  /// codegen'd for the expression's type. 'filter_descs' has the same order as
-  /// 'filter_exprs'. Prefetching is only generated for Bloom filters planned at least
+  /// Codegen EvalRuntimeFiltersOnRows() by replacing EvalOneRuntimeFilterOnRows() with a
+  /// switch over the filter index that calls a customized version of
+  /// EvalBloomFilterOnRows() or EvalRuntimeFilterOnRows() for each filter, with the
+  /// filter expression and hashing codegen'd for the expression's type. 'filter_descs'
+  /// has the same order as 'filter_exprs'. Prefetching is only generated for Bloom filters planned at least
   /// --bloom_filter_prefetch_min_bytes large: a filter can be shrunk after planning,
   /// but never grows. Return error status on failure. The generated function is
   /// returned via 'fn'.

@@ -18,3 +18,20 @@ select STRAIGHT_JOIN count(*) from alltypes a
 aggregation(SUM, Rows processed): 7308
 aggregation(SUM, Rows rejected): 7298
 ====
+---- QUERY
+####################################################
+# The same filters in the opposite order. The filter on 'id' rejects a larger fraction
+# of the rows that reach it than the filter on 'int_col' in front of it, so the scanner
+# swaps them after its first batch of rows.
+####################################################
+SET RUNTIME_FILTER_WAIT_TIME_MS=$RUNTIME_FILTER_WAIT_TIME_MS;
+SET RUNTIME_FILTER_MODE=GLOBAL;
+select STRAIGHT_JOIN count(*) from alltypes a
+    join [BROADCAST] alltypestiny b on a.id = b.id
+    join [BROADCAST] alltypestiny c on a.int_col = c.int_col
+---- RESULTS
+8
+---- RUNTIME_PROFILE
+aggregation(SUM, Rows rejected): 7298
+row_regex: .*NumRuntimeFilterSwaps: [1-9].*
+====
